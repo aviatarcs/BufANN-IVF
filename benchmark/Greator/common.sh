@@ -49,8 +49,8 @@ provision_index_into() {
     #  - elem_size MUST match the dataset element size (uint8/int8=1, float=4);
     #    it defaults to sizeof(float) in the binary, so it must be passed for
     #    non-float datasets or the per-node stride is wrong.
-    : "${CANONICAL_R:?CANONICAL_R must be set by the dataset config to consume a canonical with Greator}"
-    range="$CANONICAL_R"
+    : "${DISKANN_R:?DISKANN_R must be set by the dataset config to consume a canonical with Greator}"
+    range="$DISKANN_R"
     sector="${CANONICAL_SECTOR_LEN:-4096}"
     case "$data_type" in
         uint8|int8) elem=1 ;;

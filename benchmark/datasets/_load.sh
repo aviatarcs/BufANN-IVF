@@ -30,7 +30,7 @@ __required_dataset_vars=(
     DATASET DATA_TYPE DIM METRIC
     NPTS_FULL NPTS_BASE UPDATE_POINTS
     DATA_BIN QUERY_BIN GT_BIN_KCACHED
-    CANONICAL_INDEX_0P9B CANONICAL_R
+    DISKANN_INDEX_0P9B DISKANN_R
 )
 for __var in "${__required_dataset_vars[@]}"; do
     [[ -n "${!__var:-}" ]] || {
@@ -39,7 +39,7 @@ for __var in "${__required_dataset_vars[@]}"; do
     }
 done
 
-for __var in DIM NPTS_FULL NPTS_BASE UPDATE_POINTS CANONICAL_R; do
+for __var in DIM NPTS_FULL NPTS_BASE UPDATE_POINTS DISKANN_R; do
     [[ "${!__var}" =~ ^[1-9][0-9]*$ ]] || {
         echo "ERROR: dataset '$DATASET' has invalid $__var='${!__var}'" >&2
         exit 1
@@ -56,7 +56,7 @@ done
 }
 
 RECALL_AT="${RECALL_AT:-10}"
-R="${R:-$CANONICAL_R}"
+R="${R:-$DISKANN_R}"
 
 unset __required_dataset_vars __requested_dataset __dataset_file
 unset __bench_datasets_dir __dataset_root __index_root __var

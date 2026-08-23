@@ -1,13 +1,10 @@
 # BufANN
 
-This repository contains BufANN and the scripts used to prepare and run its query-only, insertion, deletion, and mixed-update workloads. Students compile the code, prepare vectors and ground truth, build PQ data and an initial DiskANN graph, and evaluate BufANN.
+This repository contains BufANN and the scripts used to prepare and run its query-only, insertion, deletion, and mixed-update workloads.
 
 ## 1. Compile BufANN and the DiskANN build helpers
 
-Use Bash for the setup because the benchmark helpers are Bash scripts.
-
 ```bash
-cd /path/to/BufANN
 bash benchmark/scripts/build.sh
 ```
 
@@ -15,15 +12,17 @@ The BufANN driver is written to `build/tests/bufann_driver`. The DiskANN helpers
 
 ## 2. Configure a dataset
 
-Edit the appropriate file under `benchmark/datasets/` and configure its source vectors, converted `.bin` paths, deep-ground-truth path, and canonical-index prefix.
+Edit the appropriate file under `benchmark/datasets/` and configure its source vectors, dataset path, and index path. The scripts handle conversion to `.bin` and ground-truth generation.
 
-For SIFT1M, set `DATA_FVECS` and `QUERY_FVECS` to the downloaded `sift_base.fvecs` and `sift_query.fvecs` files. The scripts convert them to float `.bin` files when needed. SIFT10M and SIFT100M use uint8 bvecs sampled from SIFT-1B and convert them to uint8 `.bin` files in the same way.
+For SIFT1M, set `DATA_FVECS` and `QUERY_FVECS` to the downloaded `sift_base.fvecs` and `sift_query.fvecs` files. The scripts convert them to float `.bin` files when needed.
+
+For SIFT10M and SIFT100M: create your own sample from SIFT-1B; you should either supply the resulting `.bvecs` or `.bin` to the script. (Note: SIFT-1B comes as uint8 `bvecs` format.)
 
 The first `NPTS_BASE` vectors form the initial index. The remaining `UPDATE_POINTS` vectors are reserved for insertion and mixed-update workloads. Verify that `DATA_TYPE`, `DIM`, `NPTS_FULL`, `NPTS_BASE`, and `UPDATE_POINTS` match the configured files.
 
 ## 3. Generate deep ground truth
 
-BufANN evaluation frequently needs ground truth for a database that contains only a particular ID range from the full dataset file. A deep ground-truth file stores the top K=100 nearest-neighbor IDs and distances for every query against the full dataset. The evaluation scripts filter those candidates on the fly to obtain the ground truth for the active ID range without repeating the expensive full nearest-neighbor computation.
+BufANN evaluation frequently needs ground truth for a database that contains only a particular ID range from the full dataset file. A deep ground-truth file stores the top **K=100** nearest-neighbor IDs and distances for every query against the full dataset. The evaluation scripts filter those candidates on the fly to obtain the ground truth for the active ID range without repeating the expensive full nearest-neighbor computation.
 
 Generate this file once for the configured dataset:
 
@@ -41,9 +40,9 @@ Train PQ pivots on the full dataset and generate PQ codes for the first `NPTS_BA
 bash benchmark/scripts/build_pq.sh sift1m
 ```
 
-The default is 32 PQ chunks and can be overridden with `PQ_CHUNKS`.
+The default is 32 PQ chunks (i.e. 32 bytes per vector) and can be overridden with `PQ_CHUNKS`.
 
-## 5. Build the canonical DiskANN graph
+## 5. Build the DiskANN graph
 
 Build the graph over the first `NPTS_BASE` vectors:
 
@@ -51,11 +50,17 @@ Build the graph over the first `NPTS_BASE` vectors:
 bash benchmark/scripts/build_diskann_index.sh sift1m
 ```
 
-The graph and PQ steps are separate. The graph builder uses the profile's `CANONICAL_R`, L=100, all available CPU cores, and a 200 GB build-memory budget by default. The latter three can be overridden with `BUILD_L`, `BUILD_THREADS`, and `BUILD_RAM_GB`.
+Configure the graph degree with `DISKANN_R` in the dataset profile (default =64). The build-time search-list size and memory budget default to `BUILD_L=100` and `BUILD_RAM_GB=200`. Override the latter two when invoking the graph builder, for example:
+
+```bash
+BUILD_L=200 BUILD_RAM_GB=64 bash benchmark/scripts/build_diskann_index.sh sift1m
+```
+
+The builder uses all available CPU cores by default; set `BUILD_THREADS` to override that behavior.
 
 ## 6. Run BufANN
 
-Each workload has a preparation script followed by a run script. The scripts handle conversion from the canonical DiskANN graph to BufANN's heap format and derive workload-specific ground truth from the deep K=100 file.
+Each workload has a preparation script followed by a run script. The scripts handle conversion from the DiskANN graph to BufANN's heap format and derive workload-specific ground truth from the deep K=100 file.
 
 `eval_tempfiles/` contains the mutable files for the current evaluation run and can be recreated by running the preparation script again. `eval_cached/` stores reusable, expensive-to-produce artifacts such as converted indexes and derived dataset slices so later preparation runs can restore them.
 

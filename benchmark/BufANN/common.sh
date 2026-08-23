@@ -84,7 +84,7 @@ provision_index_into() {
     [[ -n "$canon" ]] || error "BufANN requires a canonical DiskANN index (WORKLOAD=${WORKLOAD:-unset})"
     require_canonical "$canon"
     dim="${DIM:?DIM must be set by the dataset profile}"
-    degree_cap="${CANONICAL_R:-${R:-64}}"
+    degree_cap="${DISKANN_R:-${R:-64}}"
     pq_chunks="$(bufann_resolve_pq_chunks "$canon")"
     frames="$BUFANN_BUFFER_POOL_FRAMES"
     canon_id="$(basename "$canon")"
@@ -251,7 +251,7 @@ run_bufann_driver() {
         --maintenance_threads "${MAINTENANCE_THREADS:-${NTHREADS:-$(nproc)}}" \
         --buffer_pool_frames "$BUFANN_BUFFER_POOL_FRAMES" \
         --pq_chunks "$pq_chunks" \
-        --R "${CANONICAL_R:-${R:-64}}" \
+        --R "${DISKANN_R:-${R:-64}}" \
         --L "${L:-100}" \
         --result_file "$output_dir/result.json" \
         --delete_micro_batch "${DELETE_MICRO_BATCH:-1}" \

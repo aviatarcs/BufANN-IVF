@@ -367,7 +367,7 @@ CANONICAL_REQUIRED_SUFFIXES=(
 resolve_canonical_prefix() {
     case "${1:-}" in
         # query_then_insert: same 0.9x base as insert (RSS check; no merge).
-        query|delete|insert|update|query_then_insert) printf '%s' "${CANONICAL_INDEX_0P9B:-}" ;;
+        query|delete|insert|update|query_then_insert) printf '%s' "${DISKANN_INDEX_0P9B:-}" ;;
         *)             printf '%s' "" ;;
     esac
 }
@@ -467,7 +467,7 @@ canonical_base_points() {
         return 0
     fi
 
-    local canon="${CANONICAL_INDEX_0P9B:-}"
+    local canon="${DISKANN_INDEX_0P9B:-}"
     if [[ -n "$canon" ]]; then
         if [[ -e "${canon}_disk.index.tags" ]]; then
             bin_count "${canon}_disk.index.tags"

@@ -17,7 +17,7 @@ DATASET="$1"
 source "$REPO_DIR/benchmark/datasets/_load.sh"
 
 BIN="$REPO_DIR/baselines/DiskANN/build/tests"
-PREFIX="$CANONICAL_INDEX_0P9B"
+PREFIX="$DISKANN_INDEX_0P9B"
 PQ_CHUNKS="${PQ_CHUNKS:-32}"
 PIVOTS="${PREFIX}_pq_pivots.bin"
 CODES="${PREFIX}_pq_compressed.bin"

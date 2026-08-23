@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 # Placeholder profile: 100M-vector subset of SIFT-1B.
 # Students should create the dataset by sampling from SIFT-1B and configuring this script correctly.
-# Replace the paths below before running any benchmark.
 
 # Identity and benchmark split.
 DATASET="sift100m"
@@ -11,18 +10,18 @@ METRIC="l2"
 NPTS_FULL=100000000
 NPTS_BASE=90000000
 UPDATE_POINTS=10000000
-CANONICAL_R="${CANONICAL_R:-64}"
+DISKANN_R="${DISKANN_R:-64}"
 
-# Dataset source/output directory and canonical-index output directory.
+# TODO: Configure the dataset and DiskANN-index directories.
 __dataset_root="${SIFT100M_ROOT:-/path/to/datasets/sift100m}"
 __index_root="${SIFT100M_INDEX_DIR:-/path/to/indexes/sift100m}"
 
-# Input artifacts.
+# TODO: Configure the source vector files.
 DATA_BVECS="${DATA_BVECS:-$__dataset_root/base.100M.bvecs}"
 QUERY_BVECS="${QUERY_BVECS:-$__dataset_root/query.10K.bvecs}"
 
-# Generated artifact paths.
+# Generated artifact paths; no configuration needed.
 DATA_BIN="${DATA_BIN:-$__dataset_root/base.100M.bin}"
 QUERY_BIN="${QUERY_BIN:-$__dataset_root/query.10K.bin}"
 GT_BIN_KCACHED="${GT_BIN_KCACHED:-$__dataset_root/sift100m_100000000_gt100.bin}"
-CANONICAL_INDEX_0P9B="${CANONICAL_INDEX_0P9B:-$__index_root/sift100m_90M_R64_L100_B32_M8_noPQ}"
+DISKANN_INDEX_0P9B="${DISKANN_INDEX_0P9B:-$__index_root/sift100m_90M_R64_L100_B32_M8_noPQ}"
