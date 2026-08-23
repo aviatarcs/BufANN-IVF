@@ -13,13 +13,15 @@ NPTS_BASE=9000000
 UPDATE_POINTS=1000000
 CANONICAL_R="${CANONICAL_R:-64}"
 
-# Placeholder artifact roots.
+# Dataset source/output directory and canonical-index output directory.
 __dataset_root="${SIFT10M_ROOT:-/path/to/datasets/sift10m}"
 __index_root="${SIFT10M_INDEX_DIR:-/path/to/indexes/sift10m}"
 
-# Required artifacts.
+# Input artifacts.
 DATA_BVECS="${DATA_BVECS:-$__dataset_root/base.10M.bvecs}"
 QUERY_BVECS="${QUERY_BVECS:-$__dataset_root/query.10K.bvecs}"
+
+# Generated artifact paths.
 DATA_BIN="${DATA_BIN:-$__dataset_root/base.10M.bin}"
 QUERY_BIN="${QUERY_BIN:-$__dataset_root/query.10K.bin}"
 GT_BIN_KCACHED="${GT_BIN_KCACHED:-$__dataset_root/sift10m_10000000_gt100.bin}"

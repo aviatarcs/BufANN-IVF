@@ -12,13 +12,15 @@ NPTS_BASE=900000
 UPDATE_POINTS=100000
 CANONICAL_R="${CANONICAL_R:-64}"
 
-# Placeholder artifact roots.
-__dataset_root="${SIFT1M_ROOT:-/data-local-0/tianming/_sift_smoke}"
+# Dataset source/output directory and canonical-index output directory.
+__dataset_root="${SIFT1M_ROOT:-/path/to/datasets/sift1m}"
 __index_root="${SIFT1M_INDEX_DIR:-/path/to/indexes/sift1m}"
 
-# Required artifacts.
+# Input artifacts.
 DATA_FVECS="${DATA_FVECS:-$__dataset_root/sift_base.fvecs}"
 QUERY_FVECS="${QUERY_FVECS:-$__dataset_root/sift_query.fvecs}"
+
+# Generated artifact paths.
 DATA_BIN="${DATA_BIN:-$__dataset_root/sift_base.bin}"
 QUERY_BIN="${QUERY_BIN:-$__dataset_root/sift_query.bin}"
 GT_BIN_KCACHED="${GT_BIN_KCACHED:-$__dataset_root/sift1m_1000000_gt100.bin}"
