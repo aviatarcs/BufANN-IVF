@@ -1,14 +1,13 @@
 // Standalone PQ PIVOT builder: produces ONLY <prefix>_pq_pivots.bin (the
 // k-means trained codebook) for an index built with SKIP_PQ=1. It does NOT
-// write <prefix>_pq_compressed.bin -- the compression/assignment pass is the
-// expensive part and is now done on the GPU by
-// scripts/index_builds_PQ/build_pq_gpu.py (see that directory's README).
+// write <prefix>_pq_compressed.bin -- run build_pq_codes_standalone for the
+// compression/assignment pass, optionally limiting it to a base prefix.
 //
 // This mirrors the pivot-training block of diskann::build_disk_index
 // (src/aux_utils.cpp) and the first half of build_pq_standalone.cpp, so the
-// pivots are bit-for-bit what the original builder would have written; the GPU
-// assignment then reuses them and produces a byte-identical-format compressed
-// file.
+// pivots are bit-for-bit what the original builder would have written;
+// build_pq_codes_standalone reuses them and produces the same compressed-file
+// format.
 //
 // Usage:
 //   build_pq_pivot_standalone <type=float|int8|uint8>
@@ -74,7 +73,8 @@ void run(const std::string &base_file, const std::string &prefix,
                 << std::chrono::duration<double>(t1 - t0).count() << "s."
                 << std::endl;
   diskann::cout << "Wrote " << pq_pivots_path
-                << " (compression pass: use build_pq_gpu.py)" << std::endl;
+                << " (compression pass: use build_pq_codes_standalone)"
+                << std::endl;
 }
 
 int main(int argc, char **argv) {

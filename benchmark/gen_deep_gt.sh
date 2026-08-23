@@ -21,8 +21,9 @@ DEEP_K="${GT_DEEP_K:-100}"
 # Dataset identity + paths (DATA_BIN, QUERY_BIN, DATA_TYPE, GT_BIN_KCACHED, ...).
 source "$REPO_DIR/benchmark/datasets/_load.sh"
 # note / error / bin_count / configure_cmake_repo.
-source "$REPO_DIR/benchmark/utils.sh"
+source "$REPO_DIR/benchmark/scripts/utils.sh"
 
+ensure_dataset
 TOTAL_POINTS="$(bin_count "$DATA_BIN")"
 # The dataset cfg must declare GT_BIN_KCACHED (the persistent deep-cache path).
 [[ -n "${GT_BIN_KCACHED:-}" ]] || error "GT_BIN_KCACHED unset for $DATASET. Declare it in benchmark/datasets/$DATASET.sh"

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-: "${REPO_DIR:?REPO_DIR must be set before sourcing benchmark/utils.sh}"
+: "${REPO_DIR:?REPO_DIR must be set before sourcing benchmark/scripts/utils.sh}"
 BENCHMARK_DIR="${BENCHMARK_DIR:-$REPO_DIR/benchmark}"
 BENCH_DEPS_PREFIX="${BENCH_DEPS_PREFIX:-$(cd "$REPO_DIR/.." && pwd)/baselines_env}"
 BENCHMARK_CMAKE_BUILD_TYPE="Release"
@@ -177,23 +177,26 @@ materialize_canonical_family() {
 
 # Dataset paths come from the per-dataset file of truth (benchmark/datasets/
 # <name>.sh, loaded via benchmark/datasets/_load.sh). ensure_dataset only materializes a
-# .bin when the dataset declares an optional <X>_FVECS source and the .bin is
-# absent. Datasets whose .bin already exists (e.g. large prebuilt sets on shared
-# storage) declare no *_FVECS and this is a no-op beyond path canonicalization.
+# .bin when the dataset declares an optional <X>_FVECS or <X>_BVECS source and
+# the .bin is absent. Datasets whose .bin already exists declare neither source.
 __ensure_bin() {
-    local kind="$1" bin="$2" fvecs="$3"
+    local kind="$1" bin="$2" fvecs="$3" bvecs="$4"
     if [[ ! -f "$bin" ]]; then
-        [[ -n "$fvecs" && -f "$fvecs" ]] || \
-            error "missing $kind vectors: $bin not found and no convertible source (${fvecs:-<none>})"
-        python3 "$BENCHMARK_DIR/convert_fvec_to_bin.py" "$fvecs" "$bin"
+        if [[ -n "$fvecs" ]]; then
+            python3 "$BENCHMARK_DIR/convert_fvec_to_bin.py" "$fvecs" "$bin"
+        elif [[ -n "$bvecs" ]]; then
+            python3 "$BENCHMARK_DIR/convert_bvec_to_bin.py" "$bvecs" "$bin"
+        else
+            error "missing $kind vectors: $bin"
+        fi
     fi
 }
 
 ensure_dataset() {
     : "${DATA_BIN:?DATA_BIN unset - dataset config not loaded?}"
     : "${QUERY_BIN:?QUERY_BIN unset - dataset config not loaded?}"
-    __ensure_bin "dataset" "$DATA_BIN" "${DATA_FVECS:-}"
-    __ensure_bin "query"   "$QUERY_BIN" "${QUERY_FVECS:-}"
+    __ensure_bin "dataset" "$DATA_BIN" "${DATA_FVECS:-}" "${DATA_BVECS:-}"
+    __ensure_bin "query"   "$QUERY_BIN" "${QUERY_FVECS:-}" "${QUERY_BVECS:-}"
     DATA_BIN="$(readlink -f "$DATA_BIN")"
     QUERY_BIN="$(readlink -f "$QUERY_BIN")"
 }

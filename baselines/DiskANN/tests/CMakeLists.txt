@@ -57,6 +57,9 @@ target_link_libraries(build_pq_standalone ${PROJECT_NAME} -ltcmalloc aio)
 add_executable(build_pq_pivot_standalone build_pq_pivot_standalone.cpp )
 target_link_libraries(build_pq_pivot_standalone ${PROJECT_NAME} -ltcmalloc aio)
 
+add_executable(build_pq_codes_standalone build_pq_codes_standalone.cpp )
+target_link_libraries(build_pq_codes_standalone ${PROJECT_NAME} -ltcmalloc aio)
+
 add_executable(search_disk_index search_disk_index.cpp
     ${PROJECT_SOURCE_DIR}/src/aux_utils.cpp )
 if(MSVC)

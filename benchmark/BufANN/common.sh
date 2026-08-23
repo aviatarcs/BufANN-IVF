@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-source "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/utils.sh"
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/scripts/utils.sh"
 
 # BufANN's C++ side is this repository itself (the vectordb-bench root); the
 # baselines are vendored under baselines/. Env-overridable for relocations.
@@ -139,7 +139,7 @@ ensure_bufann_warmup_queries() {
     local work_dir pool_npts n seed cache dst
     work_dir="$1"
     pool_npts="${2:?ensure_bufann_warmup_queries: pool_npts required}"
-    n="${BUFANN_WARMUP_N:-1000000}"
+    n="${BUFANN_WARMUP_N:-1000}"
     seed="${BUFANN_WARMUP_SEED:-0}"
     dst="$work_dir/warmup_queries.bin"
     # BUFANN_WARMUP_N=0 disables the warmup-query phase; clear any stale

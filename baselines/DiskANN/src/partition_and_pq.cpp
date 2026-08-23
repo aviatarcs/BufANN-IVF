@@ -459,7 +459,7 @@ int generate_pq_data_from_pivots(const std::string data_file,
                                  unsigned num_centers, unsigned num_pq_chunks,
                                  std::string pq_pivots_path,
                                  std::string pq_compressed_vectors_path,
-                                 size_t      offset) {
+                                 size_t offset, size_t npts_override) {
   _u64            read_blk_size = 64 * 1024 * 1024;
   cached_ifstream base_reader(data_file, read_blk_size, (uint32_t) offset);
   _u32            npts32;
@@ -468,6 +468,12 @@ int generate_pq_data_from_pivots(const std::string data_file,
   base_reader.read((char *) &basedim32, sizeof(uint32_t));
   size_t num_points = npts32;
   size_t dim = basedim32;
+  if (npts_override > 0 && npts_override < num_points) {
+    diskann::cout << "Limiting PQ compression from " << num_points
+                  << " to npts_override=" << npts_override << std::endl;
+    num_points = npts_override;
+  }
+  _u32 num_points_u32 = static_cast<_u32>(num_points);
 
 #ifdef SAVE_INFLATED_PQ
   std::string inflated_pq_file = pq_compressed_vectors_path + "_full.bin";
@@ -556,12 +562,12 @@ int generate_pq_data_from_pivots(const std::string data_file,
                                        std::ios::binary);
   _u32          num_pq_chunks_u32 = num_pq_chunks;
 
-  compressed_file_writer.write((char *) &num_points, sizeof(uint32_t));
+  compressed_file_writer.write((char *) &num_points_u32, sizeof(uint32_t));
   compressed_file_writer.write((char *) &num_pq_chunks_u32, sizeof(uint32_t));
 
 #ifdef SAVE_INFLATED_PQ
   std::ofstream inflated_file_writer(inflated_pq_file, std::ios::binary);
-  inflated_file_writer.write((char *) &npts32, sizeof(uint32_t));
+  inflated_file_writer.write((char *) &num_points_u32, sizeof(uint32_t));
   inflated_file_writer.write((char *) &basedim32, sizeof(uint32_t));
 
   std::unique_ptr<float[]> block_inflated_base =
@@ -1075,12 +1081,12 @@ template DISKANN_DLLEXPORT int generate_pq_pivots<uint8_t>(
 template DISKANN_DLLEXPORT int generate_pq_data_from_pivots<int8_t>(
     const std::string data_file, unsigned num_centers, unsigned num_pq_chunks,
     std::string pq_pivots_path, std::string pq_compressed_vectors_path,
-    size_t offset);
+    size_t offset, size_t npts_override);
 template DISKANN_DLLEXPORT int generate_pq_data_from_pivots<uint8_t>(
     const std::string data_file, unsigned num_centers, unsigned num_pq_chunks,
     std::string pq_pivots_path, std::string pq_compressed_vectors_path,
-    size_t offset);
+    size_t offset, size_t npts_override);
 template DISKANN_DLLEXPORT int generate_pq_data_from_pivots<float>(
     const std::string data_file, unsigned num_centers, unsigned num_pq_chunks,
     std::string pq_pivots_path, std::string pq_compressed_vectors_path,
-    size_t offset);
+    size_t offset, size_t npts_override);
