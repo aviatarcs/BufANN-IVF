@@ -58,11 +58,13 @@ BUILD_L=200 BUILD_RAM_GB=64 bash benchmark/scripts/build_diskann_index.sh sift1m
 
 The builder uses all available CPU cores by default; set `BUILD_THREADS` to override that behavior.
 
+(Note: The DiskANN index is sometimes referred to as the "Canonical" graph / index in this repo.)
+
 ## 6. Run BufANN
 
 Each workload has a preparation script followed by a run script. The scripts handle conversion from the DiskANN graph to BufANN's heap format and derive workload-specific ground truth from the deep K=100 file.
 
-`eval_tempfiles/` contains the mutable files for the current evaluation run and can be recreated by running the preparation script again. `eval_cached/` stores reusable, expensive-to-produce artifacts such as converted indexes and derived dataset slices so later preparation runs can restore them.
+`eval_tempfiles/` contains the mutable files for the current evaluation run and can be recreated by running the preparation script again. `eval_cached/` stores reusable, expensive-to-produce artifacts such as converted indexes and derived dataset slices so later preparation runs can restore them. If you are using a server with many disk partitions, you might want to use symbolic links to manage where these two folders go, e.g. to enable running very large datasets.
 
 ```bash
 bash benchmark/BufANN/sift/query_prepare.sh
