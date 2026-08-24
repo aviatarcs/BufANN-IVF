@@ -14,8 +14,6 @@ WORK_DIR="${EVAL_TEMPFILES:-$REPO_DIR/eval_tempfiles}/$DATASET/$BASELINE/$WORKLO
 
 source "$REPO_DIR/benchmark/$BASELINE/common.sh"
 
-run_optional_fstrim
-
 ensure_dataset
 BASE_POINTS="$(canonical_base_points)"
 reset_work_dir "$WORK_DIR"

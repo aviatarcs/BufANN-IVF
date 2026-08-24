@@ -29,16 +29,6 @@ note() {
     echo "=== $* ==="
 }
 
-run_optional_fstrim() {
-    local helper="${FSTRIM_HELPER:-/usr/local/bin/fstrim-helper}"
-    if [[ ! -e "$helper" ]]; then
-        note "Skipping fstrim: $helper not found"
-        return 0
-    fi
-    note "Running fstrim via $helper"
-    "$helper" || error "fstrim failed via $helper"
-}
-
 write_ann_bench_metrics_json() {
     local run_log out_file
     run_log="${1:-${WORK_DIR:-}/run.log}"

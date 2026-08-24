@@ -20,8 +20,6 @@ if [[ -n "$UPDATE_BATCH" ]]; then
 fi
 source "$REPO_DIR/benchmark/$BASELINE/common.sh"
 
-run_optional_fstrim
-
 ensure_dataset
 compute_update_layout
 reset_work_dir "$WORK_DIR"

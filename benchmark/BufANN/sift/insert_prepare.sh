@@ -18,8 +18,6 @@ UPDATE_PERCENT="${UPDATE_PERCENT:-10}"
 
 source "$REPO_DIR/benchmark/$BASELINE/common.sh"
 
-run_optional_fstrim
-
 ensure_dataset
 compute_split
 if [[ -n "${INSERT_POINTS:-}" ]]; then
