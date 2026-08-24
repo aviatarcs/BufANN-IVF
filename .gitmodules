@@ -1,0 +1,9 @@
+[submodule "SPFresh/ThirdParty/zstd"]
+	path = baselines/SPFresh/ThirdParty/zstd
+	url = https://github.com/facebook/zstd
+[submodule "SPFresh/ThirdParty/spdk"]
+	path = baselines/SPFresh/ThirdParty/spdk
+	url = https://github.com/spdk/spdk
+[submodule "SPFresh/ThirdParty/isal-l_crypto"]
+	path = baselines/SPFresh/ThirdParty/isal-l_crypto
+	url = https://github.com/intel/isa-l_crypto
