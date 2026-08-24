@@ -502,7 +502,7 @@ patch_spfresh_mutation_ini() {
         "TmpDir=$output_dir/index/tmp" \
         "DeletedIDs=$output_dir/index/DeletedIDs.bin" \
         "BuildSsdIndex=false" \
-        "ExcludeHead=false" \
+        "ExcludeHead=true" \
         "UseKV=true" \
         "SsdInfoFile=$output_dir/index/SsdInfoFile" \
         "ResultNum=$RECALL_AT" \
@@ -512,7 +512,7 @@ patch_spfresh_mutation_ini() {
         "SearchTimes=${SPFRESH_MUTATION_SEARCH_TIMES:-1}" \
         "Update=true" \
         "SteadyState=true" \
-        "CalTruth=false" \
+        "CalTruth=true" \
         "LoadAllVectors=$SPFRESH_LOAD_ALL_VECTORS" \
         "OnlySearchFinalBatch=${SPFRESH_MUTATION_ONLY_SEARCH_FINAL_BATCH:-true}" \
         "SearchDuringUpdate=${SPFRESH_MUTATION_SEARCH_DURING_UPDATE:-false}" \
