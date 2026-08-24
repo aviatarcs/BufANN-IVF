@@ -1,8 +1,8 @@
-# Running SPFresh workloads in BufANN
+# Running SPFresh workloads
 
-This directory contains the bundled SPFresh source. BufANN runs SPFresh through the launcher scripts under [`benchmark/SPFresh/`](../../benchmark/SPFresh/). The original upstream documentation is preserved in [`README.old.md`](README.old.md).
+This directory contains the bundled SPFresh source. The evaluation framework runs SPFresh through the launcher scripts under [`benchmark/SPFresh/`](../../benchmark/SPFresh/). The original upstream documentation is preserved in [`README.old.md`](README.old.md).
 
-Run all commands below from the root of the BufANN repository.
+Run all commands below from the repository root.
 
 ## Before running a workload
 
