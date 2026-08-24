@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+
+DATASET="${DATASET:-sift1m}"
+source "$REPO_DIR/benchmark/datasets/_load.sh"
+BASELINE="SPFresh"
+WORKLOAD="update"
+# eval_tempfiles contract: consume the tree update_prepare.sh produced, in
+# place; spfresh mutates WORK_DIR/index. Re-running requires re-running
+# update_prepare.sh. See benchmark/docs/eval-tempfiles-contract.md.
+WORK_DIR="${EVAL_TEMPFILES:-$REPO_DIR/eval_tempfiles}/$DATASET/$BASELINE/$WORKLOAD"
+
+UPDATE_PERCENT="${UPDATE_PERCENT:-10}"
+UPDATE_BATCH="${UPDATE_BATCH:-}"
+if [[ -n "$UPDATE_BATCH" ]]; then
+    INSERT_CAP="${INSERT_CAP:-$UPDATE_BATCH}"
+    DELETE_CAP="${DELETE_CAP:-$UPDATE_BATCH}"
+fi
+NTHREADS="${NTHREADS:-$(nproc)}"
+SPFRESH_INSERT_THREADS="${SPFRESH_INSERT_THREADS:-${INSERT_THREADS:-$NTHREADS}}"
+SPFRESH_APPEND_THREADS="${SPFRESH_APPEND_THREADS:-$SPFRESH_INSERT_THREADS}"
+SPFRESH_DELETE_THREADS="${SPFRESH_DELETE_THREADS:-${DELETE_THREADS:-$NTHREADS}}"
+SPFRESH_REASSIGN_THREADS="${SPFRESH_REASSIGN_THREADS:-${REASSIGN_THREADS:-$((SPFRESH_INSERT_THREADS + SPFRESH_DELETE_THREADS + ${QUERY_THREADS:-$(nproc)}))}}"
+SPFRESH_MUTATION_DELETE_QPS="-1"
+SPFRESH_MUTATION_SAMPLING="1"
+SPFRESH_MUTATION_MERGE_THRESHOLD="${SPFRESH_MUTATION_MERGE_THRESHOLD:-10}"
+SPFRESH_MUTATION_LATENCY_LIMIT="100.0"
+SPFRESH_MUTATION_REASSIGN_K="64"
+SPFRESH_DISABLE_REASSIGN="${SPFRESH_DISABLE_REASSIGN:-true}"
+SPFRESH_IN_PLACE="true"
+SPFRESH_LOAD_ALL_VECTORS="true"
+SPFRESH_QUERY_THREADS="${SPFRESH_QUERY_THREADS:-$(nproc)}"
+SPFRESH_QUERY_INTERNAL_RESULT_NUM="${SPFRESH_QUERY_INTERNAL_RESULT_NUM:-512}"
+SPFRESH_QUERY_MAX_CHECK="${SPFRESH_QUERY_MAX_CHECK:-16324}"
+SPFRESH_QUERY_SEARCH_TIMES="${SPFRESH_QUERY_SEARCH_TIMES:-1}"
+SPFRESH_MUTATION_SEARCH_DURING_UPDATE="${SPFRESH_MUTATION_SEARCH_DURING_UPDATE:-true}"
+SPFRESH_MUTATION_ONLY_SEARCH_FINAL_BATCH="${SPFRESH_MUTATION_ONLY_SEARCH_FINAL_BATCH:-true}"
+SPFRESH_MUTATION_SEARCH_TIMES="${SPFRESH_MUTATION_SEARCH_TIMES:-1}"
+
+
+source "$REPO_DIR/benchmark/$BASELINE/common.sh"
+
+ensure_dataset
+compute_update_layout
+[[ -d "$WORK_DIR/index" ]] || error "missing update index; run update_prepare.sh first"
+[[ -f "$WORK_DIR/ids/insert_ids.bin" && -f "$WORK_DIR/ids/delete_ids.bin" ]] || error "missing update ids; run update_prepare.sh first"
+SPFRESH_MUTATION_DAYS="$UPDATE_ROUNDS"
+
+GT_FILE="$WORK_DIR/groundtruth/${DATASET}_update_i${INSERT_POINTS}_d${DELETE_POINTS}_gt${RECALL_AT}.bin"
+[[ -f "$GT_FILE" ]] || error "missing update groundtruth; run update_prepare.sh first"
+spfresh_apply_update "$WORK_DIR" "$GT_FILE" "$WORK_DIR/data/full.bin" "$UPDATE_ROUNDS"

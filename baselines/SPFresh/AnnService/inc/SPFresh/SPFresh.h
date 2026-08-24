@@ -921,8 +921,11 @@ namespace SPTAG {
                 p_index->GetDBStat();
 
                 int insertThreads = p_opts.m_insertThreadNum;
+                int deleteThreads = p_opts.m_deleteThreadNum;
+                bool runDelete = !p_opts.m_stressTest && deleteThreads > 0;
 
-                LOG(Helper::LogLevel::LL_Info, "Updating: numThread: %d, total days: %d.\n", insertThreads, days);
+                LOG(Helper::LogLevel::LL_Info, "Updating: insertThreads: %d, deleteThreads: %d, total days: %d.\n",
+                    insertThreads, deleteThreads, days);
 
                 LOG(Helper::LogLevel::LL_Info, "Start updating...\n");
 
@@ -954,13 +957,13 @@ namespace SPTAG {
                     bool showStatus = false;
 
                     std::future<void> delete_future;
-                    if (!p_opts.m_stressTest) {
+                    if (runDelete) {
                         delete_future =
                             std::async(std::launch::async, DeleteVectorsBySet<ValueType>, p_index,
-                                    1, vectorSet, std::ref(deleteSet), std::ref(mapping), updateSize, std::ref(p_opts), i);
+                                    deleteThreads, vectorSet, std::ref(deleteSet), std::ref(mapping), updateSize, std::ref(p_opts), i);
                     }
 
-                    std::future_status delete_status;
+                    std::future_status delete_status = std::future_status::ready;
 
                     std::future<void> insert_future =
                         std::async(std::launch::async, InsertVectorsBySet<ValueType>, p_index,
@@ -972,8 +975,7 @@ namespace SPTAG {
                     p_opts.m_calTruth = false;
                     do {
                         insert_status = insert_future.wait_for(std::chrono::seconds(2));
-                        if (!p_opts.m_stressTest) delete_status = delete_future.wait_for(std::chrono::seconds(2));
-                        else delete_status = std::future_status::ready;
+                        if (runDelete) delete_status = delete_future.wait_for(std::chrono::seconds(2));
                         if (insert_status == std::future_status::timeout || delete_status == std::future_status::timeout) {
                             if (p_index->GetNumDeleted() >= nextSamplePoint) {
                                 LOG(Helper::LogLevel::LL_Info, "Samppling Size: %d\n", nextSamplePoint);

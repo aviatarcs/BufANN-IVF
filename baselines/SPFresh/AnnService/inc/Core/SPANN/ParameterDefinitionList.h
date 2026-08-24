@@ -154,6 +154,8 @@ DefineSSDParameter(m_latencyLimit, float, 2.0, "LatencyLimit")
 DefineSSDParameter(m_step, int, 0, "Step")
 // Frontend update threadnum
 DefineSSDParameter(m_insertThreadNum, int, 16, "InsertThreadNum")
+// Frontend delete threadnum
+DefineSSDParameter(m_deleteThreadNum, int, 1, "DeleteThreadNum")
 // Update limit
 DefineSSDParameter(m_endVectorNum, int, -1, "EndVectorNum")
 // Persistent buffer path
