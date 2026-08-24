@@ -14,6 +14,16 @@ The BufANN driver is written to `build/tests/bufann_driver`. The DiskANN helpers
 
 Edit the appropriate file under `benchmark/datasets/` and configure its source vectors, dataset path, and index path. The scripts handle conversion to `.bin` and ground-truth generation.
 
+### Dataset downloads
+
+The original TexMex [SIFT1M archive](ftp://ftp.irisa.fr/local/texmex/corpus/sift.tar.gz) contains `sift/sift_base.fvecs` and `sift/sift_query.fvecs`. These are 128-dimensional float32 `fvecs` files.
+
+SIFT1B, also called BIGANN, is available as separate [base](ftp://ftp.irisa.fr/local/texmex/corpus/bigann_base.bvecs.gz), [query](ftp://ftp.irisa.fr/local/texmex/corpus/bigann_query.bvecs.gz), (and [learning](ftp://ftp.irisa.fr/local/texmex/corpus/bigann_learn.bvecs.gz)) vector files. Its supplied [ground-truth archive](ftp://ftp.irisa.fr/local/texmex/corpus/bigann_gnd.tar.gz) is optional because this repository generates ground truth separately. The base and query vectors are 128-dimensional uint8 `bvecs`.
+
+The [Big ANN Benchmarks dataset page](https://big-ann-benchmarks.com/neurips21.html) provides an HTTPS alternative in `u8bin` format. Those files are preconverted binary inputs, not `bvecs` inputs.
+
+### Dataset configuration
+
 For SIFT1M, set `DATA_FVECS` and `QUERY_FVECS` to the downloaded `sift_base.fvecs` and `sift_query.fvecs` files. The scripts convert them to float `.bin` files when needed.
 
 For SIFT10M and SIFT100M: create your own sample from SIFT-1B; you should either supply the resulting `.bvecs` or `.bin` to the script. (Note: SIFT-1B comes as uint8 `bvecs` format.)
@@ -77,7 +87,7 @@ bash benchmark/BufANN/sift/delete_prepare.sh
 bash benchmark/BufANN/sift/delete.sh
 
 bash benchmark/BufANN/sift/update_prepare.sh
-bash benchmark/BufANN/sift/update.sh
+NTHREADS=16 MERGE_THREADS=8 bash benchmark/BufANN/sift/update.sh
 ```
 
-The workloads are query-only, insert-only, delete-only, and mixed updates. Each run writes `result.json` and `run.log` under `eval_tempfiles/<dataset>/BufANN/<workload>/`.
+The mixed-update example assumes a 16-thread server and assigns eight threads to maintenance, leaving eight threads for concurrent queries. The workloads are query-only, insert-only, delete-only, and mixed updates. Each run writes `result.json` and `run.log` under `eval_tempfiles/<dataset>/BufANN/<workload>/`.
