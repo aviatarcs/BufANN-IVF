@@ -1383,7 +1383,7 @@ static InsertRunMetrics run_inserts(BufANNIndex<T> &idx,
     std::vector<uint32_t> sorted_ids = insert_ids;
     std::sort(sorted_ids.begin(), sorted_ids.end());
     const size_t required_internal_ids =
-        static_cast<size_t>(idx.store.num_active()) + sorted_ids.size() + 1;
+        static_cast<size_t>(idx.store.num_active()) + sorted_ids.size();
     const size_t reserve_internal_ids = idx.config.max_dataset_size;
     if (reserve_internal_ids > std::numeric_limits<uint32_t>::max()) {
         throw std::runtime_error("insert metadata reservation exceeds uint32_t node ID range");
@@ -1494,7 +1494,7 @@ static ConcurrentUpdateResult run_concurrent_update(
         sorted_ids = insert_ids;
         std::sort(sorted_ids.begin(), sorted_ids.end());
         const size_t required_internal_ids =
-            static_cast<size_t>(idx.store.num_active()) + sorted_ids.size() + 1;
+            static_cast<size_t>(idx.store.num_active()) + sorted_ids.size();
         const size_t reserve_internal_ids = idx.config.max_dataset_size;
         if (reserve_internal_ids > std::numeric_limits<uint32_t>::max()) {
             throw std::runtime_error(
@@ -2141,7 +2141,7 @@ static int run_workload(int argc, char **argv) {
                 const uint32_t active_cap =
                     bufann_snapshot_active_cap(index_prefix);
                 const uint64_t by_count =
-                    static_cast<uint64_t>(active_cap) + insert_ids.size() + 1;
+                    static_cast<uint64_t>(active_cap) + insert_ids.size();
                 const uint64_t by_tag = static_cast<uint64_t>(max_insert_id) + 1;
                 const uint64_t inferred = std::max(by_count, by_tag);
                 if (inferred > std::numeric_limits<uint32_t>::max()) {
