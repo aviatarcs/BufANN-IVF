@@ -16,17 +16,17 @@ Edit the appropriate file under `benchmark/datasets/` and configure its source v
 
 ### Dataset downloads
 
-The original TexMex [SIFT1M archive](ftp://ftp.irisa.fr/local/texmex/corpus/sift.tar.gz) contains `sift/sift_base.fvecs` and `sift/sift_query.fvecs`. These are 128-dimensional float32 `fvecs` files.
+Download the 128-dimensional float32 SIFT1M [base vectors](https://huggingface.co/datasets/qbo-odp/sift1m/resolve/main/sift_base.fvecs?download=true) and [query vectors](https://huggingface.co/datasets/qbo-odp/sift1m/resolve/main/sift_query.fvecs?download=true) in `fvecs` format.
 
-SIFT1B, also called BIGANN, is available as separate [base](ftp://ftp.irisa.fr/local/texmex/corpus/bigann_base.bvecs.gz), [query](ftp://ftp.irisa.fr/local/texmex/corpus/bigann_query.bvecs.gz), (and [learning](ftp://ftp.irisa.fr/local/texmex/corpus/bigann_learn.bvecs.gz)) vector files. Its supplied [ground-truth archive](ftp://ftp.irisa.fr/local/texmex/corpus/bigann_gnd.tar.gz) is optional because this repository generates ground truth separately. The base and query vectors are 128-dimensional uint8 `bvecs`.
-
-The [Big ANN Benchmarks dataset page](https://big-ann-benchmarks.com/neurips21.html) provides an HTTPS alternative in `u8bin` format. Those files are preconverted binary inputs, not `bvecs` inputs.
+SIFT1B, also called BIGANN, is available from the [Big ANN Benchmarks dataset page](https://big-ann-benchmarks.com/neurips21.html) as separate [base](https://dl.fbaipublicfiles.com/billion-scale-ann-benchmarks/bigann/base.1B.u8bin), [query](https://dl.fbaipublicfiles.com/billion-scale-ann-benchmarks/bigann/query.public.10K.u8bin), and [learning](https://dl.fbaipublicfiles.com/billion-scale-ann-benchmarks/bigann/learn.100M.u8bin) vector files. These are 128-dimensional uint8 `u8bin` inputs, i.e. they don't need conversion from `fvecs` to `bin`.
 
 ### Dataset configuration
 
+Datasets usually come in two dominant formats: the `.fvecs` or `.bvecs` format, which stores duplicated dimension count per vector, and the `.bin` (or `.u8bin` or other variants), which states the vector count and dimension once upfront, followed by all vectors packed. BufANN uses `.bin` as input, but if the `.bin` input path doesn't exist, it looks for configured `FVECS` or `BVECS` paths and convert from them.
+
 For SIFT1M, set `DATA_FVECS` and `QUERY_FVECS` to the downloaded `sift_base.fvecs` and `sift_query.fvecs` files. The scripts convert them to float `.bin` files when needed.
 
-For SIFT10M and SIFT100M: create your own sample from SIFT-1B; you should either supply the resulting `.bvecs` or `.bin` to the script. (Note: SIFT-1B comes as uint8 `bvecs` format.)
+For SIFT10M and SIFT100M, create your own sample from SIFT1B and supply the resulting `.bin` file.
 
 The first `NPTS_BASE` vectors form the initial index. The remaining `UPDATE_POINTS` vectors are reserved for insertion and mixed-update workloads. Verify that `DATA_TYPE`, `DIM`, `NPTS_FULL`, `NPTS_BASE`, and `UPDATE_POINTS` match the configured files.
 
