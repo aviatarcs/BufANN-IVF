@@ -1,115 +1,65 @@
-## **Supported Platform**
-We strongly recommend you to run SPFresh using the [Standard_L16s_v3](https://learn.microsoft.com/en-us/azure/virtual-machines/lsv3-series) instances on Azure as the code has been thoroughly tested there. 
+# Running SPFresh workloads in BufANN
 
-### **Important tips for creating Lsv3 VM**
-Since we use SPDK to build our storage, we need to disabled Secure boot option before creating Lsv3 VM, since:
-```
-1. Secure boot by default enables kernel lockdown
-2. Kernel lockdown forbids PCI direct access from userspace
-3. SPDK requires PCI direct access from userspace to run the NVMe driver
-```
+This directory contains the bundled SPFresh source. BufANN runs SPFresh through the launcher scripts under [`benchmark/SPFresh/`](../../benchmark/SPFresh/). The original upstream documentation is preserved in [`README.old.md`](README.old.md).
 
-## **Source Code (Artifacts Available)**
+Run all commands below from the root of the BufANN repository.
 
-> Clone the repository and submodules
+## Before running a workload
+
+Configure the selected dataset under `benchmark/datasets/` and follow the top-level [`README.md`](../../README.md) to prepare its converted vectors and deep ground truth. Initialize and build SPFresh's bundled dependencies and set up RocksDB by following the original instructions in [`README.old.md`](README.old.md). The launcher scripts configure and build the required SPFresh executables when needed. They expect RocksDB to be installed in the benchmark dependency prefix (`../baselines_env` by default); set `SPFRESH_ROCKSDB_DIR` if its CMake package is installed elsewhere.
+
+## Prepare, then run
+
+Each workload has a preparation script and a run script. The preparation step creates the workload tree, derives the appropriate ground truth, and builds or restores the native SPFresh index. The run step consumes that prepared tree.
+
 ```bash
-git clone git@github.com:SPFresh/SPFresh.git
-git submodule update --init --recursive
+# Query
+bash benchmark/SPFresh/sift/query_prepare.sh
+bash benchmark/SPFresh/sift/query.sh
+
+# Insert
+bash benchmark/SPFresh/sift/insert_prepare.sh
+bash benchmark/SPFresh/sift/insert.sh
+
+# Delete
+bash benchmark/SPFresh/sift/delete_prepare.sh
+bash benchmark/SPFresh/sift/delete.sh
+
+# Mixed insert/delete update
+bash benchmark/SPFresh/sift/update_prepare.sh
+bash benchmark/SPFresh/sift/update.sh
 ```
 
-## **Getting Started (Artifacts Functional)**
+The default dataset is `sift1m`. Select another configured profile on both commands of a pair:
 
-### SPFresh
-
-#### **Dependency**
-
-> install dependency
 ```bash
-sudo apt install cmake
-sudo apt install libjemalloc-dev libsnappy-dev libgflags-dev
-sudo apt install pkg-config
-sudo apt install swig libboost-all-dev
-sudo apt install libtbb-dev
-sudo apt install libisal-dev
+DATASET=sift10m bash benchmark/SPFresh/sift/query_prepare.sh
+DATASET=sift10m bash benchmark/SPFresh/sift/query.sh
 ```
 
-> We have modified rocksdb as an option of storage
-```bash
-git clone git@github.com:PtilopsisL/rocksdb.git
+The workloads exercise SPFresh as follows:
+
+- `query` searches an index built from the configured base portion.
+- `insert` builds the base index, inserts vectors from the following portion, and queries the resulting index.
+- `delete` builds the base index, deletes vectors from its tail, and queries the resulting index.
+- `update` performs mixed insert and delete batches and evaluates the updated index.
+
+Insert, delete, and update mutate their prepared index. Run the corresponding `*_prepare.sh` again before repeating one of those workloads.
+
+## Files produced by the scripts
+
+Prepared, workload-specific files live under:
+
+```text
+eval_tempfiles/<dataset>/SPFresh/<workload>/
 ```
 
-> Compile SPDK
-```bash
-cd ThirdParty/spdk
-./scripts/pkgdep.sh
-CC=gcc-9 ./configure
-CC=gcc-9 make -j
-```
-Remember to use higher version of gcc to do **both configure and compile**.
+Reusable native indexes are stored under:
 
-> Compile isal-l_crypto
-```bash
-cd ThirdParty/isal-l_crypto
-./autogen.sh
-./configure
-make -j
+```text
+eval_cached/<dataset>/SPFresh/
 ```
 
-> Build RocksDB
-```bash
-mkdir build && cd build
-cmake -DUSE_RTTI=1 -DWITH_JEMALLOC=1 -DWITH_SNAPPY=1 -DCMAKE_C_COMPILER=gcc-9 -DCMAKE_CXX_COMPILER=g++-9 -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS="-fPIC" ..
-make -j
-sudo make install
-```
+Each run writes its console output and evaluation results to `run.log` inside the workload directory.
 
-> Build SPFresh
-```bash
-mkdir build && cd build
-cmake -DCMAKE_BUILD_TYPE=Release ..
-make -j
-```
-
-### **Usage of build and search**
-The detailed usage can be found in [Get started](docs/GettingStart.md), and some of those variables definition can be found in [ParameterDefinitionList.h](AnnService/inc/Core/SPANN/ParameterDefinitionList.h).
-
-
-### **Source Code of Baselines**
-For most figures, there are three lines: SPFresh, SPANN+, and DiskANN. SPFresh stands for our system. and SPANN+ is the base system of SPFresh without LIRE protocol, [DiskANN](https://github.com/microsoft/DiskANN) is a recent system published in NIPS'19 and the [streaming version](https://github.com/microsoft/DiskANN/tree/diskv2) is uploaded in 2022, we use it as a baseline to show the performance bottleneck of out-of-place update. We have modified DiskANN to fit our reproduction scripts. Use the following command to clone the [Forked DiskANN](https://github.com/Yuming-Xu/DiskANN_Baseline.git) and build the baseline systems
-
-
-### **DiskANN**
-
-#### **Install**
-> clone DiskANN
-```bash
-git clone -b diskv2 https://github.com/Yuming-Xu/DiskANN_Baseline.git
-```
-> install the dependency of DiskANN
-```bash
-sudo apt install libgoogle-perftools-dev clang-format
-wget https://registrationcenter-download.intel.com/akdlm/irc_nas/18487/l_BaseKit_p_2022.1.2.146_offline.sh
-```
-#### **Build**
-> build then dependency of DiskANN
-```bash
-sudo sh ./l_BaseKit_p_2022.1.2.146_offline.sh
-```
-> following commands shows how to configure MKL
-```
-Accepet & Customize Install --> Intel® oneAPI Math Kernel Library(only select this) --> Skip Eclipse* IDE Configuration --> Begin Installation --> Close
-```
-
-> build DiskANN
-```
-mkdir build && cd build && cmake .. && make -j
-```
-
-> if liomp5 can not be found, the following command could be useful
-```bash
-sudo ln -s /opt/intel/oneapi/compiler/latest/linux/compiler/lib/intel64_lin/libiomp5.so /usr/lib/x86_64-linux-gnu/libiomp5.so
-```
-
-## **Reproduce All Experiment Results(Result Reproduced)**
-
-We provide scripts in ./Script_AE folder for reproducing our experiments. For more details, see [./Script_AE/README.md](./Script_AE).
+Common overrides include `UPDATE_PERCENT`, `INSERT_POINTS`, `DELETE_POINTS`, and `UPDATE_BATCH`. Thread counts can be adjusted with `SPFRESH_QUERY_THREADS`, `SPFRESH_INSERT_THREADS`, and `SPFRESH_DELETE_THREADS`.

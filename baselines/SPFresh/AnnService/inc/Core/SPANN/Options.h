@@ -155,6 +155,7 @@ namespace SPTAG {
             float m_latencyLimit;
             int m_step;
             int m_insertThreadNum;
+            int m_deleteThreadNum;
             int m_endVectorNum;
             std::string m_persistentBufferPath;
             int m_appendThreadNum;
