@@ -61,6 +61,12 @@ RawVectorHeapLayout compute_raw_vector_heap_layout(uint32_t page_size, uint32_t 
 // ---------------------------------------------------------------------------
 // RawVectorHeap
 // ---------------------------------------------------------------------------
+// No synchronization between write_vector/read_vector/free_slot: a freed
+// slot goes straight back onto the free list for immediate reuse, with no
+// grace period. Safe only while nothing else can be concurrently reading a
+// flat_slot that's being freed/reused -- once concurrent search (exact
+// re-rank reads) and concurrent insert/delete coexist, this needs the same
+// grace-period reclaim the design doc calls for around posting-list rebuilds.
 class RawVectorHeap {
 public:
     RawVectorHeap() = default;

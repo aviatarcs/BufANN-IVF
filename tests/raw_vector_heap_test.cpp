@@ -5,6 +5,7 @@
 // allocate/write/read/free/reuse over RawVectorHeap + RawVectorFreeList.
 
 #include "bufann/raw_vector_heap.h"
+#include "ann_exception.h"
 
 #include <algorithm>
 #include <cstring>
@@ -99,11 +100,37 @@ bool test_allocate_write_read_free_reuse() {
     return pass;
 }
 
+bool test_open_refuses_existing_nonempty_file() {
+    std::cout << "[Test] open() refuses to reopen an existing non-empty heap..." << std::endl;
+    std::string path = "/tmp/raw_vector_heap_test_reopen_" + std::to_string((uint64_t) getpid()) + ".bin";
+    RawVectorHeapLayout layout = compute_raw_vector_heap_layout(4096, 512);
+
+    RawVectorHeap heap;
+    heap.open(path, layout);
+    RawVectorFreeList free_list;
+    heap.write_vector(heap.allocate_slot(free_list), std::vector<char>(512, 'x').data());
+    heap.close();
+
+    bool pass = false;
+    RawVectorHeap heap2;
+    try {
+        heap2.open(path, layout);
+        std::cout << "  FAIL: open() silently truncated an existing non-empty heap" << std::endl;
+    } catch (const diskann::ANNException&) {
+        pass = true;
+    }
+
+    ::unlink(path.c_str());
+    std::cout << "  " << (pass ? "PASS" : "FAIL") << std::endl;
+    return pass;
+}
+
 }  // namespace
 
 int main() {
     bool all_pass = true;
     all_pass &= test_layout_matches_design_doc_example();
     all_pass &= test_allocate_write_read_free_reuse();
+    all_pass &= test_open_refuses_existing_nonempty_file();
     return all_pass ? 0 : 1;
 }

@@ -59,6 +59,20 @@ RawVectorHeap::~RawVectorHeap() { close(); }
 void RawVectorHeap::open(const std::string& path, RawVectorHeapLayout layout) {
     close();
     _layout = layout;
+
+    // Reopening an existing non-empty heap isn't supported yet (see the
+    // file-header comment), so refuse rather than silently truncating
+    // whatever a caller expected to still be there.
+    struct stat st;
+    if (::stat(path.c_str(), &st) == 0 && st.st_size > 0) {
+        throw ANNException(
+            "Refusing to overwrite existing non-empty raw-vector heap file "
+            "(reopen/recovery not yet supported): " + path,
+            -1, __FUNCSIG__, __FILE__, __LINE__);
+    }
+
+    // No O_DIRECT: this heap bypasses the buffer pool entirely for now, so
+    // there's no requirement that caller buffers be page-aligned.
     _fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
     if (_fd < 0) {
         throw ANNException("Failed to open raw-vector heap file: " + path,
