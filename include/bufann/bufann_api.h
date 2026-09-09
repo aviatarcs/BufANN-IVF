@@ -15,6 +15,7 @@
 #include "pq_table.h"
 #include "utils.h"
 #include "bufann/inplace_backend.h"
+#include "bufann/ivf_pq.h"
 
 namespace diskann {
 namespace inplace {
@@ -23,9 +24,25 @@ namespace inplace {
 // Configuration
 // ---------------------------------------------------------------------------
 
+// Selects which index implementation BufANNConfig configures. Chosen at
+// build/startup time; graph and IVF-PQ indexes are independent on-disk
+// formats and are never mixed within a single index_prefix.
+enum class IndexType : uint8_t {
+    Graph = 0,
+    IvfPq = 1,
+};
+
 struct BufANNConfig {
     // --- required ---
     uint32_t dim = 0;           // vector dimensionality
+
+    // --- index type ---
+    IndexType index_type = IndexType::Graph;
+
+    // --- IVF-PQ parameters (only used when index_type == IvfPq) ---
+    uint32_t ivf_nlist     = 0;  // number of coarse-quantizer partitions
+    uint32_t ivf_nprobe    = 0;  // partitions probed per search
+    uint32_t ivf_pq_chunks = 0;  // PQ subvector count for IVF-PQ codes/pivots
 
     // --- graph parameters ---
     uint32_t R           = 64;  // max graph degree (used for build and insert pruning)
