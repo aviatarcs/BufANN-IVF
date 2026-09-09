@@ -55,3 +55,7 @@ target_link_libraries(bufann_gt_computer ${PROJECT_NAME} aio -ltcmalloc)
 # Driver 3: use an index — search_only or search_after_update workloads.
 add_executable(bufann_driver bufann_driver.cpp)
 target_link_libraries(bufann_driver ${PROJECT_NAME} aio -ltcmalloc)
+
+# IVF-PQ raw-vector heap storage primitive test.
+add_executable(raw_vector_heap_test raw_vector_heap_test.cpp)
+target_link_libraries(raw_vector_heap_test ${PROJECT_NAME} aio -ltcmalloc)

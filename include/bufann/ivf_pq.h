@@ -82,27 +82,31 @@ struct IVFPQSearchConfig {
 // ---------------------------------------------------------------------------
 // RawVectorRID -- packed pointer from a vector ID to its raw-vector heap slot
 // ---------------------------------------------------------------------------
-// Raw-vector pages hold 7 fixed-size slots each (see the page layout below).
 // A RID is packed into 32 bits: bit 31 is the active flag, the low 31 bits
-// are a flat slot index that decomposes into (page_id, slot_idx).
+// are a flat slot index that decomposes into (page_id, slot_idx) given the
+// heap's slots-per-page (see RawVectorHeapLayout in raw_vector_heap.h) --
+// slots per page depends on the configured element size, so it is passed in
+// rather than assumed fixed.
 struct RawVectorRID {
     uint32_t packed = 0;
 };
 static_assert(sizeof(RawVectorRID) == 4, "RawVectorRID must pack into 32 bits");
 
-constexpr uint32_t kRawVectorSlotsPerPage = 7;
 constexpr uint32_t kRawVectorRidActiveBit = 0x80000000u;
 constexpr uint32_t kRawVectorRidSlotMask  = 0x7FFFFFFFu;
 
 inline uint32_t rid_flat_slot(RawVectorRID rid) { return rid.packed & kRawVectorRidSlotMask; }
 inline bool     rid_is_active(RawVectorRID rid) { return (rid.packed & kRawVectorRidActiveBit) != 0; }
-inline uint32_t rid_page_id(RawVectorRID rid) { return rid_flat_slot(rid) / kRawVectorSlotsPerPage; }
-inline uint32_t rid_slot_idx(RawVectorRID rid) { return rid_flat_slot(rid) % kRawVectorSlotsPerPage; }
+inline uint32_t rid_page_id(RawVectorRID rid, uint32_t slots_per_page) {
+    return rid_flat_slot(rid) / slots_per_page;
+}
+inline uint32_t rid_slot_idx(RawVectorRID rid, uint32_t slots_per_page) {
+    return rid_flat_slot(rid) % slots_per_page;
+}
 
-inline RawVectorRID make_raw_vector_rid(uint32_t page_id, uint32_t slot_idx, bool active) {
-    uint32_t flat = page_id * kRawVectorSlotsPerPage + slot_idx;
+inline RawVectorRID make_raw_vector_rid(uint32_t flat_slot, bool active) {
     RawVectorRID rid;
-    rid.packed = (flat & kRawVectorRidSlotMask) | (active ? kRawVectorRidActiveBit : 0u);
+    rid.packed = (flat_slot & kRawVectorRidSlotMask) | (active ? kRawVectorRidActiveBit : 0u);
     return rid;
 }
 
