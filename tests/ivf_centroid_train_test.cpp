@@ -1,6 +1,3 @@
-// Copyright (c) Microsoft Corporation. All rights reserved.
-// Licensed under the MIT license.
-//
 // Smoke test for IVF coarse-quantizer centroid training: trains on synthetic
 // well-separated blobs and checks the trained centroids recover them, plus a
 // save/load round-trip.

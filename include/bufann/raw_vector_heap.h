@@ -1,6 +1,3 @@
-// Copyright (c) Microsoft Corporation. All rights reserved.
-// Licensed under the MIT license.
-//
 // File-backed storage for the IVF-PQ raw-vector heap: fixed-size slots
 // grouped into fixed-size pages, addressed by RawVectorRID (see ivf_pq.h).
 //

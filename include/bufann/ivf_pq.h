@@ -1,6 +1,3 @@
-// Copyright (c) Microsoft Corporation. All rights reserved.
-// Licensed under the MIT license.
-//
 // On-disk and in-memory data structures for the IVF-PQ index type.
 //
 // IVF-PQ is a separate index type from the BufANN graph index: it carries no

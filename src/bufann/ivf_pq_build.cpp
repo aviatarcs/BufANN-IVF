@@ -1,6 +1,3 @@
-// Copyright (c) Microsoft Corporation. All rights reserved.
-// Licensed under the MIT license.
-
 #include "bufann/ivf_pq_build.h"
 
 #include <algorithm>

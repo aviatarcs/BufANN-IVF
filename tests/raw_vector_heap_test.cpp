@@ -1,6 +1,3 @@
-// Copyright (c) Microsoft Corporation. All rights reserved.
-// Licensed under the MIT license.
-//
 // Smoke test for the IVF-PQ raw-vector heap storage primitive:
 // allocate/write/read/free/reuse over RawVectorHeap + RawVectorFreeList.
 

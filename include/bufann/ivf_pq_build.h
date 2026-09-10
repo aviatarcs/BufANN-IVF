@@ -1,6 +1,3 @@
-// Copyright (c) Microsoft Corporation. All rights reserved.
-// Licensed under the MIT license.
-//
 // Build-time steps for the IVF-PQ index. Each step persists its own sidecar
 // artifact; a later step stitches them into the combined index file described
 // by IVFPQIndexFileHeader (see ivf_pq.h).

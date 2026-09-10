@@ -1,6 +1,3 @@
-// Copyright (c) Microsoft Corporation. All rights reserved.
-// Licensed under the MIT license.
-
 #include "bufann/raw_vector_heap.h"
 
 #include <fcntl.h>
