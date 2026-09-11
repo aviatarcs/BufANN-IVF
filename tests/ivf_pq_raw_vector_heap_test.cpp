@@ -109,8 +109,8 @@ bool test_concurrent_writes_to_one_page_keep_every_occupancy_bit() {
     RawVectorHeapLayout layout = compute_raw_vector_heap_layout(4096, elem_size);
 
     bool pass = true;
-    const int kRuns = 200;
-    for (int run = 0; run < kRuns && pass; ++run) {
+    const int NUM_RUNS = 200;
+    for (int run = 0; run < NUM_RUNS && pass; ++run) {
         ::unlink(path.c_str());
         RawVectorHeap heap;
         heap.open(path, layout);
@@ -178,12 +178,12 @@ bool test_rejects_slots_past_the_rid_slot_space() {
     RawVectorHeap heap;
     heap.open(path, layout);
     RawVectorFreeList free_list;
-    heap.restore_slot_cursor(kRawVectorRidSlotMask, kRawVectorRidSlotMask + 1u);
+    heap.restore_slot_cursor(RAW_VECTOR_RID_SLOT_MASK, RAW_VECTOR_RID_SLOT_MASK + 1u);
 
     bool pass = false;
     try {
         uint32_t last = heap.allocate_slot(free_list);  // the last addressable slot
-        if (last != kRawVectorRidSlotMask) {
+        if (last != RAW_VECTOR_RID_SLOT_MASK) {
             std::cout << "  FAIL: expected the last addressable slot, got " << last << std::endl;
         }
         heap.allocate_slot(free_list);  // one past it -- must throw

@@ -23,13 +23,13 @@
 namespace diskann {
 namespace inplace {
 
-static constexpr uint32_t kRawVectorPageHeaderBytes = 8;
+constexpr uint32_t RAW_VECTOR_PAGE_HEADER_BYTES = 8;
 
 // Occupancy-bitmap updates are serialized on a stripe of mutexes indexed by
 // page_id. Striping rather than one lock per page keeps the heap's footprint
 // independent of how far it has grown; pages that collide on a stripe just
 // serialize, which is correct but rarely contended at this width.
-static constexpr uint32_t kRawVectorBitmapLockStripes = 64;
+constexpr uint32_t RAW_VECTOR_BITMAP_LOCK_STRIPES = 64;
 
 // ---------------------------------------------------------------------------
 // RawVectorHeapLayout -- page/slot geometry for a given (page_size, elem_size)
@@ -55,7 +55,7 @@ struct RawVectorHeapLayout {
                static_cast<uint64_t>(slot_idx) * elem_size;
     }
     uint64_t bitmap_offset(uint32_t page_id) const {
-        return page_offset(page_id) + kRawVectorPageHeaderBytes;
+        return page_offset(page_id) + RAW_VECTOR_PAGE_HEADER_BYTES;
     }
 };
 
@@ -125,7 +125,7 @@ private:
     int _fd = -1;
     RawVectorHeapLayout _layout;
     std::mutex _grow_mtx;
-    mutable std::array<std::mutex, kRawVectorBitmapLockStripes> _bitmap_mtx;
+    mutable std::array<std::mutex, RAW_VECTOR_BITMAP_LOCK_STRIPES> _bitmap_mtx;
     uint32_t _next_flat_slot = 0;
     uint32_t _allocated_pages = 0;
 };

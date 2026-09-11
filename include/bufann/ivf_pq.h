@@ -97,11 +97,11 @@ struct RawVectorRID {
 };
 static_assert(sizeof(RawVectorRID) == 4, "RawVectorRID must pack into 32 bits");
 
-constexpr uint32_t kRawVectorRidActiveBit = 0x80000000u;
-constexpr uint32_t kRawVectorRidSlotMask  = 0x7FFFFFFFu;
+constexpr uint32_t RAW_VECTOR_RID_ACTIVE_BIT = 0x80000000u;
+constexpr uint32_t RAW_VECTOR_RID_SLOT_MASK  = 0x7FFFFFFFu;
 
-inline uint32_t rid_flat_slot(RawVectorRID rid) { return rid.packed & kRawVectorRidSlotMask; }
-inline bool     rid_is_active(RawVectorRID rid) { return (rid.packed & kRawVectorRidActiveBit) != 0; }
+inline uint32_t rid_flat_slot(RawVectorRID rid) { return rid.packed & RAW_VECTOR_RID_SLOT_MASK; }
+inline bool     rid_is_active(RawVectorRID rid) { return (rid.packed & RAW_VECTOR_RID_ACTIVE_BIT) != 0; }
 inline uint32_t rid_page_id(RawVectorRID rid, uint32_t slots_per_page) {
     return rid_flat_slot(rid) / slots_per_page;
 }
@@ -111,7 +111,7 @@ inline uint32_t rid_slot_idx(RawVectorRID rid, uint32_t slots_per_page) {
 
 inline RawVectorRID make_raw_vector_rid(uint32_t flat_slot, bool active) {
     RawVectorRID rid;
-    rid.packed = (flat_slot & kRawVectorRidSlotMask) | (active ? kRawVectorRidActiveBit : 0u);
+    rid.packed = (flat_slot & RAW_VECTOR_RID_SLOT_MASK) | (active ? RAW_VECTOR_RID_ACTIVE_BIT : 0u);
     return rid;
 }
 

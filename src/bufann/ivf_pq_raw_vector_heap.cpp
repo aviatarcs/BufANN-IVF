@@ -23,7 +23,7 @@ RawVectorHeapLayout compute_raw_vector_heap_layout(uint32_t page_size, uint32_t 
     uint32_t bitmap_bytes = 0;
     uint32_t slots_per_page = 0;
     for (int iter = 0; iter < 8; ++iter) {
-        uint32_t used = kRawVectorPageHeaderBytes + bitmap_bytes;
+        uint32_t used = RAW_VECTOR_PAGE_HEADER_BYTES + bitmap_bytes;
         if (used >= page_size || elem_size == 0) {
             throw ANNException(
                 "raw-vector element size does not fit in page_size",
@@ -47,7 +47,7 @@ RawVectorHeapLayout compute_raw_vector_heap_layout(uint32_t page_size, uint32_t 
 
     layout.bitmap_bytes = bitmap_bytes;
     layout.slots_per_page = slots_per_page;
-    layout.slots_offset = kRawVectorPageHeaderBytes + bitmap_bytes;
+    layout.slots_offset = RAW_VECTOR_PAGE_HEADER_BYTES + bitmap_bytes;
     return layout;
 }
 
@@ -100,7 +100,7 @@ uint32_t RawVectorHeap::allocate_slot(RawVectorFreeList& free_list) {
     // A flat slot has to survive being packed into RawVectorRID's low 31 bits;
     // past that, make_raw_vector_rid() would silently mask and alias an
     // already-live slot.
-    if (_next_flat_slot > kRawVectorRidSlotMask) {
+    if (_next_flat_slot > RAW_VECTOR_RID_SLOT_MASK) {
         throw ANNException("raw-vector heap is full: flat slot index exceeds "
                            "the 31 bits addressable by RawVectorRID",
                            -1, __FUNCSIG__, __FILE__, __LINE__);
@@ -154,7 +154,7 @@ bool RawVectorHeap::is_slot_occupied(uint32_t flat_slot) const {
     uint32_t slot_idx = flat_slot % _layout.slots_per_page;
     uint64_t off = _layout.bitmap_offset(page_id) + slot_idx / 8;
 
-    std::lock_guard<std::mutex> lg(_bitmap_mtx[page_id % kRawVectorBitmapLockStripes]);
+    std::lock_guard<std::mutex> lg(_bitmap_mtx[page_id % RAW_VECTOR_BITMAP_LOCK_STRIPES]);
 
     uint8_t byte = 0;
     ssize_t n = ::pread(_fd, &byte, 1, static_cast<off_t>(off));
@@ -180,7 +180,7 @@ void RawVectorHeap::set_occupancy_bit(uint32_t page_id, uint32_t slot_idx, bool 
 
     // Slots within a page share bitmap bytes, so this read-modify-write has to
     // be atomic with respect to other slots of the same page.
-    std::lock_guard<std::mutex> lg(_bitmap_mtx[page_id % kRawVectorBitmapLockStripes]);
+    std::lock_guard<std::mutex> lg(_bitmap_mtx[page_id % RAW_VECTOR_BITMAP_LOCK_STRIPES]);
 
     uint8_t byte = 0;
     ssize_t n = ::pread(_fd, &byte, 1, static_cast<off_t>(off));

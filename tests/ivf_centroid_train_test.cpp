@@ -17,15 +17,15 @@ using namespace diskann::inplace;
 
 namespace {
 
-const uint32_t kNumBlobs = 8;
-const uint32_t kPointsPerBlob = 500;
-const uint32_t kDim = 12;  // not a multiple of 8, so padding is exercised
-const float kBlobSpacing = 50.0f;
+const uint32_t NUM_BLOBS = 8;
+const uint32_t POINTS_PER_BLOB = 500;
+const uint32_t BLOB_DIM = 12;  // not a multiple of 8, so padding is exercised
+const float BLOB_SPACING = 50.0f;
 
-// Blob b sits at (b * kBlobSpacing) in every dimension, so blobs are far
+// Blob b sits at (b * BLOB_SPACING) in every dimension, so blobs are far
 // apart relative to the unit-ish noise added to each point.
 std::vector<float> blob_center(uint32_t b) {
-    return std::vector<float>(kDim, static_cast<float>(b) * kBlobSpacing);
+    return std::vector<float>(BLOB_DIM, static_cast<float>(b) * BLOB_SPACING);
 }
 
 std::string write_synthetic_base(const std::string& path) {
@@ -33,17 +33,17 @@ std::string write_synthetic_base(const std::string& path) {
     std::normal_distribution<float> noise(0.0f, 1.0f);
 
     std::vector<float> data;
-    data.reserve(static_cast<size_t>(kNumBlobs) * kPointsPerBlob * kDim);
-    for (uint32_t b = 0; b < kNumBlobs; ++b) {
+    data.reserve(static_cast<size_t>(NUM_BLOBS) * POINTS_PER_BLOB * BLOB_DIM);
+    for (uint32_t b = 0; b < NUM_BLOBS; ++b) {
         std::vector<float> center = blob_center(b);
-        for (uint32_t i = 0; i < kPointsPerBlob; ++i) {
-            for (uint32_t d = 0; d < kDim; ++d) {
+        for (uint32_t i = 0; i < POINTS_PER_BLOB; ++i) {
+            for (uint32_t d = 0; d < BLOB_DIM; ++d) {
                 data.push_back(center[d] + noise(gen));
             }
         }
     }
     diskann::save_bin<float>(path, data.data(),
-                             static_cast<size_t>(kNumBlobs) * kPointsPerBlob, kDim);
+                             static_cast<size_t>(NUM_BLOBS) * POINTS_PER_BLOB, BLOB_DIM);
     return path;
 }
 
@@ -62,7 +62,7 @@ bool test_centroids_recover_blobs(const IVFMetadata& meta) {
 
     // Each blob should claim its own distinct centroid, sitting close to it.
     std::vector<uint32_t> claimed;
-    for (uint32_t b = 0; b < kNumBlobs; ++b) {
+    for (uint32_t b = 0; b < NUM_BLOBS; ++b) {
         std::vector<float> center = blob_center(b);
         uint32_t best = 0;
         float best_dist = dist_to_centroid(center, meta, 0);
@@ -95,7 +95,7 @@ bool test_metadata_shape_and_padding(const IVFMetadata& meta) {
     std::cout << "[Test] metadata shape and aligned-dim zero padding..." << std::endl;
     bool pass = true;
 
-    if (meta.nlist != kNumBlobs || meta.dim != kDim || meta.aligned_dim != 16) {
+    if (meta.nlist != NUM_BLOBS || meta.dim != BLOB_DIM || meta.aligned_dim != 16) {
         std::cout << "  FAIL: unexpected shape nlist=" << meta.nlist << " dim=" << meta.dim
                   << " aligned_dim=" << meta.aligned_dim << std::endl;
         pass = false;
@@ -142,7 +142,7 @@ int main() {
     bool all_pass = true;
     try {
         write_synthetic_base(base_bin);
-        IVFMetadata meta = train_ivf_centroids<float>(base_bin, kNumBlobs, 1.0);
+        IVFMetadata meta = train_ivf_centroids<float>(base_bin, NUM_BLOBS, 1.0);
 
         all_pass &= test_metadata_shape_and_padding(meta);
         all_pass &= test_centroids_recover_blobs(meta);
