@@ -164,6 +164,40 @@ bool test_concurrent_writes_to_one_page_keep_every_occupancy_bit() {
     return pass;
 }
 
+bool test_rejects_slots_past_the_rid_slot_space() {
+    std::cout << "[Test] allocate_slot refuses to hand out an unaddressable slot..." << std::endl;
+    std::string path =
+        "/tmp/ivf_pq_raw_vector_heap_test_full_" + std::to_string((uint64_t) getpid()) + ".bin";
+    ::unlink(path.c_str());
+
+    // One slot per page, with the cursor parked on the last addressable slot
+    // and the page count already past it, so neither allocation below touches
+    // the file -- otherwise reaching this boundary would mean extending across
+    // 2^31 pages.
+    RawVectorHeapLayout layout = compute_raw_vector_heap_layout(4096, 4096 - 9);
+    RawVectorHeap heap;
+    heap.open(path, layout);
+    RawVectorFreeList free_list;
+    heap.restore_slot_cursor(kRawVectorRidSlotMask, kRawVectorRidSlotMask + 1u);
+
+    bool pass = false;
+    try {
+        uint32_t last = heap.allocate_slot(free_list);  // the last addressable slot
+        if (last != kRawVectorRidSlotMask) {
+            std::cout << "  FAIL: expected the last addressable slot, got " << last << std::endl;
+        }
+        heap.allocate_slot(free_list);  // one past it -- must throw
+        std::cout << "  FAIL: handed out a slot that RawVectorRID cannot address" << std::endl;
+    } catch (const diskann::ANNException&) {
+        pass = true;
+    }
+
+    heap.close();
+    ::unlink(path.c_str());
+    std::cout << "  " << (pass ? "PASS" : "FAIL") << std::endl;
+    return pass;
+}
+
 bool test_open_refuses_existing_nonempty_file() {
     std::cout << "[Test] open() refuses to reopen an existing non-empty heap..." << std::endl;
     std::string path = "/tmp/ivf_pq_raw_vector_heap_test_reopen_" + std::to_string((uint64_t) getpid()) + ".bin";
@@ -196,6 +230,7 @@ int main() {
     all_pass &= test_layout_matches_design_doc_example();
     all_pass &= test_allocate_write_read_free_reuse();
     all_pass &= test_concurrent_writes_to_one_page_keep_every_occupancy_bit();
+    all_pass &= test_rejects_slots_past_the_rid_slot_space();
     all_pass &= test_open_refuses_existing_nonempty_file();
     return all_pass ? 0 : 1;
 }

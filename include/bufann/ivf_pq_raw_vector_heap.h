@@ -101,6 +101,12 @@ public:
     // Reads layout().elem_size bytes from `flat_slot` into `out`.
     void read_vector(uint32_t flat_slot, void* out) const;
 
+    // Repositions the allocation cursor over a heap whose contents already
+    // exist. open() starts both of these at zero; the durability/recovery path
+    // is what will call this, after reading the persisted state back. Not safe
+    // to call while anything else is allocating.
+    void restore_slot_cursor(uint32_t next_flat_slot, uint32_t allocated_pages);
+
     // Reads back `flat_slot`'s occupancy bit. The bitmap is what a future
     // reopen/recovery path has to rebuild the free list from, so it is worth
     // being able to read it and not only write it.

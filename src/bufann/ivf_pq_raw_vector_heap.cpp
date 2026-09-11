@@ -97,6 +97,14 @@ uint32_t RawVectorHeap::allocate_slot(RawVectorFreeList& free_list) {
     }
 
     std::lock_guard<std::mutex> lg(_grow_mtx);
+    // A flat slot has to survive being packed into RawVectorRID's low 31 bits;
+    // past that, make_raw_vector_rid() would silently mask and alias an
+    // already-live slot.
+    if (_next_flat_slot > kRawVectorRidSlotMask) {
+        throw ANNException("raw-vector heap is full: flat slot index exceeds "
+                           "the 31 bits addressable by RawVectorRID",
+                           -1, __FUNCSIG__, __FILE__, __LINE__);
+    }
     uint32_t flat = _next_flat_slot++;
     uint32_t page_id = flat / _layout.slots_per_page;
     if (page_id >= _allocated_pages) {
@@ -133,6 +141,12 @@ void RawVectorHeap::read_vector(uint32_t flat_slot, void* out) const {
     if (n < 0 || static_cast<uint32_t>(n) != _layout.elem_size) {
         throw ANNException("Failed to read raw vector", -1, __FUNCSIG__, __FILE__, __LINE__);
     }
+}
+
+void RawVectorHeap::restore_slot_cursor(uint32_t next_flat_slot, uint32_t allocated_pages) {
+    std::lock_guard<std::mutex> lg(_grow_mtx);
+    _next_flat_slot  = next_flat_slot;
+    _allocated_pages = allocated_pages;
 }
 
 bool RawVectorHeap::is_slot_occupied(uint32_t flat_slot) const {
