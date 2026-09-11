@@ -87,9 +87,10 @@ public:
     // Reads layout().elem_size bytes from `flat_slot` into `out`.
     void read_vector(uint32_t flat_slot, void* out) const;
 
-    // Clears the occupancy bit for `flat_slot`. Caller is responsible for
-    // pushing `flat_slot` onto a RawVectorFreeList.
-    void free_slot(uint32_t flat_slot);
+    // Clears the occupancy bit for `flat_slot` and returns it to `free_list`
+    // for reuse. Both halves happen under the free list's own mutex, so this
+    // mirrors allocate_slot rather than leaving the caller to push by hand.
+    void free_slot(uint32_t flat_slot, RawVectorFreeList& free_list);
 
     const RawVectorHeapLayout& layout() const { return _layout; }
 

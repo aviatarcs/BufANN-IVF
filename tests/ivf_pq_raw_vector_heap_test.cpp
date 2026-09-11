@@ -63,8 +63,7 @@ bool test_allocate_write_read_free_reuse() {
     // flat slots (LIFO) rather than growing the heap further.
     std::vector<uint32_t> freed;
     for (uint32_t i = 0; i < num_vectors; i += 2) {
-        heap.free_slot(flat_slots[i]);
-        free_list.free_slots.push_back(flat_slots[i]);
+        heap.free_slot(flat_slots[i], free_list);
         freed.push_back(flat_slots[i]);
     }
 

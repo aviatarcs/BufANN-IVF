@@ -135,10 +135,13 @@ void RawVectorHeap::read_vector(uint32_t flat_slot, void* out) const {
     }
 }
 
-void RawVectorHeap::free_slot(uint32_t flat_slot) {
+void RawVectorHeap::free_slot(uint32_t flat_slot, RawVectorFreeList& free_list) {
     uint32_t page_id = flat_slot / _layout.slots_per_page;
     uint32_t slot_idx = flat_slot % _layout.slots_per_page;
     set_occupancy_bit(page_id, slot_idx, false);
+
+    std::lock_guard<std::mutex> lg(free_list.mtx);
+    free_list.free_slots.push_back(flat_slot);
 }
 
 void RawVectorHeap::set_occupancy_bit(uint32_t page_id, uint32_t slot_idx, bool occupied) {
