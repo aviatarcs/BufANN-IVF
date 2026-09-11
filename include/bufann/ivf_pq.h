@@ -67,6 +67,14 @@ struct PQMetadata {
 // PostingLists / ClusterAssignments) can be swapped in without blocking
 // concurrent searches; a rebuild is built off to the side and published with
 // a single atomic store once complete.
+//
+// The pointers are non-owning, and a swapped-out structure must NOT be freed
+// as soon as the store lands: searches that already loaded the old pointer are
+// still reading through it. Reclaiming it needs the grace period the design
+// doc calls for around posting-list rebuilds, so until that exists nothing
+// published here can be freed at all. Publishing stores should be release and
+// search-side loads acquire, so that a reader seeing the new pointer also sees
+// the fully built structure behind it.
 struct IVFPQSearchConfig {
     bool     is_ivf_pq_index = false;
     uint32_t nprobe          = 0;
@@ -128,6 +136,16 @@ struct RawVectorFreeList {
 struct PostingListDelta {
     std::unordered_map<uint32_t, std::vector<uint32_t>> pending_inserts;  // cluster_id -> vector_ids
     tsl::robin_set<uint32_t> tombstones;                                  // vector_ids
+};
+
+// ---------------------------------------------------------------------------
+// DynamicPQCodes -- PQ codes for vectors inserted since the last rebuild
+// ---------------------------------------------------------------------------
+// An insert can encode its PQ code immediately, but cannot append it to
+// PQMetadata::codes, which is a flat [N, chunks] array. Recent codes live here
+// until the next fold-in, so the query path has to consult both.
+struct DynamicPQCodes {
+    std::unordered_map<uint32_t, std::vector<uint8_t>> codes;  // vector_id -> [chunks]
 };
 
 // ---------------------------------------------------------------------------
