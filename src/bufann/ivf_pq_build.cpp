@@ -63,7 +63,7 @@ IVFMetadata train_ivf_centroids(const std::string& data_bin, uint32_t nlist,
     IVFMetadata meta;
     meta.nlist = nlist;
     meta.dim = static_cast<uint32_t>(train_dim);
-    meta.aligned_dim = static_cast<uint32_t>(ROUND_UP(train_dim, 8));
+    meta.aligned_dim = align_dim(static_cast<uint32_t>(train_dim));
 
     // Stored padded so query-time distance math can run at the aligned width
     // used everywhere else; the padding is zero on both sides and so
@@ -89,7 +89,7 @@ IVFMetadata load_ivf_centroids(const std::string& index_prefix, uint32_t dim) {
     diskann::load_bin<float>(ivf_centroids_path(index_prefix), raw, nlist, aligned_dim);
     std::unique_ptr<float[]> owned(raw);
 
-    if (aligned_dim != ROUND_UP(dim, 8)) {
+    if (aligned_dim != align_dim(dim)) {
         throw ANNException("centroid file dimensionality does not match dim", -1,
                            __FUNCSIG__, __FILE__, __LINE__);
     }

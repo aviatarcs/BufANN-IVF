@@ -131,11 +131,6 @@ diskann::Distance<int8_t>* make_distance<int8_t>(diskann::Metric metric) {
     return new diskann::DistanceL2Int8();
 }
 
-// Align dimension up to the nearest multiple of 8.
-static inline uint32_t align_dim(uint32_t d) {
-    return static_cast<uint32_t>(ROUND_UP(d, 8));
-}
-
 // Build PQ pivots and codes for `data_bin` if they don't already exist.
 template<typename T>
 static void ensure_pq(const std::string& data_bin,
@@ -460,7 +455,7 @@ static void init_store(BufANNIndex<T>& idx,
                        bool truncate_heap) {
     BufANNConfig& cfg = idx.config;
     const uint32_t degree_cap = cfg.R;
-    idx.aligned_dim = align_dim(cfg.dim);
+    idx.aligned_dim = diskann::align_dim(cfg.dim);
     idx.dist_cmp = make_distance<T>(cfg.metric);
     idx.dist_cmp_float = make_distance<float>(cfg.metric);
     cfg.pq_chunks = resolve_existing_pq_chunks(idx.pq_prefix, cfg.pq_chunks);

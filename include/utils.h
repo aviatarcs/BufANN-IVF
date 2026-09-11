@@ -180,6 +180,11 @@ inline int delete_file(const std::string& fileName) {
 namespace diskann {
   static const size_t MAX_SIZE_OF_STREAMBUF = 2LL * 1024 * 1024 * 1024;
 
+  // Vector dimensionality rounded up to the width the distance kernels run at.
+  inline uint32_t align_dim(uint32_t dim) {
+    return static_cast<uint32_t>(ROUND_UP(dim, 8));
+  }
+
   enum Metric { L2 = 0, INNER_PRODUCT = 1, FAST_L2 = 2, PQ = 3, COSINE = 4 };
 
   DISKANN_DLLEXPORT float calc_recall_set_tags(
