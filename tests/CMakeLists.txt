@@ -63,3 +63,9 @@ target_link_libraries(ivf_pq_raw_vector_heap_test ${PROJECT_NAME} aio -ltcmalloc
 # IVF-PQ coarse-quantizer centroid training test.
 add_executable(ivf_centroid_train_test ivf_centroid_train_test.cpp)
 target_link_libraries(ivf_centroid_train_test ${PROJECT_NAME} aio -ltcmalloc)
+
+# Unlike the drivers above, these two are self-checking: they exit non-zero on
+# failure, so ctest can run them. From the build directory:
+#     ctest --output-on-failure
+add_test(NAME ivf_pq_raw_vector_heap COMMAND ivf_pq_raw_vector_heap_test)
+add_test(NAME ivf_centroid_train COMMAND ivf_centroid_train_test)

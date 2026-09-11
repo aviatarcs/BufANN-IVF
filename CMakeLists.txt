@@ -123,5 +123,7 @@ else()
 	add_compile_options(-march=native -Wall -fno-builtin-malloc -fno-builtin-calloc -fno-builtin-realloc -fno-builtin-free -fopenmp -fopenmp-simd -funroll-loops -Wfatal-errors -DUSE_ACCELERATED_PQ -DUSE_AVX2)
 endif()
 
+enable_testing()
+
 add_subdirectory(src)
 add_subdirectory(tests)
