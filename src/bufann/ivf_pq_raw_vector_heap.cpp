@@ -135,6 +135,21 @@ void RawVectorHeap::read_vector(uint32_t flat_slot, void* out) const {
     }
 }
 
+bool RawVectorHeap::is_slot_occupied(uint32_t flat_slot) const {
+    uint32_t page_id  = flat_slot / _layout.slots_per_page;
+    uint32_t slot_idx = flat_slot % _layout.slots_per_page;
+    uint64_t off = _layout.bitmap_offset(page_id) + slot_idx / 8;
+
+    std::lock_guard<std::mutex> lg(_bitmap_mtx[page_id % kRawVectorBitmapLockStripes]);
+
+    uint8_t byte = 0;
+    ssize_t n = ::pread(_fd, &byte, 1, static_cast<off_t>(off));
+    if (n < 0) {
+        throw ANNException("Failed to read occupancy bitmap", -1, __FUNCSIG__, __FILE__, __LINE__);
+    }
+    return (byte & static_cast<uint8_t>(1u << (slot_idx % 8))) != 0;
+}
+
 void RawVectorHeap::free_slot(uint32_t flat_slot, RawVectorFreeList& free_list) {
     uint32_t page_id = flat_slot / _layout.slots_per_page;
     uint32_t slot_idx = flat_slot % _layout.slots_per_page;
@@ -148,6 +163,10 @@ void RawVectorHeap::set_occupancy_bit(uint32_t page_id, uint32_t slot_idx, bool 
     uint32_t byte_idx = slot_idx / 8;
     uint32_t bit_idx  = slot_idx % 8;
     uint64_t off = _layout.bitmap_offset(page_id) + byte_idx;
+
+    // Slots within a page share bitmap bytes, so this read-modify-write has to
+    // be atomic with respect to other slots of the same page.
+    std::lock_guard<std::mutex> lg(_bitmap_mtx[page_id % kRawVectorBitmapLockStripes]);
 
     uint8_t byte = 0;
     ssize_t n = ::pread(_fd, &byte, 1, static_cast<off_t>(off));

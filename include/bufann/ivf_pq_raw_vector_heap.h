@@ -13,6 +13,7 @@
 
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <mutex>
 #include <string>
@@ -23,6 +24,12 @@ namespace diskann {
 namespace inplace {
 
 static constexpr uint32_t kRawVectorPageHeaderBytes = 8;
+
+// Occupancy-bitmap updates are serialized on a stripe of mutexes indexed by
+// page_id. Striping rather than one lock per page keeps the heap's footprint
+// independent of how far it has grown; pages that collide on a stripe just
+// serialize, which is correct but rarely contended at this width.
+static constexpr uint32_t kRawVectorBitmapLockStripes = 64;
 
 // ---------------------------------------------------------------------------
 // RawVectorHeapLayout -- page/slot geometry for a given (page_size, elem_size)
@@ -58,11 +65,18 @@ RawVectorHeapLayout compute_raw_vector_heap_layout(uint32_t page_size, uint32_t 
 // ---------------------------------------------------------------------------
 // RawVectorHeap
 // ---------------------------------------------------------------------------
-// No synchronization between write_vector/read_vector/free_slot: a freed
-// slot goes straight back onto the free list for immediate reuse, with no
-// grace period. Safe only while nothing else can be concurrently reading a
-// flat_slot that's being freed/reused -- once concurrent search (exact
-// re-rank reads) and concurrent insert/delete coexist, this needs the same
+// allocate_slot/write_vector/free_slot are safe to call concurrently: slot
+// handout is serialized on _grow_mtx, and occupancy-bitmap updates on a
+// per-page stripe of _bitmap_mtx. The bitmap needs its own locking because
+// the update is a read-modify-write of one byte, and at the design doc's own
+// 4096B/512B geometry every slot in a page shares a single bitmap byte -- so
+// two threads writing into the same page would otherwise lose each other's
+// bits, which is precisely what a parallel build loop does.
+//
+// What is NOT yet safe: a freed slot goes straight back onto the free list for
+// immediate reuse, with no grace period, so read_vector must not race a
+// free_slot of the same flat_slot. Once concurrent search (exact re-rank
+// reads) and concurrent insert/delete coexist, this needs the same
 // grace-period reclaim the design doc calls for around posting-list rebuilds.
 class RawVectorHeap {
 public:
@@ -87,6 +101,11 @@ public:
     // Reads layout().elem_size bytes from `flat_slot` into `out`.
     void read_vector(uint32_t flat_slot, void* out) const;
 
+    // Reads back `flat_slot`'s occupancy bit. The bitmap is what a future
+    // reopen/recovery path has to rebuild the free list from, so it is worth
+    // being able to read it and not only write it.
+    bool is_slot_occupied(uint32_t flat_slot) const;
+
     // Clears the occupancy bit for `flat_slot` and returns it to `free_list`
     // for reuse. Both halves happen under the free list's own mutex, so this
     // mirrors allocate_slot rather than leaving the caller to push by hand.
@@ -100,6 +119,7 @@ private:
     int _fd = -1;
     RawVectorHeapLayout _layout;
     std::mutex _grow_mtx;
+    mutable std::array<std::mutex, kRawVectorBitmapLockStripes> _bitmap_mtx;
     uint32_t _next_flat_slot = 0;
     uint32_t _allocated_pages = 0;
 };

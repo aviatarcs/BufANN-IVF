@@ -8,6 +8,7 @@
 #include <cstring>
 #include <iostream>
 #include <string>
+#include <thread>
 #include <unistd.h>
 #include <vector>
 
@@ -96,6 +97,73 @@ bool test_allocate_write_read_free_reuse() {
     return pass;
 }
 
+// Every slot of a page shares one bitmap byte at this geometry, so an
+// unsynchronized read-modify-write of that byte drops bits when several
+// threads write into the same page -- the shape a parallel build loop takes.
+bool test_concurrent_writes_to_one_page_keep_every_occupancy_bit() {
+    std::cout << "[Test] concurrent writes into one page keep all occupancy bits..." << std::endl;
+    std::string path =
+        "/tmp/ivf_pq_raw_vector_heap_test_conc_" + std::to_string((uint64_t) getpid()) + ".bin";
+
+    const uint32_t elem_size = 512;
+    RawVectorHeapLayout layout = compute_raw_vector_heap_layout(4096, elem_size);
+
+    bool pass = true;
+    const int kRuns = 200;
+    for (int run = 0; run < kRuns && pass; ++run) {
+        ::unlink(path.c_str());
+        RawVectorHeap heap;
+        heap.open(path, layout);
+        RawVectorFreeList free_list;
+
+        // Exactly one page's worth of slots, written concurrently.
+        std::vector<uint32_t> slots;
+        for (uint32_t i = 0; i < layout.slots_per_page; ++i) {
+            slots.push_back(heap.allocate_slot(free_list));
+        }
+        std::vector<char> buf(elem_size, 'z');
+        std::vector<std::thread> writers;
+        for (uint32_t slot : slots) {
+            writers.emplace_back([&heap, slot, &buf] { heap.write_vector(slot, buf.data()); });
+        }
+        for (auto& t : writers) t.join();
+
+        for (uint32_t slot : slots) {
+            if (!heap.is_slot_occupied(slot)) {
+                std::cout << "  FAIL: run " << run << " lost the occupancy bit for slot "
+                          << slot << std::endl;
+                pass = false;
+            }
+        }
+
+        // Freeing concurrently must clear every bit for the same reason.
+        std::vector<std::thread> freers;
+        for (uint32_t slot : slots) {
+            freers.emplace_back([&heap, slot, &free_list] { heap.free_slot(slot, free_list); });
+        }
+        for (auto& t : freers) t.join();
+
+        for (uint32_t slot : slots) {
+            if (heap.is_slot_occupied(slot)) {
+                std::cout << "  FAIL: run " << run << " left slot " << slot
+                          << " marked occupied after a concurrent free" << std::endl;
+                pass = false;
+            }
+        }
+        if (free_list.free_slots.size() != slots.size()) {
+            std::cout << "  FAIL: run " << run << " free list holds "
+                      << free_list.free_slots.size() << " of " << slots.size()
+                      << " freed slots" << std::endl;
+            pass = false;
+        }
+        heap.close();
+    }
+    ::unlink(path.c_str());
+
+    std::cout << "  " << (pass ? "PASS" : "FAIL") << std::endl;
+    return pass;
+}
+
 bool test_open_refuses_existing_nonempty_file() {
     std::cout << "[Test] open() refuses to reopen an existing non-empty heap..." << std::endl;
     std::string path = "/tmp/ivf_pq_raw_vector_heap_test_reopen_" + std::to_string((uint64_t) getpid()) + ".bin";
@@ -127,6 +195,7 @@ int main() {
     bool all_pass = true;
     all_pass &= test_layout_matches_design_doc_example();
     all_pass &= test_allocate_write_read_free_reuse();
+    all_pass &= test_concurrent_writes_to_one_page_keep_every_occupancy_bit();
     all_pass &= test_open_refuses_existing_nonempty_file();
     return all_pass ? 0 : 1;
 }
