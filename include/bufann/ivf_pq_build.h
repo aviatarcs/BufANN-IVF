@@ -8,6 +8,7 @@
 #include <string>
 
 #include "bufann/ivf_pq.h"
+#include "partition_and_pq.h"
 
 namespace diskann {
 namespace inplace {
@@ -16,9 +17,6 @@ namespace inplace {
 // Below roughly 40 points per centroid k-means starts producing badly
 // under-determined centers, so this leaves some headroom above that.
 const uint32_t IVF_TRAIN_POINTS_PER_CENTROID = 64;
-
-// Lloyd's iterations used to refine the sampled centroids.
-const uint32_t IVF_MAX_KMEANS_REPS = 15;
 
 std::string ivf_centroids_path(const std::string& index_prefix);
 
@@ -31,13 +29,16 @@ std::string ivf_centroids_path(const std::string& index_prefix);
 // fits in memory; sampling is what the rest of this codebase already does at
 // billion scale, so that is where this starts.
 //
-// sampling_rate - fraction of base vectors to train on. Pass 0 to derive it
-//                 from nlist via IVF_TRAIN_POINTS_PER_CENTROID.
+// sampling_rate   - fraction of base vectors to train on. Pass 0 to derive it
+//                   from nlist via IVF_TRAIN_POINTS_PER_CENTROID.
+// max_kmeans_reps - Lloyd's iterations refining the sampled centroids.
+//                   Defaults to NUM_K_MEANS_ITERS, the same budget PQ pivot
+//                   training already uses.
 template<typename T>
 IVFMetadata train_ivf_centroids(const std::string& data_bin,
                                 uint32_t nlist,
                                 double sampling_rate = 0.0,
-                                uint32_t max_kmeans_reps = IVF_MAX_KMEANS_REPS);
+                                uint32_t max_kmeans_reps = NUM_K_MEANS_ITERS);
 
 // Persists centroids to ivf_centroids_path(index_prefix) as an
 // [nlist x aligned_dim] float bin file.
