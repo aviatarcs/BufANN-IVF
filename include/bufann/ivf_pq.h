@@ -81,9 +81,9 @@ struct IVFPQSearchConfig {
 // ---------------------------------------------------------------------------
 // A RID is packed into 32 bits: bit 31 is the active flag, the low 31 bits
 // are a flat slot index that decomposes into (page_id, slot_idx) given the
-// heap's slots-per-page (see RawVectorHeapLayout in raw_vector_heap.h) --
-// slots per page depends on the configured element size, so it is passed in
-// rather than assumed fixed.
+// heap's slots-per-page (see RawVectorHeapLayout in
+// ivf_pq_raw_vector_heap.h) -- slots per page depends on the configured
+// element size, so it is passed in rather than assumed fixed.
 struct RawVectorRID {
     uint32_t packed = 0;
 };

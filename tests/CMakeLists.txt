@@ -57,8 +57,8 @@ add_executable(bufann_driver bufann_driver.cpp)
 target_link_libraries(bufann_driver ${PROJECT_NAME} aio -ltcmalloc)
 
 # IVF-PQ raw-vector heap storage primitive test.
-add_executable(raw_vector_heap_test raw_vector_heap_test.cpp)
-target_link_libraries(raw_vector_heap_test ${PROJECT_NAME} aio -ltcmalloc)
+add_executable(ivf_pq_raw_vector_heap_test ivf_pq_raw_vector_heap_test.cpp)
+target_link_libraries(ivf_pq_raw_vector_heap_test ${PROJECT_NAME} aio -ltcmalloc)
 
 # IVF-PQ coarse-quantizer centroid training test.
 add_executable(ivf_centroid_train_test ivf_centroid_train_test.cpp)

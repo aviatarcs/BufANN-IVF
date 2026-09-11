@@ -1,4 +1,4 @@
-#include "bufann/raw_vector_heap.h"
+#include "bufann/ivf_pq_raw_vector_heap.h"
 
 #include <fcntl.h>
 #include <sys/stat.h>

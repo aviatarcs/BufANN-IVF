@@ -1,7 +1,7 @@
 // Smoke test for the IVF-PQ raw-vector heap storage primitive:
 // allocate/write/read/free/reuse over RawVectorHeap + RawVectorFreeList.
 
-#include "bufann/raw_vector_heap.h"
+#include "bufann/ivf_pq_raw_vector_heap.h"
 #include "ann_exception.h"
 
 #include <algorithm>
@@ -30,7 +30,7 @@ bool test_layout_matches_design_doc_example() {
 
 bool test_allocate_write_read_free_reuse() {
     std::cout << "[Test] allocate/write/read/free/reuse across multiple pages..." << std::endl;
-    std::string path = "/tmp/raw_vector_heap_test_" + std::to_string((uint64_t) getpid()) + ".bin";
+    std::string path = "/tmp/ivf_pq_raw_vector_heap_test_" + std::to_string((uint64_t) getpid()) + ".bin";
 
     const uint32_t elem_size = 512;
     RawVectorHeapLayout layout = compute_raw_vector_heap_layout(4096, elem_size);
@@ -99,7 +99,7 @@ bool test_allocate_write_read_free_reuse() {
 
 bool test_open_refuses_existing_nonempty_file() {
     std::cout << "[Test] open() refuses to reopen an existing non-empty heap..." << std::endl;
-    std::string path = "/tmp/raw_vector_heap_test_reopen_" + std::to_string((uint64_t) getpid()) + ".bin";
+    std::string path = "/tmp/ivf_pq_raw_vector_heap_test_reopen_" + std::to_string((uint64_t) getpid()) + ".bin";
     RawVectorHeapLayout layout = compute_raw_vector_heap_layout(4096, 512);
 
     RawVectorHeap heap;

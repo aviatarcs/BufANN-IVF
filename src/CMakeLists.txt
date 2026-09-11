@@ -10,7 +10,7 @@ else()
         partition_and_pq.cpp pq_flash_index.cpp logger.cpp distance.cpp
 		 utils.cpp bufann/graph_delta.cpp bufann/index_merger.cpp
         bufann/merge_insert.cpp bufann/inplace_backend.cpp bufann/inplace_graph_ops.cpp
-        bufann/bufann_api.cpp bufann/raw_vector_heap.cpp bufann/ivf_pq_build.cpp)
+        bufann/bufann_api.cpp bufann/ivf_pq_raw_vector_heap.cpp bufann/ivf_pq_build.cpp)
 	add_library(${PROJECT_NAME} ${CPP_SOURCES})
 	add_library(${PROJECT_NAME}_s STATIC ${CPP_SOURCES})
 endif()
