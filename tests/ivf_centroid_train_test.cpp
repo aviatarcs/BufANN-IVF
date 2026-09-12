@@ -1,6 +1,5 @@
-// Smoke test for IVF coarse-quantizer centroid training: trains on synthetic
-// well-separated blobs and checks the trained centroids recover them, plus a
-// save/load round-trip.
+// Tests for IVF centroid training: metadata shape, padding, blob recovery on
+// synthetic clusters, and save/load round-trip.
 
 #include "bufann/ivf_pq_build.h"
 #include "ann_exception.h"
@@ -22,8 +21,7 @@ const uint32_t POINTS_PER_BLOB = 500;
 const uint32_t BLOB_DIM = 12;  // not a multiple of 8, so padding is exercised
 const float BLOB_SPACING = 50.0f;
 
-// Blob b sits at (b * BLOB_SPACING) in every dimension, so blobs are far
-// apart relative to the unit-ish noise added to each point.
+// Blob b is centered at b * BLOB_SPACING in every dimension.
 std::vector<float> blob_center(uint32_t b) {
     return std::vector<float>(BLOB_DIM, static_cast<float>(b) * BLOB_SPACING);
 }
@@ -60,7 +58,7 @@ bool test_centroids_recover_blobs(const IVFMetadata& meta) {
     std::cout << "[Test] trained centroids recover the synthetic blobs..." << std::endl;
     bool pass = true;
 
-    // Each blob should claim its own distinct centroid, sitting close to it.
+    // Each blob should have its own nearby centroid.
     std::vector<uint32_t> claimed;
     for (uint32_t b = 0; b < NUM_BLOBS; ++b) {
         std::vector<float> center = blob_center(b);

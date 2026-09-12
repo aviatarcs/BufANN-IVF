@@ -41,8 +41,7 @@ IVFMetadata train_ivf_centroids(const std::string& data_bin, uint32_t nlist,
     gen_random_slice<T>(data_bin, sampling_rate, raw_sample, num_train, train_dim);
     std::unique_ptr<float[]> train_data(raw_sample);
 
-    // gen_random_slice samples each point independently, so an unlucky draw
-    // (or an over-tight sampling_rate) can return fewer points than centers.
+    // gen_random_slice samples independently, so the draw can come up short.
     if (num_train < nlist) {
         throw ANNException(
             "sampled " + std::to_string(num_train) +
@@ -65,9 +64,7 @@ IVFMetadata train_ivf_centroids(const std::string& data_bin, uint32_t nlist,
     meta.dim = static_cast<uint32_t>(train_dim);
     meta.aligned_dim = align_dim(static_cast<uint32_t>(train_dim));
 
-    // Stored padded so query-time distance math can run at the aligned width
-    // used everywhere else; the padding is zero on both sides and so
-    // contributes nothing to the distance.
+    // Zero-padded to aligned_dim so distance math runs at the aligned width.
     meta.centroids.assign(static_cast<size_t>(nlist) * meta.aligned_dim, 0.0f);
     for (uint32_t c = 0; c < nlist; ++c) {
         std::copy(centers.get() + static_cast<size_t>(c) * train_dim,

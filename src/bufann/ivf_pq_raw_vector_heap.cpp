@@ -17,9 +17,7 @@ RawVectorHeapLayout compute_raw_vector_heap_layout(uint32_t page_size, uint32_t 
     layout.page_size = page_size;
     layout.elem_size = elem_size;
 
-    // bitmap_bytes depends on slots_per_page and vice versa; a couple of
-    // fixpoint passes converge since shrinking the bitmap by a byte can only
-    // ever free up room for a bounded number of extra slots.
+    // bitmap_bytes and slots_per_page depend on each other; iterate to a fixpoint.
     uint32_t bitmap_bytes = 0;
     uint32_t slots_per_page = 0;
     for (int iter = 0; iter < 8; ++iter) {
@@ -57,9 +55,7 @@ void RawVectorHeap::open(const std::string& path, RawVectorHeapLayout layout) {
     close();
     _layout = layout;
 
-    // Reopening an existing non-empty heap isn't supported yet (see the
-    // file-header comment), so refuse rather than silently truncating
-    // whatever a caller expected to still be there.
+    // Reopen is not supported yet; refuse rather than silently truncate.
     struct stat st;
     if (::stat(path.c_str(), &st) == 0 && st.st_size > 0) {
         throw ANNException(
@@ -68,8 +64,7 @@ void RawVectorHeap::open(const std::string& path, RawVectorHeapLayout layout) {
             -1, __FUNCSIG__, __FILE__, __LINE__);
     }
 
-    // No O_DIRECT: this heap bypasses the buffer pool entirely for now, so
-    // there's no requirement that caller buffers be page-aligned.
+    // No O_DIRECT, so caller buffers need not be aligned.
     _fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
     if (_fd < 0) {
         throw ANNException("Failed to open raw-vector heap file: " + path,
@@ -97,9 +92,7 @@ uint32_t RawVectorHeap::allocate_slot(RawVectorFreeList& free_list) {
     }
 
     std::lock_guard<std::mutex> lg(_grow_mtx);
-    // A flat slot has to survive being packed into RawVectorRID's low 31 bits;
-    // past that, make_raw_vector_rid() would silently mask and alias an
-    // already-live slot.
+    // Must fit RawVectorRID's 31-bit slot field; past that, packing would alias.
     if (_next_flat_slot > RAW_VECTOR_RID_SLOT_MASK) {
         throw ANNException("raw-vector heap is full: flat slot index exceeds "
                            "the 31 bits addressable by RawVectorRID",
@@ -178,8 +171,7 @@ void RawVectorHeap::set_occupancy_bit(uint32_t page_id, uint32_t slot_idx, bool 
     uint32_t bit_idx  = slot_idx % 8;
     uint64_t off = _layout.bitmap_offset(page_id) + byte_idx;
 
-    // Slots within a page share bitmap bytes, so this read-modify-write has to
-    // be atomic with respect to other slots of the same page.
+    // Slots in a page share bitmap bytes; the read-modify-write must be atomic.
     std::lock_guard<std::mutex> lg(_bitmap_mtx[page_id % RAW_VECTOR_BITMAP_LOCK_STRIPES]);
 
     uint8_t byte = 0;

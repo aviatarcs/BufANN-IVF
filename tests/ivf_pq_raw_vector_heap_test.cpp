@@ -1,5 +1,5 @@
-// Smoke test for the IVF-PQ raw-vector heap storage primitive:
-// allocate/write/read/free/reuse over RawVectorHeap + RawVectorFreeList.
+// Tests for RawVectorHeap: layout, allocate/write/read/free/reuse, concurrent
+// bitmap updates, slot-space limit, and the reopen guard.
 
 #include "bufann/ivf_pq_raw_vector_heap.h"
 #include "ann_exception.h"
@@ -60,8 +60,7 @@ bool test_allocate_write_read_free_reuse() {
         }
     }
 
-    // Free every other slot, then confirm reallocation reuses exactly those
-    // flat slots (LIFO) rather than growing the heap further.
+    // Free every other slot; reallocation must reuse exactly those.
     std::vector<uint32_t> freed;
     for (uint32_t i = 0; i < num_vectors; i += 2) {
         heap.free_slot(flat_slots[i], free_list);
@@ -97,9 +96,8 @@ bool test_allocate_write_read_free_reuse() {
     return pass;
 }
 
-// Every slot of a page shares one bitmap byte at this geometry, so an
-// unsynchronized read-modify-write of that byte drops bits when several
-// threads write into the same page -- the shape a parallel build loop takes.
+// All slots of a page share one bitmap byte at this geometry; unsynchronized
+// updates would drop bits.
 bool test_concurrent_writes_to_one_page_keep_every_occupancy_bit() {
     std::cout << "[Test] concurrent writes into one page keep all occupancy bits..." << std::endl;
     std::string path =
@@ -116,7 +114,7 @@ bool test_concurrent_writes_to_one_page_keep_every_occupancy_bit() {
         heap.open(path, layout);
         RawVectorFreeList free_list;
 
-        // Exactly one page's worth of slots, written concurrently.
+        // One page's worth of slots, written concurrently.
         std::vector<uint32_t> slots;
         for (uint32_t i = 0; i < layout.slots_per_page; ++i) {
             slots.push_back(heap.allocate_slot(free_list));
@@ -136,7 +134,7 @@ bool test_concurrent_writes_to_one_page_keep_every_occupancy_bit() {
             }
         }
 
-        // Freeing concurrently must clear every bit for the same reason.
+        // Concurrent frees must clear every bit too.
         std::vector<std::thread> freers;
         for (uint32_t slot : slots) {
             freers.emplace_back([&heap, slot, &free_list] { heap.free_slot(slot, free_list); });
@@ -170,10 +168,8 @@ bool test_rejects_slots_past_the_rid_slot_space() {
         "/tmp/ivf_pq_raw_vector_heap_test_full_" + std::to_string((uint64_t) getpid()) + ".bin";
     ::unlink(path.c_str());
 
-    // One slot per page, with the cursor parked on the last addressable slot
-    // and the page count already past it, so neither allocation below touches
-    // the file -- otherwise reaching this boundary would mean extending across
-    // 2^31 pages.
+    // Park the cursor on the last addressable slot with the page count already
+    // past it, so neither allocation extends the file.
     RawVectorHeapLayout layout = compute_raw_vector_heap_layout(4096, 4096 - 9);
     RawVectorHeap heap;
     heap.open(path, layout);

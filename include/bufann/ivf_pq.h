@@ -1,12 +1,6 @@
-// On-disk and in-memory data structures for the IVF-PQ index type.
-//
-// IVF-PQ is a separate index type from the BufANN graph index: it carries no
-// graph adjacency, uses its own page format for raw vectors, and is built and
-// deployed independently. Which index type is active is chosen at
-// build/startup time via BufANNConfig::index_type (see bufann_api.h).
-//
-// This header only declares the structures used across the build, query, and
-// mutation paths; it is not yet wired into any of them.
+// Data structures for the IVF-PQ index type. IVF-PQ is separate from the graph
+// index (no adjacency, own raw-vector page format); BufANNConfig::index_type
+// selects between them. Not yet wired into build/query/mutation paths.
 
 #pragma once
 
@@ -35,15 +29,13 @@ struct IVFMetadata {
 // ClusterAssignments -- centroid index per vector, indexed by internal ID
 // ---------------------------------------------------------------------------
 struct ClusterAssignments {
-    std::vector<uint32_t> cluster_id;  // shape: [N]; cluster_id[i] = centroid index for vector i
+    std::vector<uint32_t> cluster_id;  // shape: [N]
 };
 
 // ---------------------------------------------------------------------------
 // PostingLists -- CSR-style grouping of vector IDs by cluster
 // ---------------------------------------------------------------------------
-// offsets[i] = start of partition i in the ids array.
-// ids is the flattened array of all point IDs, such that partition i is
-// ids[offsets[i]:offsets[i+1]].
+// Partition i is ids[offsets[i] : offsets[i+1]].
 struct PostingLists {
     std::vector<uint32_t> offsets;
     std::vector<uint32_t> ids;
@@ -63,18 +55,10 @@ struct PQMetadata {
 // ---------------------------------------------------------------------------
 // IVFPQSearchConfig -- search-time handle over the live index structures
 // ---------------------------------------------------------------------------
-// Structures are held behind atomic pointers so background rebuilds (of
-// PostingLists / ClusterAssignments) can be swapped in without blocking
-// concurrent searches; a rebuild is built off to the side and published with
-// a single atomic store once complete.
-//
-// The pointers are non-owning, and a swapped-out structure must NOT be freed
-// as soon as the store lands: searches that already loaded the old pointer are
-// still reading through it. Reclaiming it needs the grace period the design
-// doc calls for around posting-list rebuilds, so until that exists nothing
-// published here can be freed at all. Publishing stores should be release and
-// search-side loads acquire, so that a reader seeing the new pointer also sees
-// the fully built structure behind it.
+// Atomic pointers let a background rebuild be published with one store while
+// searches continue. Non-owning: a swapped-out structure may still be read by
+// in-flight searches, so it must not be freed until grace-period reclaim
+// exists. Publish with release, load with acquire.
 struct IVFPQSearchConfig {
     bool     is_ivf_pq_index = false;
     uint32_t nprobe          = 0;
@@ -87,11 +71,8 @@ struct IVFPQSearchConfig {
 // ---------------------------------------------------------------------------
 // RawVectorRID -- packed pointer from a vector ID to its raw-vector heap slot
 // ---------------------------------------------------------------------------
-// A RID is packed into 32 bits: bit 31 is the active flag, the low 31 bits
-// are a flat slot index that decomposes into (page_id, slot_idx) given the
-// heap's slots-per-page (see RawVectorHeapLayout in
-// ivf_pq_raw_vector_heap.h) -- slots per page depends on the configured
-// element size, so it is passed in rather than assumed fixed.
+// Bit 31: active flag. Low 31 bits: flat slot index, which splits into
+// (page_id, slot_idx) given the heap's slots_per_page (see RawVectorHeapLayout).
 struct RawVectorRID {
     uint32_t packed = 0;
 };
@@ -115,16 +96,12 @@ inline RawVectorRID make_raw_vector_rid(uint32_t flat_slot, bool active) {
     return rid;
 }
 
-// Maps vector ID -> location of its raw vector bytes on disk. Inserts are not
-// necessarily ID-ordered, so this table is required to locate a vector's page
-// and slot from its ID alone.
+// Vector ID -> raw-vector slot. Needed because inserts are not ID-ordered.
 struct RawVectorRIDTable {
     std::vector<RawVectorRID> rid;
 };
 
-// Free-list of (page, slot) locations in the raw-vector heap, populated by
-// deletes and drained by inserts. Mirrors the free-list used by the graph
-// index's slot allocator.
+// Slots released by deletes, reused by inserts.
 struct RawVectorFreeList {
     std::mutex mtx;
     std::vector<uint32_t> free_slots;  // flat slot indices, see RawVectorRID
@@ -141,9 +118,8 @@ struct PostingListDelta {
 // ---------------------------------------------------------------------------
 // DynamicPQCodes -- PQ codes for vectors inserted since the last rebuild
 // ---------------------------------------------------------------------------
-// An insert can encode its PQ code immediately, but cannot append it to
-// PQMetadata::codes, which is a flat [N, chunks] array. Recent codes live here
-// until the next fold-in, so the query path has to consult both.
+// PQMetadata::codes is a flat array and cannot grow in place, so codes for
+// recent inserts live here until the next rebuild. Queries consult both.
 struct DynamicPQCodes {
     std::unordered_map<uint32_t, std::vector<uint8_t>> codes;  // vector_id -> [chunks]
 };
