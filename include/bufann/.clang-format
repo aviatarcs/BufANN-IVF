@@ -1,0 +1,5 @@
+# BufANN-authored code: 4-space indent, no namespace indentation.
+# Everything else inherits the upstream DiskANN config at the repo root.
+BasedOnStyle: InheritParentConfig
+IndentWidth: 4
+NamespaceIndentation: None
