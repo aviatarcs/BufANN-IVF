@@ -1,5 +1,5 @@
 // Tests for RawVectorHeap: layout, allocate/write/read/free/reuse, concurrent
-// bitmap updates, slot-space limit, and the reopen guard.
+// bitmap updates, slot-space limit, the reopen guard, and the bulk writer.
 
 #include "bufann/ivf_pq_raw_vector_heap.h"
 #include "ann_exception.h"
@@ -224,6 +224,94 @@ bool test_open_refuses_existing_nonempty_file() {
 
 }  // namespace
 
+bool test_bulk_writer_matches_per_slot_writes() {
+    std::cout << "[Test] bulk writer lays pages out like write_vector and resumes allocation..."
+              << std::endl;
+    std::string path = "/tmp/ivf_pq_raw_vector_heap_test_" + std::to_string((uint64_t) getpid()) + ".bin";
+    ::unlink(path.c_str());
+
+    const uint32_t elem_size = 512;
+    RawVectorHeapLayout layout = compute_raw_vector_heap_layout(4096, elem_size);  // 7 slots/page
+
+    // 3 pages per flush, 4 flushes of 21 slots, then a tail page with 4 slots.
+    const uint32_t pages_per_flush = 3;
+    const uint32_t num_vectors = 4 * pages_per_flush * layout.slots_per_page + 4;
+
+    RawVectorHeap heap;
+    heap.open(path, layout);
+    RawVectorHeapBulkWriter writer(heap, pages_per_flush);
+
+    bool pass = true;
+    std::vector<char> vec(elem_size);
+    for (uint32_t i = 0; i < num_vectors; ++i) {
+        std::memset(vec.data(), static_cast<int>(i % 251 + 1), elem_size);
+        uint32_t slot = writer.append(vec.data());
+        if (slot != i) {
+            std::cout << "  FAIL: vector " << i << " landed in slot " << slot << std::endl;
+            pass = false;
+        }
+    }
+    writer.finish();
+
+    const uint32_t expected_pages = (num_vectors + layout.slots_per_page - 1) / layout.slots_per_page;
+    if (heap.next_flat_slot() != num_vectors || heap.allocated_pages() != expected_pages) {
+        std::cout << "  FAIL: cursor at slot " << heap.next_flat_slot() << " / page "
+                  << heap.allocated_pages() << ", expected " << num_vectors << " / "
+                  << expected_pages << std::endl;
+        pass = false;
+    }
+
+    // Every written slot reads back through the per-slot path; the first
+    // unwritten slot in the tail page is unoccupied.
+    std::vector<char> got(elem_size);
+    for (uint32_t i = 0; i < num_vectors; ++i) {
+        std::memset(vec.data(), static_cast<int>(i % 251 + 1), elem_size);
+        heap.read_vector(i, got.data());
+        if (got != vec || !heap.is_slot_occupied(i)) {
+            std::cout << "  FAIL: slot " << i << " did not read back as written" << std::endl;
+            pass = false;
+            break;
+        }
+    }
+    if (heap.is_slot_occupied(num_vectors)) {
+        std::cout << "  FAIL: slot past the bulk load reads as occupied" << std::endl;
+        pass = false;
+    }
+
+    // Allocation continues after the bulk load without clobbering it.
+    RawVectorFreeList free_list;
+    uint32_t next = heap.allocate_slot(free_list);
+    if (next != num_vectors) {
+        std::cout << "  FAIL: allocate_slot after bulk load returned " << next << std::endl;
+        pass = false;
+    }
+    std::memset(vec.data(), 0x7f, elem_size);
+    heap.write_vector(next, vec.data());
+    heap.read_vector(num_vectors - 1, got.data());
+    std::memset(vec.data(), static_cast<int>((num_vectors - 1) % 251 + 1), elem_size);
+    if (got != vec) {
+        std::cout << "  FAIL: post-load write_vector clobbered the last bulk slot" << std::endl;
+        pass = false;
+    }
+
+    // A second bulk writer on the now-populated heap is refused.
+    bool refused = false;
+    try {
+        RawVectorHeapBulkWriter again(heap, pages_per_flush);
+    } catch (const diskann::ANNException&) {
+        refused = true;
+    }
+    if (!refused) {
+        std::cout << "  FAIL: bulk writer accepted a non-empty heap" << std::endl;
+        pass = false;
+    }
+
+    heap.close();
+    ::unlink(path.c_str());
+    std::cout << "  " << (pass ? "PASS" : "FAIL") << std::endl;
+    return pass;
+}
+
 int main() {
     bool all_pass = true;
     all_pass &= test_layout_matches_design_doc_example();
@@ -231,5 +319,6 @@ int main() {
     all_pass &= test_concurrent_writes_to_one_page_keep_every_occupancy_bit();
     all_pass &= test_rejects_slots_past_the_rid_slot_space();
     all_pass &= test_open_refuses_existing_nonempty_file();
+    all_pass &= test_bulk_writer_matches_per_slot_writes();
     return all_pass ? 0 : 1;
 }

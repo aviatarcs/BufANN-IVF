@@ -1,12 +1,16 @@
-// Tests for IVF centroid training: metadata shape, padding, blob recovery on
-// synthetic clusters, and save/load round-trip.
+// Tests for IVF centroid training and cluster assignment: metadata shape,
+// padding, blob recovery on synthetic clusters, save/load round-trips, and
+// assignment + raw-vector bulk load of the synthetic base.
 
 #include "bufann/ivf_pq_build.h"
 #include "ann_exception.h"
 #include "utils.h"
 
+#include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <iostream>
+#include <memory>
 #include <random>
 #include <string>
 #include <unistd.h>
@@ -145,10 +149,104 @@ bool test_same_seed_is_reproducible(const std::string& base_bin, const IVFMetada
     return pass;
 }
 
+// Each point must be assigned to the centroid nearest its blob, and each raw
+// vector must come back byte-identical from the heap slot its RID names.
+bool test_assign_clusters_and_load_heap(const std::string& prefix, const std::string& base_bin,
+                                        const IVFMetadata& meta) {
+    std::cout << "[Test] cluster assignment matches blobs and heap holds every raw vector..."
+              << std::endl;
+    bool pass = true;
+
+    // Which centroid each blob trained to.
+    std::vector<uint32_t> blob_to_centroid(NUM_BLOBS);
+    for (uint32_t b = 0; b < NUM_BLOBS; ++b) {
+        std::vector<float> center = blob_center(b);
+        uint32_t best = 0;
+        for (uint32_t c = 1; c < meta.nlist; ++c) {
+            if (dist_to_centroid(center, meta, c) < dist_to_centroid(center, meta, best)) {
+                best = c;
+            }
+        }
+        blob_to_centroid[b] = best;
+    }
+
+    // 4 KB pages hold ~84 12-float slots, so 4000 points span ~48 pages with a
+    // partial tail page. (Multi-flush behaviour is covered by the heap test.)
+    RawVectorHeapLayout layout =
+        compute_raw_vector_heap_layout(4096, meta.dim * sizeof(float));
+    std::string heap_path = ivf_raw_vectors_path(prefix);
+    ::unlink(heap_path.c_str());
+    RawVectorHeap heap;
+    heap.open(heap_path, layout);
+
+    ClusterAssignments assignments;
+    RawVectorRIDTable rid_table;
+    assign_ivf_clusters<float>(base_bin, meta, heap, assignments, rid_table);
+
+    const size_t npts = static_cast<size_t>(NUM_BLOBS) * POINTS_PER_BLOB;
+    if (assignments.cluster_id.size() != npts || rid_table.rid.size() != npts) {
+        std::cout << "  FAIL: expected " << npts << " assignments/RIDs, got "
+                  << assignments.cluster_id.size() << "/" << rid_table.rid.size() << std::endl;
+        pass = false;
+    }
+
+    float* raw = nullptr;
+    size_t n = 0, d = 0;
+    diskann::load_bin<float>(base_bin, raw, n, d);
+    std::unique_ptr<float[]> base(raw);
+
+    size_t wrong_cluster = 0, wrong_bytes = 0, wrong_rid = 0;
+    std::vector<float> got(meta.dim);
+    for (size_t i = 0; i < npts && pass; ++i) {
+        uint32_t blob = static_cast<uint32_t>(i / POINTS_PER_BLOB);
+        if (assignments.cluster_id[i] != blob_to_centroid[blob]) {
+            ++wrong_cluster;
+        }
+        RawVectorRID rid = rid_table.rid[i];
+        if (!rid_is_active(rid) || rid_flat_slot(rid) != i) {
+            ++wrong_rid;
+        }
+        heap.read_vector(rid_flat_slot(rid), got.data());
+        if (std::memcmp(got.data(), base.get() + i * meta.dim, meta.dim * sizeof(float)) != 0) {
+            ++wrong_bytes;
+        }
+    }
+    if (wrong_cluster || wrong_rid || wrong_bytes) {
+        std::cout << "  FAIL: " << wrong_cluster << " misassigned, " << wrong_rid
+                  << " bad RIDs, " << wrong_bytes << " raw-vector mismatches" << std::endl;
+        pass = false;
+    }
+    if (heap.next_flat_slot() != npts) {
+        std::cout << "  FAIL: heap cursor at " << heap.next_flat_slot() << ", expected " << npts
+                  << std::endl;
+        pass = false;
+    }
+
+    // Sidecar round-trips.
+    save_ivf_cluster_assignments(prefix, assignments);
+    save_ivf_rid_table(prefix, rid_table);
+    ClusterAssignments assignments2 = load_ivf_cluster_assignments(prefix);
+    RawVectorRIDTable rid_table2 = load_ivf_rid_table(prefix);
+    bool rids_equal = rid_table2.rid.size() == rid_table.rid.size() &&
+                      std::equal(rid_table.rid.begin(), rid_table.rid.end(), rid_table2.rid.begin(),
+                                 [](RawVectorRID a, RawVectorRID b) { return a.packed == b.packed; });
+    if (assignments2.cluster_id != assignments.cluster_id || !rids_equal) {
+        std::cout << "  FAIL: cluster-id or RID-table sidecar did not round-trip" << std::endl;
+        pass = false;
+    }
+
+    heap.close();
+    ::unlink(heap_path.c_str());
+    ::unlink(ivf_cluster_ids_path(prefix).c_str());
+    ::unlink(ivf_rid_table_path(prefix).c_str());
+    std::cout << "  " << (pass ? "PASS" : "FAIL") << std::endl;
+    return pass;
+}
+
 }  // namespace
 
 int main() {
-    std::string prefix = "/tmp/ivf_centroid_train_test_" + std::to_string((uint64_t) getpid());
+    std::string prefix = "/tmp/ivf_pq_build_test_" + std::to_string((uint64_t) getpid());
     std::string base_bin = prefix + "_base.bin";
 
     bool all_pass = true;
@@ -161,6 +259,7 @@ int main() {
         all_pass &= test_centroids_recover_blobs(meta);
         all_pass &= test_save_load_round_trip(prefix, meta);
         all_pass &= test_same_seed_is_reproducible(base_bin, meta);
+        all_pass &= test_assign_clusters_and_load_heap(prefix, base_bin, meta);
     } catch (const diskann::ANNException& e) {
         std::cout << "  FAIL: " << e.message() << std::endl;
         all_pass = false;

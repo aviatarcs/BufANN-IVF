@@ -60,10 +60,10 @@ target_link_libraries(bufann_driver ${PROJECT_NAME} aio -ltcmalloc)
 add_executable(ivf_pq_raw_vector_heap_test ivf_pq_raw_vector_heap_test.cpp)
 target_link_libraries(ivf_pq_raw_vector_heap_test ${PROJECT_NAME} aio -ltcmalloc)
 
-# IVF-PQ coarse-quantizer centroid training test.
-add_executable(ivf_centroid_train_test ivf_centroid_train_test.cpp)
-target_link_libraries(ivf_centroid_train_test ${PROJECT_NAME} aio -ltcmalloc)
+# IVF-PQ build steps (centroid training, cluster assignment) test.
+add_executable(ivf_pq_build_test ivf_pq_build_test.cpp)
+target_link_libraries(ivf_pq_build_test ${PROJECT_NAME} aio -ltcmalloc)
 
 # Self-checking tests (non-zero exit on failure); run with `ctest`.
 add_test(NAME ivf_pq_raw_vector_heap COMMAND ivf_pq_raw_vector_heap_test)
-add_test(NAME ivf_centroid_train COMMAND ivf_centroid_train_test)
+add_test(NAME ivf_pq_build COMMAND ivf_pq_build_test)

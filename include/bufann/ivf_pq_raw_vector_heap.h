@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <mutex>
 #include <string>
+#include <vector>
 
 #include "bufann/ivf_pq.h"
 
@@ -74,9 +75,17 @@ public:
     // Reads elem_size bytes from `flat_slot` into `out`.
     void read_vector(uint32_t flat_slot, void* out) const;
 
+    // Writes `num_pages` complete pages (header, bitmap and slots already laid
+    // out by the caller) starting at `first_page_id` with a single pwrite.
+    // Does not touch the allocation cursor; see RawVectorHeapBulkWriter.
+    void write_pages(uint32_t first_page_id, const void* pages, uint32_t num_pages);
+
     // Resets the allocation cursor, e.g. after recovery reads persisted state.
     // Not safe to call concurrently with allocate_slot.
     void restore_slot_cursor(uint32_t next_flat_slot, uint32_t allocated_pages);
+
+    uint32_t next_flat_slot() const { return _next_flat_slot; }
+    uint32_t allocated_pages() const { return _allocated_pages; }
 
     bool is_slot_occupied(uint32_t flat_slot) const;
 
@@ -94,6 +103,35 @@ private:
     mutable std::array<std::mutex, RAW_VECTOR_BITMAP_LOCK_STRIPES> _bitmap_mtx;
     uint32_t _next_flat_slot = 0;
     uint32_t _allocated_pages = 0;
+};
+
+// ---------------------------------------------------------------------------
+// RawVectorHeapBulkWriter -- build-time sequential loader
+// ---------------------------------------------------------------------------
+// Fills pages in memory and hands them to write_pages() `pages_per_flush` at a
+// time, so a build costs one syscall per flush rather than three per vector.
+// Requires an empty heap; vector k of the load lands in flat slot k. Call
+// finish() to flush the tail and set the heap's allocation cursor. Not
+// thread-safe.
+class RawVectorHeapBulkWriter {
+public:
+    RawVectorHeapBulkWriter(RawVectorHeap& heap, uint32_t pages_per_flush);
+
+    // Appends one elem_size-byte vector and returns its flat slot.
+    uint32_t append(const void* data);
+    void finish();
+
+private:
+    void flush();
+
+    RawVectorHeap& _heap;
+    const RawVectorHeapLayout& _layout;
+    std::vector<char> _buf;        // pages_per_flush pages
+    uint32_t _pages_per_flush = 0;
+    uint32_t _buf_pages = 0;       // pages in _buf with at least one slot
+    uint32_t _next_flat_slot = 0;
+    uint32_t _first_page_in_buf = 0;
+    bool _finished = false;
 };
 
 }  // namespace inplace

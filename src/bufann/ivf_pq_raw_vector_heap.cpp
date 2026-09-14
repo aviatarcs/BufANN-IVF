@@ -4,6 +4,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cstring>
 #include <vector>
 
@@ -136,6 +137,16 @@ void RawVectorHeap::read_vector(uint32_t flat_slot, void* out) const {
     }
 }
 
+void RawVectorHeap::write_pages(uint32_t first_page_id, const void* pages, uint32_t num_pages) {
+    size_t bytes = static_cast<size_t>(num_pages) * _layout.page_size;
+    ssize_t n = ::pwrite(_fd, pages, bytes,
+                         static_cast<off_t>(_layout.page_offset(first_page_id)));
+    if (n < 0 || static_cast<size_t>(n) != bytes) {
+        throw ANNException("Failed to bulk-write raw-vector heap pages", -1,
+                           __FUNCSIG__, __FILE__, __LINE__);
+    }
+}
+
 void RawVectorHeap::restore_slot_cursor(uint32_t next_flat_slot, uint32_t allocated_pages) {
     std::lock_guard<std::mutex> lg(_grow_mtx);
     _next_flat_slot  = next_flat_slot;
@@ -188,6 +199,65 @@ void RawVectorHeap::set_occupancy_bit(uint32_t page_id, uint32_t slot_idx, bool 
     if (n != 1) {
         throw ANNException("Failed to write occupancy bitmap", -1, __FUNCSIG__, __FILE__, __LINE__);
     }
+}
+
+RawVectorHeapBulkWriter::RawVectorHeapBulkWriter(RawVectorHeap& heap, uint32_t pages_per_flush)
+    : _heap(heap), _layout(heap.layout()), _pages_per_flush(pages_per_flush) {
+    if (pages_per_flush == 0) {
+        throw ANNException("pages_per_flush must be greater than zero", -1,
+                           __FUNCSIG__, __FILE__, __LINE__);
+    }
+    if (heap.next_flat_slot() != 0 || heap.allocated_pages() != 0) {
+        throw ANNException("bulk load requires an empty raw-vector heap", -1,
+                           __FUNCSIG__, __FILE__, __LINE__);
+    }
+    _buf.assign(static_cast<size_t>(pages_per_flush) * _layout.page_size, 0);
+}
+
+uint32_t RawVectorHeapBulkWriter::append(const void* data) {
+    if (_finished) {
+        throw ANNException("append after finish on raw-vector bulk writer", -1,
+                           __FUNCSIG__, __FILE__, __LINE__);
+    }
+    if (_next_flat_slot > RAW_VECTOR_RID_SLOT_MASK) {
+        throw ANNException("raw-vector heap is full: flat slot index exceeds "
+                           "the 31 bits addressable by RawVectorRID",
+                           -1, __FUNCSIG__, __FILE__, __LINE__);
+    }
+    uint32_t flat = _next_flat_slot++;
+    uint32_t slot_idx = flat % _layout.slots_per_page;
+    uint32_t page_in_buf = (flat / _layout.slots_per_page) - _first_page_in_buf;
+
+    char* page = _buf.data() + static_cast<size_t>(page_in_buf) * _layout.page_size;
+    std::memcpy(page + _layout.slots_offset + static_cast<size_t>(slot_idx) * _layout.elem_size,
+                data, _layout.elem_size);
+    page[RAW_VECTOR_PAGE_HEADER_BYTES + slot_idx / 8] |= static_cast<char>(1u << (slot_idx % 8));
+    _buf_pages = page_in_buf + 1;
+
+    // Flush once the last page of the buffer is full.
+    if (_buf_pages == _pages_per_flush && slot_idx + 1 == _layout.slots_per_page) {
+        flush();
+    }
+    return flat;
+}
+
+void RawVectorHeapBulkWriter::flush() {
+    if (_buf_pages == 0) {
+        return;
+    }
+    _heap.write_pages(_first_page_in_buf, _buf.data(), _buf_pages);
+    _first_page_in_buf += _buf_pages;
+    _buf_pages = 0;
+    std::fill(_buf.begin(), _buf.end(), 0);
+}
+
+void RawVectorHeapBulkWriter::finish() {
+    if (_finished) {
+        return;
+    }
+    flush();
+    _heap.restore_slot_cursor(_next_flat_slot, _first_page_in_buf);
+    _finished = true;
 }
 
 }  // namespace inplace
