@@ -124,6 +124,14 @@ void gen_random_slice(const std::string data_file, double p_val,
 template<typename T>
 void gen_random_slice(const std::string data_file, double p_val,
                       float *&sampled_data, size_t &slice_size, size_t &ndims) {
+  gen_random_slice<T>(data_file, p_val, sampled_data, slice_size, ndims,
+                      std::random_device{}());
+}
+
+template<typename T>
+void gen_random_slice(const std::string data_file, double p_val,
+                      float *&sampled_data, size_t &slice_size, size_t &ndims,
+                      uint32_t seed) {
   size_t                          npts;
   uint32_t                        npts32, ndims32;
   std::vector<std::vector<float>> sampled_vectors;
@@ -142,9 +150,7 @@ void gen_random_slice(const std::string data_file, double p_val,
   std::unique_ptr<T[]> cur_vector_T = std::make_unique<T[]>(ndims);
   p_val = p_val < 1 ? p_val : 1;
 
-  std::random_device rd;  // Will be used to obtain a seed for the random number
-  size_t             x = rd();
-  std::mt19937       generator((unsigned) x);
+  std::mt19937                          generator(seed);
   std::uniform_real_distribution<float> distribution(0, 1);
 
   for (size_t i = 0; i < npts; i++) {
@@ -1003,6 +1009,16 @@ template void DISKANN_DLLEXPORT gen_random_slice<uint8_t>(
 template void DISKANN_DLLEXPORT gen_random_slice<int8_t>(
     const std::string data_file, double p_val, float *&sampled_data,
     size_t &slice_size, size_t &ndims);
+
+template void DISKANN_DLLEXPORT gen_random_slice<float>(
+    const std::string data_file, double p_val, float *&sampled_data,
+    size_t &slice_size, size_t &ndims, uint32_t seed);
+template void DISKANN_DLLEXPORT gen_random_slice<uint8_t>(
+    const std::string data_file, double p_val, float *&sampled_data,
+    size_t &slice_size, size_t &ndims, uint32_t seed);
+template void DISKANN_DLLEXPORT gen_random_slice<int8_t>(
+    const std::string data_file, double p_val, float *&sampled_data,
+    size_t &slice_size, size_t &ndims, uint32_t seed);
 
 template DISKANN_DLLEXPORT int partition<int8_t>(
     const std::string data_file, const float sampling_rate, size_t num_centers,

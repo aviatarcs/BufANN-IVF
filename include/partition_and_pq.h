@@ -8,15 +8,13 @@
 #include <string>
 #include <unordered_map>
 
+#include "defaults.h"
 #include "neighbor.h"
 #include "parameters.h"
 #include "tsl/robin_set.h"
 #include "utils.h"
 
 #include "windows_customizations.h"
-
-const uint32_t NUM_PQ_CENTERS = 256;
-const uint32_t NUM_K_MEANS_ITERS = 15;
 
 template<typename T>
 void gen_random_slice(const std::string base_file,
@@ -31,6 +29,12 @@ void gen_random_slice(const std::string data_file, double p_val,
 template<typename T>
 void gen_random_slice(const std::string data_file, double p_val,
                       float *&sampled_data, size_t &slice_size, size_t &ndims);
+
+// Deterministic for a given seed.
+template<typename T>
+void gen_random_slice(const std::string data_file, double p_val,
+                      float *&sampled_data, size_t &slice_size, size_t &ndims,
+                      uint32_t seed);
 
 template<typename T>
 void gen_random_slice(const T *inputdata, size_t npts, size_t ndims,

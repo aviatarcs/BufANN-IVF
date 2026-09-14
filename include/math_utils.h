@@ -88,10 +88,16 @@ namespace kmeans {
                    std::vector<size_t>* closest_docs, uint32_t* closest_center);
 
   // assumes already memory allocated for pivot_data as new
-  // float[num_centers*dim] and select randomly num_centers points as pivots
+  // float[num_centers*dim] and select randomly num_centers points as pivots.
+  // The seeded overloads are deterministic; the others draw a fresh seed.
+  void selecting_pivots(float* data, size_t num_points, size_t dim,
+                        float* pivot_data, size_t num_centers, uint32_t seed);
   void selecting_pivots(float* data, size_t num_points, size_t dim,
                         float* pivot_data, size_t num_centers);
 
+  void kmeanspp_selecting_pivots(float* data, size_t num_points, size_t dim,
+                                 float* pivot_data, size_t num_centers,
+                                 uint32_t seed);
   void kmeanspp_selecting_pivots(float* data, size_t num_points, size_t dim,
                                  float* pivot_data, size_t num_centers);
 }  // namespace kmeans

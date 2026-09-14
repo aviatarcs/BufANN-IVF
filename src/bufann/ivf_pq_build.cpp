@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <memory>
+#include <random>
 
 #include "ann_exception.h"
 #include "math_utils.h"
@@ -17,7 +18,8 @@ std::string ivf_centroids_path(const std::string& index_prefix) {
 
 template<typename T>
 IVFMetadata train_ivf_centroids(const std::string& data_bin, uint32_t nlist,
-                                double sampling_rate, uint32_t max_kmeans_reps) {
+                                double sampling_rate, uint32_t max_kmeans_reps,
+                                std::optional<uint32_t> seed) {
     if (nlist == 0) {
         throw ANNException("ivf_nlist must be greater than zero", -1,
                            __FUNCSIG__, __FILE__, __LINE__);
@@ -36,9 +38,13 @@ IVFMetadata train_ivf_centroids(const std::string& data_bin, uint32_t nlist,
         sampling_rate = static_cast<double>(target) / static_cast<double>(npts);
     }
 
+    // One seed drives both the sample and the k-means++ init, so a fixed seed
+    // gives a fully reproducible training run.
+    uint32_t rng_seed = seed.has_value() ? *seed : std::random_device{}();
+
     float* raw_sample = nullptr;
     size_t num_train = 0, train_dim = 0;
-    gen_random_slice<T>(data_bin, sampling_rate, raw_sample, num_train, train_dim);
+    gen_random_slice<T>(data_bin, sampling_rate, raw_sample, num_train, train_dim, rng_seed);
     std::unique_ptr<float[]> train_data(raw_sample);
 
     // gen_random_slice samples independently, so the draw can come up short.
@@ -55,7 +61,7 @@ IVFMetadata train_ivf_centroids(const std::string& data_bin, uint32_t nlist,
 
     std::unique_ptr<float[]> centers(new float[static_cast<size_t>(nlist) * train_dim]);
     kmeans::kmeanspp_selecting_pivots(train_data.get(), num_train, train_dim,
-                                      centers.get(), nlist);
+                                      centers.get(), nlist, rng_seed);
     kmeans::run_lloyds(train_data.get(), num_train, train_dim, centers.get(),
                        nlist, max_kmeans_reps, NULL, NULL);
 
@@ -99,9 +105,12 @@ IVFMetadata load_ivf_centroids(const std::string& index_prefix, uint32_t dim) {
     return meta;
 }
 
-template IVFMetadata train_ivf_centroids<float>(const std::string&, uint32_t, double, uint32_t);
-template IVFMetadata train_ivf_centroids<uint8_t>(const std::string&, uint32_t, double, uint32_t);
-template IVFMetadata train_ivf_centroids<int8_t>(const std::string&, uint32_t, double, uint32_t);
+template IVFMetadata train_ivf_centroids<float>(const std::string&, uint32_t, double, uint32_t,
+                                                std::optional<uint32_t>);
+template IVFMetadata train_ivf_centroids<uint8_t>(const std::string&, uint32_t, double, uint32_t,
+                                                  std::optional<uint32_t>);
+template IVFMetadata train_ivf_centroids<int8_t>(const std::string&, uint32_t, double, uint32_t,
+                                                 std::optional<uint32_t>);
 
 }  // namespace inplace
 }  // namespace diskann

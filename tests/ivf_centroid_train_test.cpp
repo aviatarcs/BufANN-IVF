@@ -17,6 +17,7 @@ using namespace diskann::inplace;
 namespace {
 
 const uint32_t NUM_BLOBS = 8;
+const uint32_t TRAIN_SEED = 12345;  // pinned: k-means++ init must not flake
 const uint32_t POINTS_PER_BLOB = 500;
 const uint32_t BLOB_DIM = 12;  // not a multiple of 8, so padding is exercised
 const float BLOB_SPACING = 50.0f;
@@ -131,6 +132,19 @@ bool test_save_load_round_trip(const std::string& prefix, const IVFMetadata& met
     return pass;
 }
 
+bool test_same_seed_is_reproducible(const std::string& base_bin, const IVFMetadata& meta) {
+    std::cout << "[Test] same seed reproduces identical centroids..." << std::endl;
+    IVFMetadata again = train_ivf_centroids<float>(base_bin, NUM_BLOBS, 1.0,
+                                                   NUM_K_MEANS_ITERS, TRAIN_SEED);
+    bool pass = again.centroids == meta.centroids;
+    if (!pass) {
+        std::cout << "  FAIL: a second run with the same seed produced different centroids"
+                  << std::endl;
+    }
+    std::cout << "  " << (pass ? "PASS" : "FAIL") << std::endl;
+    return pass;
+}
+
 }  // namespace
 
 int main() {
@@ -140,11 +154,13 @@ int main() {
     bool all_pass = true;
     try {
         write_synthetic_base(base_bin);
-        IVFMetadata meta = train_ivf_centroids<float>(base_bin, NUM_BLOBS, 1.0);
+        IVFMetadata meta = train_ivf_centroids<float>(base_bin, NUM_BLOBS, 1.0,
+                                                      NUM_K_MEANS_ITERS, TRAIN_SEED);
 
         all_pass &= test_metadata_shape_and_padding(meta);
         all_pass &= test_centroids_recover_blobs(meta);
         all_pass &= test_save_load_round_trip(prefix, meta);
+        all_pass &= test_same_seed_is_reproducible(base_bin, meta);
     } catch (const diskann::ANNException& e) {
         std::cout << "  FAIL: " << e.message() << std::endl;
         all_pass = false;

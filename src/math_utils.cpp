@@ -359,13 +359,11 @@ namespace kmeans {
   // float[num_centers*dim]
   // and select randomly num_centers points as pivots
   void selecting_pivots(float* data, size_t num_points, size_t dim,
-                        float* pivot_data, size_t num_centers) {
+                        float* pivot_data, size_t num_centers, uint32_t seed) {
     //	pivot_data = new float[num_centers * dim];
 
     std::vector<size_t>                   picked;
-    std::random_device                    rd;
-    auto                                  x = rd();
-    std::mt19937                          generator(x);
+    std::mt19937                          generator(seed);
     std::uniform_int_distribution<size_t> distribution(0, num_points - 1);
 
     size_t tmp_pivot;
@@ -379,22 +377,27 @@ namespace kmeans {
     }
   }
 
+  void selecting_pivots(float* data, size_t num_points, size_t dim,
+                        float* pivot_data, size_t num_centers) {
+    selecting_pivots(data, num_points, dim, pivot_data, num_centers,
+                     std::random_device{}());
+  }
+
   void kmeanspp_selecting_pivots(float* data, size_t num_points, size_t dim,
-                                 float* pivot_data, size_t num_centers) {
+                                 float* pivot_data, size_t num_centers,
+                                 uint32_t seed) {
     if (num_points > 1 << 23) {
       diskann::cout << "ERROR: n_pts " << num_points
                     << " currently not supported for k-means++, maximum is "
                        "8388608. Falling back to random pivot "
                        "selection."
                     << std::endl;
-      selecting_pivots(data, num_points, dim, pivot_data, num_centers);
+      selecting_pivots(data, num_points, dim, pivot_data, num_centers, seed);
       return;
     }
 
     std::vector<size_t>                   picked;
-    std::random_device                    rd;
-    auto                                  x = rd();
-    std::mt19937                          generator(x);
+    std::mt19937                          generator(seed);
     std::uniform_real_distribution<>      distribution(0, 1);
     std::uniform_int_distribution<size_t> int_dist(0, num_points - 1);
     size_t                                init_id = int_dist(generator);
@@ -459,4 +462,9 @@ namespace kmeans {
     delete[] dist;
   }
 
+  void kmeanspp_selecting_pivots(float* data, size_t num_points, size_t dim,
+                                 float* pivot_data, size_t num_centers) {
+    kmeanspp_selecting_pivots(data, num_points, dim, pivot_data, num_centers,
+                              std::random_device{}());
+  }
 }  // namespace kmeans

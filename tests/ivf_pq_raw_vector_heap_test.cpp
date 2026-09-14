@@ -176,17 +176,20 @@ bool test_rejects_slots_past_the_rid_slot_space() {
     RawVectorFreeList free_list;
     heap.restore_slot_cursor(RAW_VECTOR_RID_SLOT_MASK, RAW_VECTOR_RID_SLOT_MASK + 1u);
 
-    bool pass = false;
+    bool last_ok = false;
+    bool threw = false;
     try {
         uint32_t last = heap.allocate_slot(free_list);  // the last addressable slot
-        if (last != RAW_VECTOR_RID_SLOT_MASK) {
+        last_ok = (last == RAW_VECTOR_RID_SLOT_MASK);
+        if (!last_ok) {
             std::cout << "  FAIL: expected the last addressable slot, got " << last << std::endl;
         }
         heap.allocate_slot(free_list);  // one past it -- must throw
         std::cout << "  FAIL: handed out a slot that RawVectorRID cannot address" << std::endl;
     } catch (const diskann::ANNException&) {
-        pass = true;
+        threw = true;
     }
+    bool pass = last_ok && threw;
 
     heap.close();
     ::unlink(path.c_str());
