@@ -6,7 +6,7 @@
 #include <random>
 #include <vector>
 
-#include "ann_exception.h"
+#include "bufann/ivf_pq_require.h"
 #include "cached_io.h"
 #include "math_utils.h"
 #include "partition_and_pq.h"
@@ -36,7 +36,18 @@ std::string ivf_posting_ids_path(const std::string& index_prefix) {
 
 namespace {
 
-// [N x 1] uint32 bin round-trips shared by the sidecars below.
+const uint64_t BASE_FILE_READ_CACHE_BYTES = 64 * 1024 * 1024;
+const uint32_t BIN_FILE_HEADER_BYTES = 2 * sizeof(uint32_t);  // npts, dim
+
+// Copies `cols` values from each of `rows` rows between differently strided
+// row-major buffers; used to add and strip the aligned_dim padding.
+void copy_rows(const float* src, size_t src_stride, float* dst, size_t dst_stride,
+               size_t rows, size_t cols) {
+    for (size_t r = 0; r < rows; ++r) {
+        std::copy_n(src + r * src_stride, cols, dst + r * dst_stride);
+    }
+}
+
 void save_u32_column(const std::string& path, const uint32_t* data, size_t n) {
     diskann::save_bin<uint32_t>(path, const_cast<uint32_t*>(data), n, 1);
 }
@@ -46,10 +57,7 @@ std::vector<uint32_t> load_u32_column(const std::string& path) {
     size_t n = 0, cols = 0;
     diskann::load_bin<uint32_t>(path, raw, n, cols);
     std::unique_ptr<uint32_t[]> owned(raw);
-    if (cols != 1) {
-        throw ANNException("expected a single-column uint32 bin file: " + path, -1,
-                           __FUNCSIG__, __FILE__, __LINE__);
-    }
+    IVF_PQ_REQUIRE(cols == 1, "expected a single-column uint32 bin file: " + path);
     return std::vector<uint32_t>(owned.get(), owned.get() + n);
 }
 
@@ -59,70 +67,47 @@ template<typename T>
 IVFMetadata train_ivf_centroids(const std::string& data_bin, uint32_t nlist,
                                 double sampling_rate, uint32_t max_kmeans_reps,
                                 std::optional<uint32_t> seed) {
-    if (nlist == 0) {
-        throw ANNException("ivf_nlist must be greater than zero", -1,
-                           __FUNCSIG__, __FILE__, __LINE__);
-    }
-
-    size_t npts = 0, file_dim = 0;
-    get_bin_metadata(data_bin, npts, file_dim);
-    if (npts < nlist) {
-        throw ANNException("ivf_nlist exceeds the number of base vectors", -1,
-                           __FUNCSIG__, __FILE__, __LINE__);
-    }
+    IVF_PQ_REQUIRE(nlist > 0, "ivf_nlist must be greater than zero");
+    size_t npts = 0, dim = 0;
+    get_bin_metadata(data_bin, npts, dim);
+    IVF_PQ_REQUIRE(npts >= nlist, "ivf_nlist exceeds the number of base vectors");
 
     if (sampling_rate <= 0.0) {
-        size_t target = std::min<size_t>(
-            static_cast<size_t>(nlist) * IVF_TRAIN_POINTS_PER_CENTROID, npts);
-        sampling_rate = static_cast<double>(target) / static_cast<double>(npts);
+        size_t target = std::min<size_t>(size_t(nlist) * IVF_TRAIN_POINTS_PER_CENTROID, npts);
+        sampling_rate = double(target) / double(npts);
     }
-
-    // One seed drives both the sample and the k-means++ init, so a fixed seed
-    // gives a fully reproducible training run.
     uint32_t rng_seed = seed.has_value() ? *seed : std::random_device{}();
 
     float* raw_sample = nullptr;
-    size_t num_train = 0, train_dim = 0;
-    gen_random_slice<T>(data_bin, sampling_rate, raw_sample, num_train, train_dim, rng_seed);
+    size_t num_train = 0, sample_dim = 0;
+    gen_random_slice<T>(data_bin, sampling_rate, raw_sample, num_train, sample_dim, rng_seed);
     std::unique_ptr<float[]> train_data(raw_sample);
-
-    // gen_random_slice samples independently, so the draw can come up short.
-    if (num_train < nlist) {
-        throw ANNException(
-            "sampled " + std::to_string(num_train) +
-                " training points for " + std::to_string(nlist) +
-                " centroids; raise sampling_rate or lower ivf_nlist",
-            -1, __FUNCSIG__, __FILE__, __LINE__);
-    }
+    IVF_PQ_REQUIRE(num_train >= nlist,
+                   "sampled " + std::to_string(num_train) + " training points for " +
+                       std::to_string(nlist) + " centroids; raise sampling_rate or lower ivf_nlist");
 
     diskann::cout << "Training " << nlist << " IVF centroids on " << num_train
-                  << " sampled points (dim " << train_dim << ")" << std::endl;
+                  << " sampled points (dim " << dim << ")" << std::endl;
 
-    std::unique_ptr<float[]> centers(new float[static_cast<size_t>(nlist) * train_dim]);
-    kmeans::kmeanspp_selecting_pivots(train_data.get(), num_train, train_dim,
-                                      centers.get(), nlist, rng_seed);
-    kmeans::run_lloyds(train_data.get(), num_train, train_dim, centers.get(),
-                       nlist, max_kmeans_reps, NULL, NULL);
+    std::vector<float> centers(size_t(nlist) * dim);
+    kmeans::kmeanspp_selecting_pivots(train_data.get(), num_train, dim, centers.data(), nlist,
+                                      rng_seed);
+    kmeans::run_lloyds(train_data.get(), num_train, dim, centers.data(), nlist, max_kmeans_reps,
+                       NULL, NULL);
 
     IVFMetadata meta;
     meta.nlist = nlist;
-    meta.dim = static_cast<uint32_t>(train_dim);
-    meta.aligned_dim = align_dim(static_cast<uint32_t>(train_dim));
-
-    // Zero-padded to aligned_dim so distance math runs at the aligned width.
-    meta.centroids.assign(static_cast<size_t>(nlist) * meta.aligned_dim, 0.0f);
-    for (uint32_t c = 0; c < nlist; ++c) {
-        std::copy(centers.get() + static_cast<size_t>(c) * train_dim,
-                  centers.get() + static_cast<size_t>(c + 1) * train_dim,
-                  meta.centroids.begin() + static_cast<size_t>(c) * meta.aligned_dim);
-    }
+    meta.dim = uint32_t(dim);
+    meta.aligned_dim = align_dim(uint32_t(dim));
+    meta.centroids.assign(size_t(nlist) * meta.aligned_dim, 0.0f);
+    copy_rows(centers.data(), dim, meta.centroids.data(), meta.aligned_dim, nlist, dim);
     return meta;
 }
 
 void save_ivf_centroids(const std::string& index_prefix, const IVFMetadata& meta) {
     diskann::save_bin<float>(ivf_centroids_path(index_prefix),
-                             const_cast<float*>(meta.centroids.data()),
-                             meta.nlist, meta.aligned_dim);
+                             const_cast<float*>(meta.centroids.data()), meta.nlist,
+                             meta.aligned_dim);
 }
 
 IVFMetadata load_ivf_centroids(const std::string& index_prefix, uint32_t dim) {
@@ -130,16 +115,12 @@ IVFMetadata load_ivf_centroids(const std::string& index_prefix, uint32_t dim) {
     size_t nlist = 0, aligned_dim = 0;
     diskann::load_bin<float>(ivf_centroids_path(index_prefix), raw, nlist, aligned_dim);
     std::unique_ptr<float[]> owned(raw);
-
-    if (aligned_dim != align_dim(dim)) {
-        throw ANNException("centroid file dimensionality does not match dim", -1,
-                           __FUNCSIG__, __FILE__, __LINE__);
-    }
+    IVF_PQ_REQUIRE(aligned_dim == align_dim(dim), "centroid file dimensionality does not match dim");
 
     IVFMetadata meta;
-    meta.nlist = static_cast<uint32_t>(nlist);
+    meta.nlist = uint32_t(nlist);
     meta.dim = dim;
-    meta.aligned_dim = static_cast<uint32_t>(aligned_dim);
+    meta.aligned_dim = uint32_t(aligned_dim);
     meta.centroids.assign(owned.get(), owned.get() + nlist * aligned_dim);
     return meta;
 }
@@ -148,42 +129,26 @@ template<typename T>
 void assign_ivf_clusters(const std::string& data_bin, const IVFMetadata& meta,
                          RawVectorHeap& heap, ClusterAssignments& assignments,
                          RawVectorRIDTable& rid_table, size_t max_block_points) {
-    if (max_block_points == 0) {
-        throw ANNException("max_block_points must be greater than zero", -1,
-                           __FUNCSIG__, __FILE__, __LINE__);
-    }
+    IVF_PQ_REQUIRE(max_block_points > 0, "max_block_points must be greater than zero");
     size_t npts = 0, file_dim = 0;
     get_bin_metadata(data_bin, npts, file_dim);
-    if (file_dim != meta.dim) {
-        throw ANNException("base file dimensionality does not match the centroids", -1,
-                           __FUNCSIG__, __FILE__, __LINE__);
-    }
+    IVF_PQ_REQUIRE(file_dim == meta.dim, "base file dimensionality does not match the centroids");
+    IVF_PQ_REQUIRE(npts <= size_t(RAW_VECTOR_RID_SLOT_MASK) + 1,
+                   "base file has more vectors than RawVectorRID can address");
     const size_t dim = meta.dim;
     const size_t elem_size = dim * sizeof(T);
-    if (heap.layout().elem_size != elem_size) {
-        throw ANNException("raw-vector heap elem_size does not match dim * sizeof(T)", -1,
-                           __FUNCSIG__, __FILE__, __LINE__);
-    }
-    if (npts > static_cast<size_t>(RAW_VECTOR_RID_SLOT_MASK) + 1) {
-        throw ANNException("base file has more vectors than RawVectorRID can address", -1,
-                           __FUNCSIG__, __FILE__, __LINE__);
-    }
+    IVF_PQ_REQUIRE(heap.layout().elem_size == elem_size,
+                   "raw-vector heap elem_size does not match dim * sizeof(T)");
 
     // compute_closest_centers works at `dim`, so strip the aligned_dim padding.
-    std::vector<float> centroids(static_cast<size_t>(meta.nlist) * dim);
-    for (uint32_t c = 0; c < meta.nlist; ++c) {
-        std::copy(meta.centroids.begin() + static_cast<size_t>(c) * meta.aligned_dim,
-                  meta.centroids.begin() + static_cast<size_t>(c) * meta.aligned_dim + dim,
-                  centroids.begin() + static_cast<size_t>(c) * dim);
-    }
+    std::vector<float> centroids(size_t(meta.nlist) * dim);
+    copy_rows(meta.centroids.data(), meta.aligned_dim, centroids.data(), dim, meta.nlist, dim);
 
-    size_t block_size = IVF_ASSIGN_DIST_MATRIX_BYTES / (static_cast<size_t>(meta.nlist) * sizeof(float));
-    block_size = std::min({block_size, max_block_points, npts});
-    block_size = std::max<size_t>(1, block_size);
-
-    std::unique_ptr<T[]> block_T(new T[block_size * dim]);
-    std::unique_ptr<float[]> block_float(new float[block_size * dim]);
-    std::unique_ptr<uint32_t[]> block_closest(new uint32_t[block_size]);
+    size_t block_size = IVF_ASSIGN_DIST_MATRIX_BYTES / (size_t(meta.nlist) * sizeof(float));
+    block_size = std::max<size_t>(1, std::min({block_size, max_block_points, npts}));
+    std::vector<T> block(block_size * dim);
+    std::vector<float> block_float(block_size * dim);
+    std::vector<uint32_t> block_closest(block_size);
 
     assignments.cluster_id.resize(npts);
     rid_table.rid.resize(npts);
@@ -192,22 +157,17 @@ void assign_ivf_clusters(const std::string& data_bin, const IVFMetadata& meta,
     diskann::cout << "Assigning " << npts << " vectors to " << meta.nlist
                   << " IVF centroids in blocks of " << block_size << std::endl;
 
-    cached_ifstream reader(data_bin, 64 * 1024 * 1024);
-    uint32_t hdr[2];
-    reader.read(reinterpret_cast<char*>(hdr), sizeof(hdr));
-
+    cached_ifstream reader(data_bin, BASE_FILE_READ_CACHE_BYTES, BIN_FILE_HEADER_BYTES);
     for (size_t start = 0; start < npts; start += block_size) {
         size_t cur = std::min(block_size, npts - start);
-        reader.read(reinterpret_cast<char*>(block_T.get()), cur * elem_size);
-        diskann::convert_types<T, float>(block_T.get(), block_float.get(), cur, dim);
-
-        math_utils::compute_closest_centers(block_float.get(), cur, dim, centroids.data(),
-                                            meta.nlist, 1, block_closest.get());
-        std::copy(block_closest.get(), block_closest.get() + cur,
-                  assignments.cluster_id.begin() + start);
+        reader.read(reinterpret_cast<char*>(block.data()), cur * elem_size);
+        diskann::convert_types<T, float>(block.data(), block_float.data(), cur, dim);
+        math_utils::compute_closest_centers(block_float.data(), cur, dim, centroids.data(),
+                                            meta.nlist, 1, block_closest.data());
+        std::copy_n(block_closest.data(), cur, assignments.cluster_id.begin() + start);
 
         for (size_t i = 0; i < cur; ++i) {
-            uint32_t slot = writer.append(block_T.get() + i * dim);
+            uint32_t slot = writer.append(block.data() + i * dim);
             rid_table.rid[start + i] = make_raw_vector_rid(slot, true);
         }
     }
@@ -233,42 +193,36 @@ void save_ivf_rid_table(const std::string& index_prefix, const RawVectorRIDTable
 }
 
 RawVectorRIDTable load_ivf_rid_table(const std::string& index_prefix) {
-    std::vector<uint32_t> packed = load_u32_column(ivf_rid_table_path(index_prefix));
     RawVectorRIDTable rid_table;
-    rid_table.rid.resize(packed.size());
-    for (size_t i = 0; i < packed.size(); ++i) {
-        rid_table.rid[i].packed = packed[i];
+    for (uint32_t packed : load_u32_column(ivf_rid_table_path(index_prefix))) {
+        rid_table.rid.push_back(RawVectorRID{packed});
     }
     return rid_table;
 }
 
 PostingLists build_ivf_posting_lists(const ClusterAssignments& assignments, uint32_t nlist) {
-    const size_t npts = assignments.cluster_id.size();
-    if (npts > std::numeric_limits<uint32_t>::max()) {
-        throw ANNException("too many vectors for uint32 posting-list offsets", -1,
-                           __FUNCSIG__, __FILE__, __LINE__);
-    }
+    const std::vector<uint32_t>& cluster_id = assignments.cluster_id;
+    const size_t npts = cluster_id.size();
+    IVF_PQ_REQUIRE(npts <= std::numeric_limits<uint32_t>::max(),
+                   "too many vectors for uint32 posting-list offsets");
 
     PostingLists lists;
-    lists.offsets.assign(static_cast<size_t>(nlist) + 1, 0);
+    lists.offsets.assign(size_t(nlist) + 1, 0);
     for (size_t i = 0; i < npts; ++i) {
-        uint32_t c = assignments.cluster_id[i];
-        if (c >= nlist) {
-            throw ANNException("vector " + std::to_string(i) + " is assigned to cluster " +
-                                   std::to_string(c) + " but nlist is " + std::to_string(nlist),
-                               -1, __FUNCSIG__, __FILE__, __LINE__);
-        }
-        ++lists.offsets[c + 1];
+        IVF_PQ_REQUIRE(cluster_id[i] < nlist,
+                       "vector " + std::to_string(i) + " is assigned to cluster " +
+                           std::to_string(cluster_id[i]) + " but nlist is " + std::to_string(nlist));
+        ++lists.offsets[cluster_id[i] + 1];
     }
     for (uint32_t c = 0; c < nlist; ++c) {
         lists.offsets[c + 1] += lists.offsets[c];
     }
 
-    // Counting-sort placement; walking i upward keeps each partition ascending.
-    std::vector<uint32_t> fill(lists.offsets.begin(), lists.offsets.end() - 1);
+    // Counting sort: walking i upward keeps each partition ascending.
+    std::vector<uint32_t> next_free(lists.offsets.begin(), lists.offsets.end() - 1);
     lists.ids.resize(npts);
     for (size_t i = 0; i < npts; ++i) {
-        lists.ids[fill[assignments.cluster_id[i]]++] = static_cast<uint32_t>(i);
+        lists.ids[next_free[cluster_id[i]]++] = uint32_t(i);
     }
     return lists;
 }
@@ -283,12 +237,10 @@ PostingLists load_ivf_posting_lists(const std::string& index_prefix) {
     PostingLists lists;
     lists.offsets = load_u32_column(ivf_posting_offsets_path(index_prefix));
     lists.ids = load_u32_column(ivf_posting_ids_path(index_prefix));
-    if (lists.offsets.empty() || lists.offsets.front() != 0 ||
-        lists.offsets.back() != lists.ids.size() ||
-        !std::is_sorted(lists.offsets.begin(), lists.offsets.end())) {
-        throw ANNException("posting-list offsets and ids sidecars are inconsistent", -1,
-                           __FUNCSIG__, __FILE__, __LINE__);
-    }
+    IVF_PQ_REQUIRE(!lists.offsets.empty() && lists.offsets.front() == 0 &&
+                       lists.offsets.back() == lists.ids.size() &&
+                       std::is_sorted(lists.offsets.begin(), lists.offsets.end()),
+                   "posting-list offsets and ids sidecars are inconsistent");
     return lists;
 }
 
