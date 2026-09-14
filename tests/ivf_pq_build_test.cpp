@@ -1,7 +1,8 @@
 // Tests for the IVF-PQ build steps on a synthetic-blob base: centroid
-// training (shape, padding, blob recovery, seeding, save/load) and cluster
+// training (shape, padding, blob recovery, seeding, save/load), cluster
 // assignment + raw-vector bulk load (exact nearest-centroid agreement,
-// RID/heap contents, multi-block streaming, sidecar round-trips, error paths).
+// RID/heap contents, multi-block streaming, sidecar round-trips, error paths),
+// and posting-list construction (exact inverse of the assignments).
 
 #include "bufann/ivf_pq_build.h"
 #include "ann_exception.h"
@@ -325,6 +326,26 @@ bool test_assign_clusters_and_load_heap(const std::string& tag, const std::strin
         }
     }
 
+    // Posting lists built from these assignments must be exactly the blobs'
+    // row ranges, since blob b occupies rows [b*500, (b+1)*500).
+    PostingLists lists = build_ivf_posting_lists(assignments, meta.nlist);
+    for (uint32_t c = 0; c < meta.nlist && pass; ++c) {
+        uint32_t begin = lists.offsets[c], end = lists.offsets[c + 1];
+        if (end - begin != POINTS_PER_BLOB || lists.ids[begin] % POINTS_PER_BLOB != 0) {
+            std::cout << "  FAIL: partition " << c << " is not one whole blob" << std::endl;
+            pass = false;
+            break;
+        }
+        for (uint32_t k = begin; k < end; ++k) {
+            if (lists.ids[k] != lists.ids[begin] + (k - begin)) {
+                std::cout << "  FAIL: partition " << c << " is not the contiguous blob rows"
+                          << std::endl;
+                pass = false;
+                break;
+            }
+        }
+    }
+
     uint32_t expected_pages = (NUM_POINTS + layout.slots_per_page - 1) / layout.slots_per_page;
     if (heap.next_flat_slot() != NUM_POINTS || heap.allocated_pages() != expected_pages) {
         std::cout << "  FAIL: heap cursor slot/page " << heap.next_flat_slot() << "/"
@@ -400,6 +421,106 @@ bool test_assignment_error_paths(const std::string& prefix, const std::string& b
     return report(pass);
 }
 
+// ---------------------------------------------------------------------------
+// Posting lists
+// ---------------------------------------------------------------------------
+
+// Random assignments over more clusters than get used, so partitions are
+// interleaved (not contiguous ID runs) and several are empty.
+bool test_posting_lists_invert_assignments(const std::string& prefix) {
+    std::cout << "[Test] posting lists are the exact inverse of the assignments..." << std::endl;
+    bool pass = true;
+    const uint32_t nlist = 13;
+    const uint32_t used_clusters = 10;  // 10..12 never appear; 3 is skipped too
+    const size_t npts = 5000;
+
+    ClusterAssignments assignments;
+    std::mt19937 gen(99);
+    std::uniform_int_distribution<uint32_t> pick(0, used_clusters - 1);
+    for (size_t i = 0; i < npts; ++i) {
+        uint32_t c = pick(gen);
+        assignments.cluster_id.push_back(c == 3 ? 4 : c);
+    }
+
+    PostingLists lists = build_ivf_posting_lists(assignments, nlist);
+    if (lists.offsets.size() != nlist + 1 || lists.offsets.front() != 0 ||
+        lists.offsets.back() != npts || lists.ids.size() != npts ||
+        !std::is_sorted(lists.offsets.begin(), lists.offsets.end())) {
+        std::cout << "  FAIL: offsets are not a valid CSR row index" << std::endl;
+        return report(false);
+    }
+
+    std::vector<uint32_t> seen(npts, 0);
+    for (uint32_t c = 0; c < nlist; ++c) {
+        uint32_t begin = lists.offsets[c], end = lists.offsets[c + 1];
+        for (uint32_t k = begin; k < end; ++k) {
+            uint32_t id = lists.ids[k];
+            if (id >= npts || assignments.cluster_id[id] != c) {
+                std::cout << "  FAIL: id " << id << " listed under cluster " << c << std::endl;
+                return report(false);
+            }
+            if (k > begin && lists.ids[k - 1] >= id) {
+                std::cout << "  FAIL: partition " << c << " is not strictly ascending" << std::endl;
+                return report(false);
+            }
+            ++seen[id];
+        }
+    }
+    if (std::count(seen.begin(), seen.end(), 1u) != static_cast<long>(npts)) {
+        std::cout << "  FAIL: some vector ID is missing or listed more than once" << std::endl;
+        pass = false;
+    }
+    for (uint32_t c : {3u, 10u, 11u, 12u}) {
+        if (lists.offsets[c] != lists.offsets[c + 1]) {
+            std::cout << "  FAIL: cluster " << c << " should be empty" << std::endl;
+            pass = false;
+        }
+    }
+
+    // Empty input still yields a well-formed (all-zero) row index.
+    PostingLists none = build_ivf_posting_lists(ClusterAssignments{}, 5);
+    if (none.offsets != std::vector<uint32_t>(6, 0) || !none.ids.empty()) {
+        std::cout << "  FAIL: empty assignments did not give an empty CSR" << std::endl;
+        pass = false;
+    }
+
+    // A cluster ID at or past nlist is a corrupt assignment, not an empty partition.
+    bool threw = false;
+    try {
+        build_ivf_posting_lists(assignments, used_clusters - 1);
+    } catch (const diskann::ANNException&) {
+        threw = true;
+    }
+    if (!threw) {
+        std::cout << "  FAIL: out-of-range cluster ID was accepted" << std::endl;
+        pass = false;
+    }
+
+    // Sidecar round-trip, and the loader rejects offsets that do not match ids.
+    save_ivf_posting_lists(prefix, lists);
+    PostingLists loaded = load_ivf_posting_lists(prefix);
+    if (loaded.offsets != lists.offsets || loaded.ids != lists.ids) {
+        std::cout << "  FAIL: posting-list sidecars did not round-trip" << std::endl;
+        pass = false;
+    }
+    PostingLists truncated = lists;
+    truncated.ids.pop_back();
+    save_ivf_posting_lists(prefix, truncated);
+    threw = false;
+    try {
+        load_ivf_posting_lists(prefix);
+    } catch (const diskann::ANNException&) {
+        threw = true;
+    }
+    if (!threw) {
+        std::cout << "  FAIL: loader accepted offsets whose total exceeds the ids file" << std::endl;
+        pass = false;
+    }
+    ::unlink(ivf_posting_offsets_path(prefix).c_str());
+    ::unlink(ivf_posting_ids_path(prefix).c_str());
+    return report(pass);
+}
+
 }  // namespace
 
 int main() {
@@ -421,6 +542,7 @@ int main() {
         all_pass &= test_training_error_paths(base_f32);
         all_pass &= test_assign_clusters_and_load_heap<float>("float", prefix, base_f32, data_f32, meta);
         all_pass &= test_assignment_error_paths(prefix, base_f32, meta);
+        all_pass &= test_posting_lists_invert_assignments(prefix);
 
         // uint8 base: the raw bytes stored in the heap are 1 byte per dim, and
         // training/assignment must convert without touching what is stored.

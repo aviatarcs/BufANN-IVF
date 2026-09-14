@@ -1,6 +1,7 @@
 #include "bufann/ivf_pq_build.h"
 
 #include <algorithm>
+#include <limits>
 #include <memory>
 #include <random>
 #include <vector>
@@ -26,6 +27,33 @@ std::string ivf_rid_table_path(const std::string& index_prefix) {
 std::string ivf_raw_vectors_path(const std::string& index_prefix) {
     return index_prefix + "_ivf_raw_vectors.bin";
 }
+std::string ivf_posting_offsets_path(const std::string& index_prefix) {
+    return index_prefix + "_ivf_posting_offsets.bin";
+}
+std::string ivf_posting_ids_path(const std::string& index_prefix) {
+    return index_prefix + "_ivf_posting_ids.bin";
+}
+
+namespace {
+
+// [N x 1] uint32 bin round-trips shared by the sidecars below.
+void save_u32_column(const std::string& path, const uint32_t* data, size_t n) {
+    diskann::save_bin<uint32_t>(path, const_cast<uint32_t*>(data), n, 1);
+}
+
+std::vector<uint32_t> load_u32_column(const std::string& path) {
+    uint32_t* raw = nullptr;
+    size_t n = 0, cols = 0;
+    diskann::load_bin<uint32_t>(path, raw, n, cols);
+    std::unique_ptr<uint32_t[]> owned(raw);
+    if (cols != 1) {
+        throw ANNException("expected a single-column uint32 bin file: " + path, -1,
+                           __FUNCSIG__, __FILE__, __LINE__);
+    }
+    return std::vector<uint32_t>(owned.get(), owned.get() + n);
+}
+
+}  // namespace
 
 template<typename T>
 IVFMetadata train_ivf_centroids(const std::string& data_bin, uint32_t nlist,
@@ -188,40 +216,80 @@ void assign_ivf_clusters(const std::string& data_bin, const IVFMetadata& meta,
 
 void save_ivf_cluster_assignments(const std::string& index_prefix,
                                   const ClusterAssignments& assignments) {
-    diskann::save_bin<uint32_t>(ivf_cluster_ids_path(index_prefix),
-                                const_cast<uint32_t*>(assignments.cluster_id.data()),
-                                assignments.cluster_id.size(), 1);
+    save_u32_column(ivf_cluster_ids_path(index_prefix), assignments.cluster_id.data(),
+                    assignments.cluster_id.size());
 }
 
 ClusterAssignments load_ivf_cluster_assignments(const std::string& index_prefix) {
-    uint32_t* raw = nullptr;
-    size_t npts = 0, one = 0;
-    diskann::load_bin<uint32_t>(ivf_cluster_ids_path(index_prefix), raw, npts, one);
-    std::unique_ptr<uint32_t[]> owned(raw);
     ClusterAssignments assignments;
-    assignments.cluster_id.assign(owned.get(), owned.get() + npts);
+    assignments.cluster_id = load_u32_column(ivf_cluster_ids_path(index_prefix));
     return assignments;
 }
 
 void save_ivf_rid_table(const std::string& index_prefix, const RawVectorRIDTable& rid_table) {
     static_assert(sizeof(RawVectorRID) == sizeof(uint32_t), "RID table is stored as uint32");
-    diskann::save_bin<uint32_t>(ivf_rid_table_path(index_prefix),
-                                const_cast<uint32_t*>(
-                                    reinterpret_cast<const uint32_t*>(rid_table.rid.data())),
-                                rid_table.rid.size(), 1);
+    save_u32_column(ivf_rid_table_path(index_prefix),
+                    reinterpret_cast<const uint32_t*>(rid_table.rid.data()), rid_table.rid.size());
 }
 
 RawVectorRIDTable load_ivf_rid_table(const std::string& index_prefix) {
-    uint32_t* raw = nullptr;
-    size_t npts = 0, one = 0;
-    diskann::load_bin<uint32_t>(ivf_rid_table_path(index_prefix), raw, npts, one);
-    std::unique_ptr<uint32_t[]> owned(raw);
+    std::vector<uint32_t> packed = load_u32_column(ivf_rid_table_path(index_prefix));
     RawVectorRIDTable rid_table;
-    rid_table.rid.resize(npts);
-    for (size_t i = 0; i < npts; ++i) {
-        rid_table.rid[i].packed = owned[i];
+    rid_table.rid.resize(packed.size());
+    for (size_t i = 0; i < packed.size(); ++i) {
+        rid_table.rid[i].packed = packed[i];
     }
     return rid_table;
+}
+
+PostingLists build_ivf_posting_lists(const ClusterAssignments& assignments, uint32_t nlist) {
+    const size_t npts = assignments.cluster_id.size();
+    if (npts > std::numeric_limits<uint32_t>::max()) {
+        throw ANNException("too many vectors for uint32 posting-list offsets", -1,
+                           __FUNCSIG__, __FILE__, __LINE__);
+    }
+
+    PostingLists lists;
+    lists.offsets.assign(static_cast<size_t>(nlist) + 1, 0);
+    for (size_t i = 0; i < npts; ++i) {
+        uint32_t c = assignments.cluster_id[i];
+        if (c >= nlist) {
+            throw ANNException("vector " + std::to_string(i) + " is assigned to cluster " +
+                                   std::to_string(c) + " but nlist is " + std::to_string(nlist),
+                               -1, __FUNCSIG__, __FILE__, __LINE__);
+        }
+        ++lists.offsets[c + 1];
+    }
+    for (uint32_t c = 0; c < nlist; ++c) {
+        lists.offsets[c + 1] += lists.offsets[c];
+    }
+
+    // Counting-sort placement; walking i upward keeps each partition ascending.
+    std::vector<uint32_t> fill(lists.offsets.begin(), lists.offsets.end() - 1);
+    lists.ids.resize(npts);
+    for (size_t i = 0; i < npts; ++i) {
+        lists.ids[fill[assignments.cluster_id[i]]++] = static_cast<uint32_t>(i);
+    }
+    return lists;
+}
+
+void save_ivf_posting_lists(const std::string& index_prefix, const PostingLists& lists) {
+    save_u32_column(ivf_posting_offsets_path(index_prefix), lists.offsets.data(),
+                    lists.offsets.size());
+    save_u32_column(ivf_posting_ids_path(index_prefix), lists.ids.data(), lists.ids.size());
+}
+
+PostingLists load_ivf_posting_lists(const std::string& index_prefix) {
+    PostingLists lists;
+    lists.offsets = load_u32_column(ivf_posting_offsets_path(index_prefix));
+    lists.ids = load_u32_column(ivf_posting_ids_path(index_prefix));
+    if (lists.offsets.empty() || lists.offsets.front() != 0 ||
+        lists.offsets.back() != lists.ids.size() ||
+        !std::is_sorted(lists.offsets.begin(), lists.offsets.end())) {
+        throw ANNException("posting-list offsets and ids sidecars are inconsistent", -1,
+                           __FUNCSIG__, __FILE__, __LINE__);
+    }
+    return lists;
 }
 
 template IVFMetadata train_ivf_centroids<float>(const std::string&, uint32_t, double, uint32_t,

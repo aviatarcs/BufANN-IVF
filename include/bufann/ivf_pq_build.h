@@ -30,6 +30,8 @@ std::string ivf_centroids_path(const std::string& index_prefix);
 std::string ivf_cluster_ids_path(const std::string& index_prefix);
 std::string ivf_rid_table_path(const std::string& index_prefix);
 std::string ivf_raw_vectors_path(const std::string& index_prefix);
+std::string ivf_posting_offsets_path(const std::string& index_prefix);
+std::string ivf_posting_ids_path(const std::string& index_prefix);
 
 // Trains `nlist` centroids on a random sample of `data_bin` (k-means++ seed,
 // Lloyd's refinement) and returns them zero-padded to aligned_dim.
@@ -65,6 +67,15 @@ void save_ivf_cluster_assignments(const std::string& index_prefix,
 ClusterAssignments load_ivf_cluster_assignments(const std::string& index_prefix);
 void save_ivf_rid_table(const std::string& index_prefix, const RawVectorRIDTable& rid_table);
 RawVectorRIDTable load_ivf_rid_table(const std::string& index_prefix);
+
+// Groups vector IDs by cluster into CSR form: partition c is
+// ids[offsets[c] : offsets[c+1]], ascending by vector ID. Partitions with no
+// members are empty ranges. Throws on a cluster_id >= nlist.
+PostingLists build_ivf_posting_lists(const ClusterAssignments& assignments, uint32_t nlist);
+
+// offsets as an [nlist+1 x 1] and ids as an [N x 1] uint32 bin file.
+void save_ivf_posting_lists(const std::string& index_prefix, const PostingLists& lists);
+PostingLists load_ivf_posting_lists(const std::string& index_prefix);
 
 }  // namespace inplace
 }  // namespace diskann
