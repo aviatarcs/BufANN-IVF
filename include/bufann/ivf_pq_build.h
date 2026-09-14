@@ -17,8 +17,10 @@ namespace inplace {
 // Training points sampled per centroid; ~40 is the practical floor for k-means.
 const uint32_t IVF_TRAIN_POINTS_PER_CENTROID = 64;
 
-// Memory budget for the per-block [points x nlist] distance matrix used by
-// cluster assignment; it sets how many base vectors are assigned per GEMM.
+// Cluster assignment streams the base file in blocks. A block is capped at
+// IVF_ASSIGN_MAX_BLOCK_POINTS vectors and shrinks further so the per-block
+// [points x nlist] float distance matrix stays under the byte budget.
+const size_t IVF_ASSIGN_MAX_BLOCK_POINTS = size_t(1) << 20;
 const size_t IVF_ASSIGN_DIST_MATRIX_BYTES = size_t(256) << 20;
 
 // Pages the bulk loader buffers before each write to the raw-vector heap.
@@ -50,11 +52,12 @@ IVFMetadata load_ivf_centroids(const std::string& index_prefix, uint32_t dim);
 // bulk-loads the raw vectors into `heap`, which must be freshly opened with
 // elem_size == meta.dim * sizeof(T). Vector i lands in flat slot i, so the
 // RID table is the identity; it is still materialized because inserts later
-// break that property.
+// break that property. `max_block_points` bounds the streaming block.
 template<typename T>
 void assign_ivf_clusters(const std::string& data_bin, const IVFMetadata& meta,
                          RawVectorHeap& heap, ClusterAssignments& assignments,
-                         RawVectorRIDTable& rid_table);
+                         RawVectorRIDTable& rid_table,
+                         size_t max_block_points = IVF_ASSIGN_MAX_BLOCK_POINTS);
 
 // Each is an [N x 1] uint32 bin file.
 void save_ivf_cluster_assignments(const std::string& index_prefix,

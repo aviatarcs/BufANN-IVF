@@ -119,7 +119,11 @@ IVFMetadata load_ivf_centroids(const std::string& index_prefix, uint32_t dim) {
 template<typename T>
 void assign_ivf_clusters(const std::string& data_bin, const IVFMetadata& meta,
                          RawVectorHeap& heap, ClusterAssignments& assignments,
-                         RawVectorRIDTable& rid_table) {
+                         RawVectorRIDTable& rid_table, size_t max_block_points) {
+    if (max_block_points == 0) {
+        throw ANNException("max_block_points must be greater than zero", -1,
+                           __FUNCSIG__, __FILE__, __LINE__);
+    }
     size_t npts = 0, file_dim = 0;
     get_bin_metadata(data_bin, npts, file_dim);
     if (file_dim != meta.dim) {
@@ -146,7 +150,8 @@ void assign_ivf_clusters(const std::string& data_bin, const IVFMetadata& meta,
     }
 
     size_t block_size = IVF_ASSIGN_DIST_MATRIX_BYTES / (static_cast<size_t>(meta.nlist) * sizeof(float));
-    block_size = std::max<size_t>(1, std::min(block_size, npts));
+    block_size = std::min({block_size, max_block_points, npts});
+    block_size = std::max<size_t>(1, block_size);
 
     std::unique_ptr<T[]> block_T(new T[block_size * dim]);
     std::unique_ptr<float[]> block_float(new float[block_size * dim]);
@@ -227,11 +232,11 @@ template IVFMetadata train_ivf_centroids<int8_t>(const std::string&, uint32_t, d
                                                  std::optional<uint32_t>);
 
 template void assign_ivf_clusters<float>(const std::string&, const IVFMetadata&, RawVectorHeap&,
-                                         ClusterAssignments&, RawVectorRIDTable&);
+                                         ClusterAssignments&, RawVectorRIDTable&, size_t);
 template void assign_ivf_clusters<uint8_t>(const std::string&, const IVFMetadata&, RawVectorHeap&,
-                                           ClusterAssignments&, RawVectorRIDTable&);
+                                           ClusterAssignments&, RawVectorRIDTable&, size_t);
 template void assign_ivf_clusters<int8_t>(const std::string&, const IVFMetadata&, RawVectorHeap&,
-                                          ClusterAssignments&, RawVectorRIDTable&);
+                                          ClusterAssignments&, RawVectorRIDTable&, size_t);
 
 }  // namespace inplace
 }  // namespace diskann

@@ -6,7 +6,9 @@
 
 #include <algorithm>
 #include <cstring>
+#include <fstream>
 #include <iostream>
+#include <iterator>
 #include <string>
 #include <thread>
 #include <unistd.h>
@@ -222,86 +224,192 @@ bool test_open_refuses_existing_nonempty_file() {
     return pass;
 }
 
-}  // namespace
+std::vector<char> read_whole_file(const std::string& path) {
+    std::ifstream in(path, std::ios::binary);
+    return std::vector<char>((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+}
 
-bool test_bulk_writer_matches_per_slot_writes() {
-    std::cout << "[Test] bulk writer lays pages out like write_vector and resumes allocation..."
-              << std::endl;
-    std::string path = "/tmp/ivf_pq_raw_vector_heap_test_" + std::to_string((uint64_t) getpid()) + ".bin";
-    ::unlink(path.c_str());
+void fill_vector(std::vector<char>& vec, uint32_t i) {
+    std::memset(vec.data(), static_cast<int>(i % 251 + 1), vec.size());
+}
+
+// Bulk-loads `num_vectors` and checks the result against the same vectors
+// written through allocate_slot/write_vector into a second heap: the files
+// must be byte-identical and the cursor must land where per-slot allocation
+// would have left it.
+bool check_bulk_load_shape(const std::string& tag, uint32_t num_vectors, uint32_t pages_per_flush) {
+    std::string base = "/tmp/ivf_pq_raw_vector_heap_test_bulk_" + std::to_string((uint64_t) getpid());
+    std::string bulk_path = base + "_bulk.bin";
+    std::string slot_path = base + "_slot.bin";
+    ::unlink(bulk_path.c_str());
+    ::unlink(slot_path.c_str());
 
     const uint32_t elem_size = 512;
     RawVectorHeapLayout layout = compute_raw_vector_heap_layout(4096, elem_size);  // 7 slots/page
-
-    // 3 pages per flush, 4 flushes of 21 slots, then a tail page with 4 slots.
-    const uint32_t pages_per_flush = 3;
-    const uint32_t num_vectors = 4 * pages_per_flush * layout.slots_per_page + 4;
-
-    RawVectorHeap heap;
-    heap.open(path, layout);
-    RawVectorHeapBulkWriter writer(heap, pages_per_flush);
-
     bool pass = true;
     std::vector<char> vec(elem_size);
-    for (uint32_t i = 0; i < num_vectors; ++i) {
-        std::memset(vec.data(), static_cast<int>(i % 251 + 1), elem_size);
-        uint32_t slot = writer.append(vec.data());
-        if (slot != i) {
-            std::cout << "  FAIL: vector " << i << " landed in slot " << slot << std::endl;
-            pass = false;
-        }
-    }
-    writer.finish();
 
-    const uint32_t expected_pages = (num_vectors + layout.slots_per_page - 1) / layout.slots_per_page;
-    if (heap.next_flat_slot() != num_vectors || heap.allocated_pages() != expected_pages) {
-        std::cout << "  FAIL: cursor at slot " << heap.next_flat_slot() << " / page "
-                  << heap.allocated_pages() << ", expected " << num_vectors << " / "
-                  << expected_pages << std::endl;
+    RawVectorHeap bulk;
+    bulk.open(bulk_path, layout);
+    {
+        RawVectorHeapBulkWriter writer(bulk, pages_per_flush);
+        for (uint32_t i = 0; i < num_vectors; ++i) {
+            fill_vector(vec, i);
+            uint32_t slot = writer.append(vec.data());
+            if (slot != i) {
+                std::cout << "  FAIL[" << tag << "]: vector " << i << " landed in slot " << slot
+                          << std::endl;
+                pass = false;
+            }
+        }
+        writer.finish();
+    }
+
+    RawVectorHeap per_slot;
+    per_slot.open(slot_path, layout);
+    RawVectorFreeList unused;
+    for (uint32_t i = 0; i < num_vectors; ++i) {
+        fill_vector(vec, i);
+        per_slot.write_vector(per_slot.allocate_slot(unused), vec.data());
+    }
+
+    if (bulk.next_flat_slot() != per_slot.next_flat_slot() ||
+        bulk.allocated_pages() != per_slot.allocated_pages()) {
+        std::cout << "  FAIL[" << tag << "]: bulk cursor slot/page " << bulk.next_flat_slot() << "/"
+                  << bulk.allocated_pages() << " vs per-slot " << per_slot.next_flat_slot() << "/"
+                  << per_slot.allocated_pages() << std::endl;
+        pass = false;
+    }
+    std::vector<char> bulk_bytes = read_whole_file(bulk_path);
+    std::vector<char> slot_bytes = read_whole_file(slot_path);
+    if (bulk_bytes.size() != static_cast<size_t>(bulk.allocated_pages()) * layout.page_size) {
+        std::cout << "  FAIL[" << tag << "]: bulk file is " << bulk_bytes.size()
+                  << " bytes, expected " << bulk.allocated_pages() << " pages" << std::endl;
+        pass = false;
+    }
+    if (bulk_bytes != slot_bytes) {
+        size_t first = 0;
+        while (first < std::min(bulk_bytes.size(), slot_bytes.size()) &&
+               bulk_bytes[first] == slot_bytes[first]) {
+            ++first;
+        }
+        std::cout << "  FAIL[" << tag << "]: bulk and per-slot files differ at byte " << first
+                  << " (sizes " << bulk_bytes.size() << " vs " << slot_bytes.size() << ")"
+                  << std::endl;
         pass = false;
     }
 
-    // Every written slot reads back through the per-slot path; the first
-    // unwritten slot in the tail page is unoccupied.
+    // Read back through the per-slot API too, and confirm no slot past the
+    // load is marked occupied.
     std::vector<char> got(elem_size);
-    for (uint32_t i = 0; i < num_vectors; ++i) {
-        std::memset(vec.data(), static_cast<int>(i % 251 + 1), elem_size);
-        heap.read_vector(i, got.data());
-        if (got != vec || !heap.is_slot_occupied(i)) {
-            std::cout << "  FAIL: slot " << i << " did not read back as written" << std::endl;
+    for (uint32_t i = 0; i < num_vectors && pass; ++i) {
+        fill_vector(vec, i);
+        bulk.read_vector(i, got.data());
+        if (got != vec || !bulk.is_slot_occupied(i)) {
+            std::cout << "  FAIL[" << tag << "]: slot " << i << " did not read back as written"
+                      << std::endl;
             pass = false;
-            break;
         }
     }
-    if (heap.is_slot_occupied(num_vectors)) {
-        std::cout << "  FAIL: slot past the bulk load reads as occupied" << std::endl;
-        pass = false;
+    uint32_t last_page_end = bulk.allocated_pages() * layout.slots_per_page;
+    for (uint32_t i = num_vectors; i < last_page_end && pass; ++i) {
+        if (bulk.is_slot_occupied(i)) {
+            std::cout << "  FAIL[" << tag << "]: unwritten slot " << i << " reads as occupied"
+                      << std::endl;
+            pass = false;
+        }
     }
 
-    // Allocation continues after the bulk load without clobbering it.
-    RawVectorFreeList free_list;
-    uint32_t next = heap.allocate_slot(free_list);
-    if (next != num_vectors) {
-        std::cout << "  FAIL: allocate_slot after bulk load returned " << next << std::endl;
-        pass = false;
-    }
-    std::memset(vec.data(), 0x7f, elem_size);
-    heap.write_vector(next, vec.data());
-    heap.read_vector(num_vectors - 1, got.data());
-    std::memset(vec.data(), static_cast<int>((num_vectors - 1) % 251 + 1), elem_size);
-    if (got != vec) {
-        std::cout << "  FAIL: post-load write_vector clobbered the last bulk slot" << std::endl;
-        pass = false;
+    // Per-slot allocation continues where the load ended and leaves it intact.
+    if (num_vectors > 0) {
+        RawVectorFreeList free_list;
+        uint32_t next = bulk.allocate_slot(free_list);
+        if (next != num_vectors) {
+            std::cout << "  FAIL[" << tag << "]: allocate_slot after bulk load returned " << next
+                      << std::endl;
+            pass = false;
+        }
+        std::memset(vec.data(), 0x7f, elem_size);
+        bulk.write_vector(next, vec.data());
+        bulk.read_vector(num_vectors - 1, got.data());
+        fill_vector(vec, num_vectors - 1);
+        if (got != vec) {
+            std::cout << "  FAIL[" << tag << "]: post-load write_vector clobbered the last bulk slot"
+                      << std::endl;
+            pass = false;
+        }
     }
 
-    // A second bulk writer on the now-populated heap is refused.
-    bool refused = false;
+    bulk.close();
+    per_slot.close();
+    ::unlink(bulk_path.c_str());
+    ::unlink(slot_path.c_str());
+    return pass;
+}
+
+bool test_bulk_writer_matches_per_slot_writes() {
+    std::cout << "[Test] bulk writer produces the same file as per-slot writes..." << std::endl;
+    const uint32_t spp = 7;  // slots per page at page_size=4096, elem_size=512
+    const uint32_t ppf = 3;  // pages per flush
+    bool pass = true;
+    pass &= check_bulk_load_shape("empty", 0, ppf);
+    pass &= check_bulk_load_shape("one slot", 1, ppf);
+    pass &= check_bulk_load_shape("one full page", spp, ppf);
+    pass &= check_bulk_load_shape("one full buffer", spp * ppf, ppf);
+    pass &= check_bulk_load_shape("one buffer + partial page", spp * ppf + 3, ppf);
+    pass &= check_bulk_load_shape("four buffers exactly", 4 * spp * ppf, ppf);
+    pass &= check_bulk_load_shape("four buffers + full page", 4 * spp * ppf + spp, ppf);
+    pass &= check_bulk_load_shape("four buffers + partial page", 4 * spp * ppf + 4, ppf);
+    pass &= check_bulk_load_shape("single-page flushes", 5 * spp + 2, 1);
+    std::cout << "  " << (pass ? "PASS" : "FAIL") << std::endl;
+    return pass;
+}
+
+bool test_bulk_writer_rejects_misuse() {
+    std::cout << "[Test] bulk writer rejects a populated heap, zero flush size, append after finish..."
+              << std::endl;
+    std::string path =
+        "/tmp/ivf_pq_raw_vector_heap_test_misuse_" + std::to_string((uint64_t) getpid()) + ".bin";
+    ::unlink(path.c_str());
+    RawVectorHeapLayout layout = compute_raw_vector_heap_layout(4096, 512);
+    RawVectorHeap heap;
+    heap.open(path, layout);
+    bool pass = true;
+    std::vector<char> vec(512, 'q');
+
+    bool threw = false;
     try {
-        RawVectorHeapBulkWriter again(heap, pages_per_flush);
+        RawVectorHeapBulkWriter w(heap, 0);
     } catch (const diskann::ANNException&) {
-        refused = true;
+        threw = true;
     }
-    if (!refused) {
+    if (!threw) {
+        std::cout << "  FAIL: accepted pages_per_flush == 0" << std::endl;
+        pass = false;
+    }
+
+    RawVectorHeapBulkWriter writer(heap, 2);
+    writer.append(vec.data());
+    writer.finish();
+    writer.finish();  // idempotent
+    threw = false;
+    try {
+        writer.append(vec.data());
+    } catch (const diskann::ANNException&) {
+        threw = true;
+    }
+    if (!threw || heap.next_flat_slot() != 1) {
+        std::cout << "  FAIL: append after finish was accepted or moved the cursor" << std::endl;
+        pass = false;
+    }
+
+    threw = false;
+    try {
+        RawVectorHeapBulkWriter again(heap, 2);
+    } catch (const diskann::ANNException&) {
+        threw = true;
+    }
+    if (!threw) {
         std::cout << "  FAIL: bulk writer accepted a non-empty heap" << std::endl;
         pass = false;
     }
@@ -312,6 +420,8 @@ bool test_bulk_writer_matches_per_slot_writes() {
     return pass;
 }
 
+}  // namespace
+
 int main() {
     bool all_pass = true;
     all_pass &= test_layout_matches_design_doc_example();
@@ -320,5 +430,6 @@ int main() {
     all_pass &= test_rejects_slots_past_the_rid_slot_space();
     all_pass &= test_open_refuses_existing_nonempty_file();
     all_pass &= test_bulk_writer_matches_per_slot_writes();
+    all_pass &= test_bulk_writer_rejects_misuse();
     return all_pass ? 0 : 1;
 }

@@ -1,15 +1,19 @@
-// Tests for IVF centroid training and cluster assignment: metadata shape,
-// padding, blob recovery on synthetic clusters, save/load round-trips, and
-// assignment + raw-vector bulk load of the synthetic base.
+// Tests for the IVF-PQ build steps on a synthetic-blob base: centroid
+// training (shape, padding, blob recovery, seeding, save/load) and cluster
+// assignment + raw-vector bulk load (exact nearest-centroid agreement,
+// RID/heap contents, multi-block streaming, sidecar round-trips, error paths).
 
 #include "bufann/ivf_pq_build.h"
 #include "ann_exception.h"
+#include "math_utils.h"
+#include "partition_and_pq.h"
 #include "utils.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <random>
 #include <string>
@@ -23,34 +27,46 @@ namespace {
 const uint32_t NUM_BLOBS = 8;
 const uint32_t TRAIN_SEED = 12345;  // pinned: k-means++ init must not flake
 const uint32_t POINTS_PER_BLOB = 500;
+const uint32_t NUM_POINTS = NUM_BLOBS * POINTS_PER_BLOB;
 const uint32_t BLOB_DIM = 12;  // not a multiple of 8, so padding is exercised
-const float BLOB_SPACING = 50.0f;
+const float BLOB_SPACING_F32 = 50.0f;
+const float BLOB_SPACING_U8 = 30.0f;  // 8 blobs at 30 fit in [0, 255]
 
-// Blob b is centered at b * BLOB_SPACING in every dimension.
-std::vector<float> blob_center(uint32_t b) {
-    return std::vector<float>(BLOB_DIM, static_cast<float>(b) * BLOB_SPACING);
+// Blob b is centered at b * spacing in every dimension.
+std::vector<float> blob_center(uint32_t b, float spacing) {
+    return std::vector<float>(BLOB_DIM, static_cast<float>(b) * spacing);
 }
 
-std::string write_synthetic_base(const std::string& path) {
+template<typename T>
+T clamp_to(float v) {
+    float lo = static_cast<float>(std::numeric_limits<T>::lowest());
+    float hi = static_cast<float>(std::numeric_limits<T>::max());
+    return static_cast<T>(std::round(std::min(hi, std::max(lo, v))));
+}
+template<>
+float clamp_to<float>(float v) { return v; }
+
+// Points of blob b are rows [b*POINTS_PER_BLOB, (b+1)*POINTS_PER_BLOB).
+template<typename T>
+std::vector<T> write_synthetic_base(const std::string& path, float spacing) {
     std::mt19937 gen(42);
     std::normal_distribution<float> noise(0.0f, 1.0f);
 
-    std::vector<float> data;
-    data.reserve(static_cast<size_t>(NUM_BLOBS) * POINTS_PER_BLOB * BLOB_DIM);
+    std::vector<T> data;
+    data.reserve(static_cast<size_t>(NUM_POINTS) * BLOB_DIM);
     for (uint32_t b = 0; b < NUM_BLOBS; ++b) {
-        std::vector<float> center = blob_center(b);
+        std::vector<float> center = blob_center(b, spacing);
         for (uint32_t i = 0; i < POINTS_PER_BLOB; ++i) {
             for (uint32_t d = 0; d < BLOB_DIM; ++d) {
-                data.push_back(center[d] + noise(gen));
+                data.push_back(clamp_to<T>(center[d] + noise(gen)));
             }
         }
     }
-    diskann::save_bin<float>(path, data.data(),
-                             static_cast<size_t>(NUM_BLOBS) * POINTS_PER_BLOB, BLOB_DIM);
-    return path;
+    diskann::save_bin<T>(path, data.data(), NUM_POINTS, BLOB_DIM);
+    return data;
 }
 
-float dist_to_centroid(const std::vector<float>& point, const IVFMetadata& meta, uint32_t c) {
+float dist_to_centroid(const float* point, const IVFMetadata& meta, uint32_t c) {
     float sum = 0.0f;
     for (uint32_t d = 0; d < meta.dim; ++d) {
         float diff = point[d] - meta.centroids[static_cast<size_t>(c) * meta.aligned_dim + d];
@@ -59,40 +75,27 @@ float dist_to_centroid(const std::vector<float>& point, const IVFMetadata& meta,
     return sum;
 }
 
-bool test_centroids_recover_blobs(const IVFMetadata& meta) {
-    std::cout << "[Test] trained centroids recover the synthetic blobs..." << std::endl;
-    bool pass = true;
-
-    // Each blob should have its own nearby centroid.
-    std::vector<uint32_t> claimed;
-    for (uint32_t b = 0; b < NUM_BLOBS; ++b) {
-        std::vector<float> center = blob_center(b);
-        uint32_t best = 0;
-        float best_dist = dist_to_centroid(center, meta, 0);
-        for (uint32_t c = 1; c < meta.nlist; ++c) {
-            float d = dist_to_centroid(center, meta, c);
-            if (d < best_dist) {
-                best_dist = d;
-                best = c;
-            }
+uint32_t nearest_centroid(const float* point, const IVFMetadata& meta) {
+    uint32_t best = 0;
+    float best_dist = dist_to_centroid(point, meta, 0);
+    for (uint32_t c = 1; c < meta.nlist; ++c) {
+        float d = dist_to_centroid(point, meta, c);
+        if (d < best_dist) {
+            best_dist = d;
+            best = c;
         }
-        if (best_dist > 25.0f) {
-            std::cout << "  FAIL: blob " << b << " nearest centroid is " << best_dist
-                      << " away (squared)" << std::endl;
-            pass = false;
-        }
-        for (uint32_t prev : claimed) {
-            if (prev == best) {
-                std::cout << "  FAIL: centroid " << best << " claimed by two blobs" << std::endl;
-                pass = false;
-            }
-        }
-        claimed.push_back(best);
     }
+    return best;
+}
 
+bool report(bool pass) {
     std::cout << "  " << (pass ? "PASS" : "FAIL") << std::endl;
     return pass;
 }
+
+// ---------------------------------------------------------------------------
+// Centroid training
+// ---------------------------------------------------------------------------
 
 bool test_metadata_shape_and_padding(const IVFMetadata& meta) {
     std::cout << "[Test] metadata shape and aligned-dim zero padding..." << std::endl;
@@ -115,9 +118,34 @@ bool test_metadata_shape_and_padding(const IVFMetadata& meta) {
             }
         }
     }
+    return report(pass);
+}
 
-    std::cout << "  " << (pass ? "PASS" : "FAIL") << std::endl;
-    return pass;
+// Every blob must have a distinct centroid within noise distance of its center.
+bool test_centroids_recover_blobs(const IVFMetadata& meta, float spacing) {
+    std::cout << "[Test] trained centroids recover the synthetic blobs..." << std::endl;
+    bool pass = true;
+
+    std::vector<uint32_t> claimed;
+    for (uint32_t b = 0; b < NUM_BLOBS; ++b) {
+        std::vector<float> center = blob_center(b, spacing);
+        uint32_t best = nearest_centroid(center.data(), meta);
+        float best_dist = dist_to_centroid(center.data(), meta, best);
+        // The mean of 500 unit-variance samples per dim sits ~0.05 from the
+        // true center; 25 (squared, over 12 dims) is far above that but far
+        // below the spacing^2 * 12 that a wrong blob would give.
+        if (best_dist > 25.0f) {
+            std::cout << "  FAIL: blob " << b << " nearest centroid is " << best_dist
+                      << " away (squared)" << std::endl;
+            pass = false;
+        }
+        if (std::find(claimed.begin(), claimed.end(), best) != claimed.end()) {
+            std::cout << "  FAIL: centroid " << best << " claimed by two blobs" << std::endl;
+            pass = false;
+        }
+        claimed.push_back(best);
+    }
+    return report(pass);
 }
 
 bool test_save_load_round_trip(const std::string& prefix, const IVFMetadata& meta) {
@@ -131,49 +159,120 @@ bool test_save_load_round_trip(const std::string& prefix, const IVFMetadata& met
         std::cout << "  FAIL: loaded centroids differ from what was saved" << std::endl;
     }
 
-    ::unlink(ivf_centroids_path(prefix).c_str());
-    std::cout << "  " << (pass ? "PASS" : "FAIL") << std::endl;
-    return pass;
-}
-
-bool test_same_seed_is_reproducible(const std::string& base_bin, const IVFMetadata& meta) {
-    std::cout << "[Test] same seed reproduces identical centroids..." << std::endl;
-    IVFMetadata again = train_ivf_centroids<float>(base_bin, NUM_BLOBS, 1.0,
-                                                   NUM_K_MEANS_ITERS, TRAIN_SEED);
-    bool pass = again.centroids == meta.centroids;
-    if (!pass) {
-        std::cout << "  FAIL: a second run with the same seed produced different centroids"
-                  << std::endl;
+    // Loading with a dim whose padding does not match the file must be refused.
+    bool threw = false;
+    try {
+        load_ivf_centroids(prefix, meta.dim + 8);
+    } catch (const diskann::ANNException&) {
+        threw = true;
     }
-    std::cout << "  " << (pass ? "PASS" : "FAIL") << std::endl;
-    return pass;
+    if (!threw) {
+        std::cout << "  FAIL: load_ivf_centroids accepted a mismatched dim" << std::endl;
+        pass = false;
+    }
+
+    ::unlink(ivf_centroids_path(prefix).c_str());
+    return report(pass);
 }
 
-// Each point must be assigned to the centroid nearest its blob, and each raw
-// vector must come back byte-identical from the heap slot its RID names.
-bool test_assign_clusters_and_load_heap(const std::string& prefix, const std::string& base_bin,
-                                        const IVFMetadata& meta) {
-    std::cout << "[Test] cluster assignment matches blobs and heap holds every raw vector..."
-              << std::endl;
+// The seeded primitives are single-threaded, so they must be bit-exact.
+bool test_seeded_primitives_are_deterministic(const std::string& base_bin) {
+    std::cout << "[Test] seeded sampling and k-means++ init are bit-exact..." << std::endl;
     bool pass = true;
 
-    // Which centroid each blob trained to.
-    std::vector<uint32_t> blob_to_centroid(NUM_BLOBS);
-    for (uint32_t b = 0; b < NUM_BLOBS; ++b) {
-        std::vector<float> center = blob_center(b);
-        uint32_t best = 0;
-        for (uint32_t c = 1; c < meta.nlist; ++c) {
-            if (dist_to_centroid(center, meta, c) < dist_to_centroid(center, meta, best)) {
-                best = c;
-            }
-        }
-        blob_to_centroid[b] = best;
+    auto sample = [&](uint32_t seed) {
+        float* raw = nullptr;
+        size_t n = 0, d = 0;
+        gen_random_slice<float>(base_bin, 0.5, raw, n, d, seed);
+        std::vector<float> out(raw, raw + n * d);
+        delete[] raw;
+        return out;
+    };
+    std::vector<float> s1 = sample(7), s2 = sample(7), s3 = sample(8);
+    if (s1.empty() || s1 != s2) {
+        std::cout << "  FAIL: gen_random_slice with the same seed drew different samples" << std::endl;
+        pass = false;
+    }
+    if (s1 == s3) {
+        std::cout << "  FAIL: gen_random_slice with different seeds drew the same sample" << std::endl;
+        pass = false;
     }
 
-    // 4 KB pages hold ~84 12-float slots, so 4000 points span ~48 pages with a
-    // partial tail page. (Multi-flush behaviour is covered by the heap test.)
-    RawVectorHeapLayout layout =
-        compute_raw_vector_heap_layout(4096, meta.dim * sizeof(float));
+    std::vector<float> p1(NUM_BLOBS * BLOB_DIM), p2(NUM_BLOBS * BLOB_DIM), p3(NUM_BLOBS * BLOB_DIM);
+    size_t n = s1.size() / BLOB_DIM;
+    kmeans::kmeanspp_selecting_pivots(s1.data(), n, BLOB_DIM, p1.data(), NUM_BLOBS, 7);
+    kmeans::kmeanspp_selecting_pivots(s1.data(), n, BLOB_DIM, p2.data(), NUM_BLOBS, 7);
+    kmeans::kmeanspp_selecting_pivots(s1.data(), n, BLOB_DIM, p3.data(), NUM_BLOBS, 8);
+    if (p1 != p2) {
+        std::cout << "  FAIL: kmeanspp_selecting_pivots with the same seed picked different pivots"
+                  << std::endl;
+        pass = false;
+    }
+    if (p1 == p3) {
+        std::cout << "  FAIL: kmeanspp_selecting_pivots with different seeds picked the same pivots"
+                  << std::endl;
+        pass = false;
+    }
+    return report(pass);
+}
+
+// End to end, Lloyd's reduces cluster sums in OpenMP order, so two runs can
+// differ by float rounding; the seed guarantees the same sample and init,
+// which on this data means the same optimum to within that rounding.
+bool test_same_seed_reproduces_centroids(const std::string& base_bin, const IVFMetadata& meta) {
+    std::cout << "[Test] same seed reproduces the centroids to float rounding..." << std::endl;
+    IVFMetadata again = train_ivf_centroids<float>(base_bin, NUM_BLOBS, 1.0,
+                                                   NUM_K_MEANS_ITERS, TRAIN_SEED);
+    bool pass = again.centroids.size() == meta.centroids.size();
+    float max_diff = 0.0f;
+    for (size_t i = 0; pass && i < meta.centroids.size(); ++i) {
+        max_diff = std::max(max_diff, std::fabs(again.centroids[i] - meta.centroids[i]));
+    }
+    if (!pass || max_diff > 1e-3f) {
+        std::cout << "  FAIL: second run differs by up to " << max_diff << std::endl;
+        pass = false;
+    }
+    return report(pass);
+}
+
+bool test_training_error_paths(const std::string& base_bin) {
+    std::cout << "[Test] training rejects nlist == 0, nlist > N, and too small a sample..."
+              << std::endl;
+    bool pass = true;
+    auto expect_throw = [&](const char* what, auto&& fn) {
+        try {
+            fn();
+            std::cout << "  FAIL: " << what << " did not throw" << std::endl;
+            pass = false;
+        } catch (const diskann::ANNException&) {
+        }
+    };
+    expect_throw("nlist == 0", [&] { train_ivf_centroids<float>(base_bin, 0); });
+    expect_throw("nlist > N", [&] { train_ivf_centroids<float>(base_bin, NUM_POINTS + 1); });
+    // 1e-6 of 4000 points samples ~0 rows, far short of NUM_BLOBS centroids.
+    expect_throw("sample < nlist", [&] {
+        train_ivf_centroids<float>(base_bin, NUM_BLOBS, 1e-6, NUM_K_MEANS_ITERS, TRAIN_SEED);
+    });
+    return report(pass);
+}
+
+// ---------------------------------------------------------------------------
+// Cluster assignment + raw-vector bulk load
+// ---------------------------------------------------------------------------
+
+// Ground truth is a brute-force argmin over the same padded centroids the
+// build uses. `max_block_points` does not divide NUM_POINTS, so the streaming
+// loop runs several full blocks and a short tail.
+template<typename T>
+bool test_assign_clusters_and_load_heap(const std::string& tag, const std::string& prefix,
+                                        const std::string& base_bin, const std::vector<T>& base,
+                                        const IVFMetadata& meta) {
+    std::cout << "[Test] " << tag << ": assignment is the exact nearest centroid and the heap "
+              << "holds every raw vector..." << std::endl;
+    bool pass = true;
+    const size_t max_block_points = 333;
+
+    RawVectorHeapLayout layout = compute_raw_vector_heap_layout(4096, meta.dim * sizeof(T));
     std::string heap_path = ivf_raw_vectors_path(prefix);
     ::unlink(heap_path.c_str());
     RawVectorHeap heap;
@@ -181,43 +280,55 @@ bool test_assign_clusters_and_load_heap(const std::string& prefix, const std::st
 
     ClusterAssignments assignments;
     RawVectorRIDTable rid_table;
-    assign_ivf_clusters<float>(base_bin, meta, heap, assignments, rid_table);
+    assign_ivf_clusters<T>(base_bin, meta, heap, assignments, rid_table, max_block_points);
 
-    const size_t npts = static_cast<size_t>(NUM_BLOBS) * POINTS_PER_BLOB;
-    if (assignments.cluster_id.size() != npts || rid_table.rid.size() != npts) {
-        std::cout << "  FAIL: expected " << npts << " assignments/RIDs, got "
+    if (assignments.cluster_id.size() != NUM_POINTS || rid_table.rid.size() != NUM_POINTS) {
+        std::cout << "  FAIL: expected " << NUM_POINTS << " assignments/RIDs, got "
                   << assignments.cluster_id.size() << "/" << rid_table.rid.size() << std::endl;
-        pass = false;
+        return report(false);
     }
 
-    float* raw = nullptr;
-    size_t n = 0, d = 0;
-    diskann::load_bin<float>(base_bin, raw, n, d);
-    std::unique_ptr<float[]> base(raw);
-
-    size_t wrong_cluster = 0, wrong_bytes = 0, wrong_rid = 0;
-    std::vector<float> got(meta.dim);
-    for (size_t i = 0; i < npts && pass; ++i) {
-        uint32_t blob = static_cast<uint32_t>(i / POINTS_PER_BLOB);
-        if (assignments.cluster_id[i] != blob_to_centroid[blob]) {
+    size_t wrong_cluster = 0, wrong_rid = 0, wrong_bytes = 0;
+    std::vector<uint32_t> per_cluster(meta.nlist, 0);
+    std::vector<float> point(meta.dim);
+    std::vector<T> got(meta.dim);
+    for (size_t i = 0; i < NUM_POINTS; ++i) {
+        for (uint32_t d = 0; d < meta.dim; ++d) {
+            point[d] = static_cast<float>(base[i * meta.dim + d]);
+        }
+        if (assignments.cluster_id[i] != nearest_centroid(point.data(), meta)) {
             ++wrong_cluster;
+        }
+        if (assignments.cluster_id[i] < meta.nlist) {
+            ++per_cluster[assignments.cluster_id[i]];
         }
         RawVectorRID rid = rid_table.rid[i];
         if (!rid_is_active(rid) || rid_flat_slot(rid) != i) {
             ++wrong_rid;
         }
         heap.read_vector(rid_flat_slot(rid), got.data());
-        if (std::memcmp(got.data(), base.get() + i * meta.dim, meta.dim * sizeof(float)) != 0) {
+        if (std::memcmp(got.data(), base.data() + i * meta.dim, meta.dim * sizeof(T)) != 0) {
             ++wrong_bytes;
         }
     }
     if (wrong_cluster || wrong_rid || wrong_bytes) {
-        std::cout << "  FAIL: " << wrong_cluster << " misassigned, " << wrong_rid
-                  << " bad RIDs, " << wrong_bytes << " raw-vector mismatches" << std::endl;
+        std::cout << "  FAIL: " << wrong_cluster << " misassigned, " << wrong_rid << " bad RIDs, "
+                  << wrong_bytes << " raw-vector mismatches" << std::endl;
         pass = false;
     }
-    if (heap.next_flat_slot() != npts) {
-        std::cout << "  FAIL: heap cursor at " << heap.next_flat_slot() << ", expected " << npts
+    // With one centroid per blob, every cluster holds exactly one blob.
+    for (uint32_t c = 0; c < meta.nlist; ++c) {
+        if (per_cluster[c] != POINTS_PER_BLOB) {
+            std::cout << "  FAIL: cluster " << c << " holds " << per_cluster[c] << " points, expected "
+                      << POINTS_PER_BLOB << std::endl;
+            pass = false;
+        }
+    }
+
+    uint32_t expected_pages = (NUM_POINTS + layout.slots_per_page - 1) / layout.slots_per_page;
+    if (heap.next_flat_slot() != NUM_POINTS || heap.allocated_pages() != expected_pages) {
+        std::cout << "  FAIL: heap cursor slot/page " << heap.next_flat_slot() << "/"
+                  << heap.allocated_pages() << ", expected " << NUM_POINTS << "/" << expected_pages
                   << std::endl;
         pass = false;
     }
@@ -239,32 +350,92 @@ bool test_assign_clusters_and_load_heap(const std::string& prefix, const std::st
     ::unlink(heap_path.c_str());
     ::unlink(ivf_cluster_ids_path(prefix).c_str());
     ::unlink(ivf_rid_table_path(prefix).c_str());
-    std::cout << "  " << (pass ? "PASS" : "FAIL") << std::endl;
-    return pass;
+    return report(pass);
+}
+
+bool test_assignment_error_paths(const std::string& prefix, const std::string& base_bin,
+                                 const IVFMetadata& meta) {
+    std::cout << "[Test] assignment rejects a mismatched heap, a mismatched base, and a used heap..."
+              << std::endl;
+    bool pass = true;
+    std::string heap_path = ivf_raw_vectors_path(prefix) + ".err";
+    ClusterAssignments assignments;
+    RawVectorRIDTable rid_table;
+
+    auto expect_throw = [&](const char* what, auto&& fn) {
+        ::unlink(heap_path.c_str());
+        try {
+            fn();
+            std::cout << "  FAIL: " << what << " did not throw" << std::endl;
+            pass = false;
+        } catch (const diskann::ANNException&) {
+        }
+    };
+
+    expect_throw("heap elem_size != dim * sizeof(T)", [&] {
+        RawVectorHeap heap;
+        heap.open(heap_path, compute_raw_vector_heap_layout(4096, (meta.dim + 1) * sizeof(float)));
+        assign_ivf_clusters<float>(base_bin, meta, heap, assignments, rid_table);
+    });
+    expect_throw("base dim != centroid dim", [&] {
+        IVFMetadata other = meta;
+        other.dim += 1;
+        RawVectorHeap heap;
+        heap.open(heap_path, compute_raw_vector_heap_layout(4096, other.dim * sizeof(float)));
+        assign_ivf_clusters<float>(base_bin, other, heap, assignments, rid_table);
+    });
+    expect_throw("heap already has slots", [&] {
+        RawVectorHeap heap;
+        heap.open(heap_path, compute_raw_vector_heap_layout(4096, meta.dim * sizeof(float)));
+        RawVectorFreeList free_list;
+        heap.allocate_slot(free_list);
+        assign_ivf_clusters<float>(base_bin, meta, heap, assignments, rid_table);
+    });
+    expect_throw("max_block_points == 0", [&] {
+        RawVectorHeap heap;
+        heap.open(heap_path, compute_raw_vector_heap_layout(4096, meta.dim * sizeof(float)));
+        assign_ivf_clusters<float>(base_bin, meta, heap, assignments, rid_table, 0);
+    });
+    ::unlink(heap_path.c_str());
+    return report(pass);
 }
 
 }  // namespace
 
 int main() {
     std::string prefix = "/tmp/ivf_pq_build_test_" + std::to_string((uint64_t) getpid());
-    std::string base_bin = prefix + "_base.bin";
+    std::string base_f32 = prefix + "_base_f32.bin";
+    std::string base_u8 = prefix + "_base_u8.bin";
 
     bool all_pass = true;
     try {
-        write_synthetic_base(base_bin);
-        IVFMetadata meta = train_ivf_centroids<float>(base_bin, NUM_BLOBS, 1.0,
+        std::vector<float> data_f32 = write_synthetic_base<float>(base_f32, BLOB_SPACING_F32);
+        IVFMetadata meta = train_ivf_centroids<float>(base_f32, NUM_BLOBS, 1.0,
                                                       NUM_K_MEANS_ITERS, TRAIN_SEED);
 
         all_pass &= test_metadata_shape_and_padding(meta);
-        all_pass &= test_centroids_recover_blobs(meta);
+        all_pass &= test_centroids_recover_blobs(meta, BLOB_SPACING_F32);
         all_pass &= test_save_load_round_trip(prefix, meta);
-        all_pass &= test_same_seed_is_reproducible(base_bin, meta);
-        all_pass &= test_assign_clusters_and_load_heap(prefix, base_bin, meta);
+        all_pass &= test_seeded_primitives_are_deterministic(base_f32);
+        all_pass &= test_same_seed_reproduces_centroids(base_f32, meta);
+        all_pass &= test_training_error_paths(base_f32);
+        all_pass &= test_assign_clusters_and_load_heap<float>("float", prefix, base_f32, data_f32, meta);
+        all_pass &= test_assignment_error_paths(prefix, base_f32, meta);
+
+        // uint8 base: the raw bytes stored in the heap are 1 byte per dim, and
+        // training/assignment must convert without touching what is stored.
+        std::vector<uint8_t> data_u8 = write_synthetic_base<uint8_t>(base_u8, BLOB_SPACING_U8);
+        IVFMetadata meta_u8 = train_ivf_centroids<uint8_t>(base_u8, NUM_BLOBS, 1.0,
+                                                           NUM_K_MEANS_ITERS, TRAIN_SEED);
+        all_pass &= test_centroids_recover_blobs(meta_u8, BLOB_SPACING_U8);
+        all_pass &= test_assign_clusters_and_load_heap<uint8_t>("uint8", prefix + "_u8", base_u8,
+                                                                data_u8, meta_u8);
     } catch (const diskann::ANNException& e) {
         std::cout << "  FAIL: " << e.message() << std::endl;
         all_pass = false;
     }
 
-    ::unlink(base_bin.c_str());
+    ::unlink(base_f32.c_str());
+    ::unlink(base_u8.c_str());
     return all_pass ? 0 : 1;
 }
