@@ -5,6 +5,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <mutex>
 #include <string>
@@ -73,8 +74,8 @@ public:
 
     // Not safe to call concurrently with allocate_slot.
     void restore_slot_cursor(uint32_t next_flat_slot, uint32_t allocated_pages);
-    uint32_t next_flat_slot() const { return _next_flat_slot; }
-    uint32_t allocated_pages() const { return _allocated_pages; }
+    uint32_t next_flat_slot() const { return _next_flat_slot.load(std::memory_order_relaxed); }
+    uint32_t allocated_pages() const { return _allocated_pages.load(std::memory_order_relaxed); }
 
     const RawVectorHeapLayout& layout() const { return _layout; }
 
@@ -82,6 +83,7 @@ private:
     void read_at(uint64_t offset, void* buf, size_t bytes, const char* what) const;
     void write_at(uint64_t offset, const void* buf, size_t bytes, const char* what);
     void set_occupancy_bit(uint32_t flat_slot, bool occupied);
+    void require_allocated(uint32_t flat_slot) const;
     std::mutex& bitmap_mutex(uint32_t flat_slot) const {
         return _bitmap_mtx[_layout.page_of(flat_slot) % RAW_VECTOR_BITMAP_LOCK_STRIPES];
     }
@@ -90,8 +92,8 @@ private:
     RawVectorHeapLayout _layout;
     std::mutex _grow_mtx;
     mutable std::array<std::mutex, RAW_VECTOR_BITMAP_LOCK_STRIPES> _bitmap_mtx;
-    uint32_t _next_flat_slot = 0;
-    uint32_t _allocated_pages = 0;
+    std::atomic<uint32_t> _next_flat_slot{0};
+    std::atomic<uint32_t> _allocated_pages{0};
 };
 
 // Build-time loader for an empty heap: vector k of the load lands in flat

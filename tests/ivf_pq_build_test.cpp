@@ -251,7 +251,7 @@ bool test_assign_clusters_and_load_heap(const std::string& tag, const std::strin
 
 bool test_assignment_error_paths(const std::string& prefix, const std::string& base_bin,
                                  const IVFMetadata& meta) {
-    TestCase t("assignment rejects a mismatched heap, a mismatched base, a used heap, zero block");
+    TestCase t("assignment rejects mismatched heap/base, used heap, zero block, bad metadata");
     std::string heap_path = ivf_raw_vectors_path(prefix) + ".err";
     ClusterAssignments assignments;
     RawVectorRIDTable rid_table;
@@ -283,6 +283,21 @@ bool test_assignment_error_paths(const std::string& prefix, const std::string& b
         RawVectorHeap heap;
         fresh_heap(heap, meta.dim * sizeof(float));
         assign_ivf_clusters<float>(base_bin, meta, heap, assignments, rid_table, 0);
+    });
+    t.expect_throw("metadata with nlist == 0", [&] {
+        IVFMetadata empty;
+        empty.dim = meta.dim;
+        empty.aligned_dim = meta.aligned_dim;
+        RawVectorHeap heap;
+        fresh_heap(heap, meta.dim * sizeof(float));
+        assign_ivf_clusters<float>(base_bin, empty, heap, assignments, rid_table);
+    });
+    t.expect_throw("metadata whose centroid buffer is short", [&] {
+        IVFMetadata truncated = meta;
+        truncated.centroids.pop_back();
+        RawVectorHeap heap;
+        fresh_heap(heap, meta.dim * sizeof(float));
+        assign_ivf_clusters<float>(base_bin, truncated, heap, assignments, rid_table);
     });
     ::unlink(heap_path.c_str());
     return t.done();

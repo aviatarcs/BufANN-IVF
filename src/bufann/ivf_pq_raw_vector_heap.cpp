@@ -40,6 +40,12 @@ RawVectorHeap::~RawVectorHeap() { close(); }
 
 void RawVectorHeap::open(const std::string& path, RawVectorHeapLayout layout) {
     close();
+    IVF_PQ_REQUIRE(layout.slots_per_page > 0 && layout.elem_size > 0 &&
+                       layout.slots_offset == RAW_VECTOR_PAGE_HEADER_BYTES + layout.bitmap_bytes &&
+                       layout.bitmap_bytes * 8 >= layout.slots_per_page &&
+                       uint64_t(layout.slots_offset) + uint64_t(layout.slots_per_page) * layout.elem_size <=
+                           layout.page_size,
+                   "raw-vector heap layout is inconsistent; use compute_raw_vector_heap_layout");
     _layout = layout;
 
     struct stat st;
@@ -60,14 +66,29 @@ void RawVectorHeap::close() {
     }
 }
 
+// pread/pwrite may transfer fewer bytes than asked (a signal, or a network
+// filesystem); loop until done and treat 0 bytes (EOF) or an error as failure.
 void RawVectorHeap::read_at(uint64_t offset, void* buf, size_t bytes, const char* what) const {
-    ssize_t n = ::pread(_fd, buf, bytes, static_cast<off_t>(offset));
-    IVF_PQ_REQUIRE(n >= 0 && static_cast<size_t>(n) == bytes, std::string("Failed to ") + what);
+    char* p = static_cast<char*>(buf);
+    while (bytes > 0) {
+        ssize_t n = ::pread(_fd, p, bytes, static_cast<off_t>(offset));
+        IVF_PQ_REQUIRE(n > 0, std::string("Failed to ") + what);
+        p += n, offset += n, bytes -= n;
+    }
 }
 
 void RawVectorHeap::write_at(uint64_t offset, const void* buf, size_t bytes, const char* what) {
-    ssize_t n = ::pwrite(_fd, buf, bytes, static_cast<off_t>(offset));
-    IVF_PQ_REQUIRE(n >= 0 && static_cast<size_t>(n) == bytes, std::string("Failed to ") + what);
+    const char* p = static_cast<const char*>(buf);
+    while (bytes > 0) {
+        ssize_t n = ::pwrite(_fd, p, bytes, static_cast<off_t>(offset));
+        IVF_PQ_REQUIRE(n > 0, std::string("Failed to ") + what);
+        p += n, offset += n, bytes -= n;
+    }
+}
+
+void RawVectorHeap::require_allocated(uint32_t flat_slot) const {
+    IVF_PQ_REQUIRE(_layout.page_of(flat_slot) < allocated_pages(),
+                   "raw-vector slot " + std::to_string(flat_slot) + " is past the allocated pages");
 }
 
 uint32_t RawVectorHeap::allocate_slot(RawVectorFreeList& free_list) {
@@ -81,29 +102,35 @@ uint32_t RawVectorHeap::allocate_slot(RawVectorFreeList& free_list) {
     }
 
     std::lock_guard<std::mutex> lg(_grow_mtx);
-    IVF_PQ_REQUIRE(_next_flat_slot <= RAW_VECTOR_RID_SLOT_MASK,
+    uint32_t flat = _next_flat_slot.load();
+    IVF_PQ_REQUIRE(flat <= RAW_VECTOR_RID_SLOT_MASK,
                    "raw-vector heap is full: flat slot index exceeds the 31 bits "
                    "addressable by RawVectorRID");
-    uint32_t flat = _next_flat_slot++;
-    while (_allocated_pages <= _layout.page_of(flat)) {
+    // Extend the file before publishing the slot, so a reader that sees the
+    // new cursor also sees the page.
+    while (allocated_pages() <= _layout.page_of(flat)) {
         std::vector<char> zero_page(_layout.page_size, 0);
-        write_at(_layout.page_offset(_allocated_pages), zero_page.data(), _layout.page_size,
+        write_at(_layout.page_offset(allocated_pages()), zero_page.data(), _layout.page_size,
                  "extend raw-vector heap file");
-        ++_allocated_pages;
+        _allocated_pages.fetch_add(1);
     }
+    _next_flat_slot.store(flat + 1);
     return flat;
 }
 
 void RawVectorHeap::write_vector(uint32_t flat_slot, const void* data) {
+    require_allocated(flat_slot);
     write_at(_layout.slot_offset(flat_slot), data, _layout.elem_size, "write raw vector");
     set_occupancy_bit(flat_slot, true);
 }
 
 void RawVectorHeap::read_vector(uint32_t flat_slot, void* out) const {
+    require_allocated(flat_slot);
     read_at(_layout.slot_offset(flat_slot), out, _layout.elem_size, "read raw vector");
 }
 
 bool RawVectorHeap::is_slot_occupied(uint32_t flat_slot) const {
+    require_allocated(flat_slot);
     std::lock_guard<std::mutex> lg(bitmap_mutex(flat_slot));
     uint8_t byte = 0;
     read_at(_layout.bitmap_byte_offset(flat_slot), &byte, 1, "read occupancy bitmap");
@@ -111,6 +138,7 @@ bool RawVectorHeap::is_slot_occupied(uint32_t flat_slot) const {
 }
 
 void RawVectorHeap::free_slot(uint32_t flat_slot, RawVectorFreeList& free_list) {
+    require_allocated(flat_slot);
     set_occupancy_bit(flat_slot, false);
     std::lock_guard<std::mutex> lg(free_list.mtx);
     free_list.free_slots.push_back(flat_slot);
@@ -133,9 +161,11 @@ void RawVectorHeap::write_pages(uint32_t first_page_id, const void* pages, uint3
 }
 
 void RawVectorHeap::restore_slot_cursor(uint32_t next_flat_slot, uint32_t allocated_pages) {
+    IVF_PQ_REQUIRE(uint64_t(next_flat_slot) <= uint64_t(allocated_pages) * _layout.slots_per_page,
+                   "slot cursor lies past the allocated pages");
     std::lock_guard<std::mutex> lg(_grow_mtx);
-    _next_flat_slot  = next_flat_slot;
-    _allocated_pages = allocated_pages;
+    _next_flat_slot.store(next_flat_slot);
+    _allocated_pages.store(allocated_pages);
 }
 
 RawVectorHeapBulkWriter::RawVectorHeapBulkWriter(RawVectorHeap& heap, uint32_t pages_per_flush)

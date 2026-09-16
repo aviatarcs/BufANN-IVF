@@ -98,6 +98,12 @@ std::vector<U> load_bin_section(const std::string& path, size_t offset, size_t& 
     return std::vector<U>(owned.get(), owned.get() + rows * cols);
 }
 
+void require_valid(const IVFMetadata& meta) {
+    IVF_PQ_REQUIRE(meta.nlist > 0 && meta.dim > 0 && meta.aligned_dim >= meta.dim &&
+                       meta.centroids.size() == size_t(meta.nlist) * meta.aligned_dim,
+                   "IVFMetadata is inconsistent");
+}
+
 void save_u32_column(const std::string& path, const uint32_t* data, size_t n) {
     diskann::save_bin<uint32_t>(path, const_cast<uint32_t*>(data), n, 1);
 }
@@ -144,6 +150,7 @@ IVFMetadata train_ivf_centroids(const std::string& data_bin, uint32_t nlist,
 }
 
 void save_ivf_centroids(const std::string& index_prefix, const IVFMetadata& meta) {
+    require_valid(meta);
     diskann::save_bin<float>(ivf_centroids_path(index_prefix),
                              const_cast<float*>(meta.centroids.data()), meta.nlist,
                              meta.aligned_dim);
@@ -157,6 +164,7 @@ IVFMetadata load_ivf_centroids(const std::string& index_prefix, uint32_t dim) {
     meta.nlist = uint32_t(nlist);
     meta.dim = dim;
     meta.aligned_dim = uint32_t(aligned_dim);
+    require_valid(meta);
     return meta;
 }
 
@@ -165,6 +173,7 @@ void assign_ivf_clusters(const std::string& data_bin, const IVFMetadata& meta,
                          RawVectorHeap& heap, ClusterAssignments& assignments,
                          RawVectorRIDTable& rid_table, size_t max_block_points) {
     IVF_PQ_REQUIRE(max_block_points > 0, "max_block_points must be greater than zero");
+    require_valid(meta);
     size_t npts = 0, file_dim = 0;
     get_bin_metadata(data_bin, npts, file_dim);
     IVF_PQ_REQUIRE(file_dim == meta.dim, "base file dimensionality does not match the centroids");

@@ -292,6 +292,35 @@ bool test_bulk_writer_rejects_misuse() {
     return t.done();
 }
 
+bool test_rejects_bad_layout_and_out_of_range_slots() {
+    TestCase t("heap rejects an inconsistent layout, slots past the allocated pages, a bad cursor");
+    std::string path = temp_path("ivf_heap_guard");
+    RawVectorHeap heap;
+    t.expect_throw("default-constructed layout", [&] { heap.open(path, RawVectorHeapLayout{}); });
+    RawVectorHeapLayout too_many = compute_raw_vector_heap_layout(PAGE, ELEM);
+    too_many.slots_per_page += 1;  // slots would run past the page
+    t.expect_throw("slots overrunning the page", [&] { heap.open(path, too_many); });
+
+    heap.open(path, compute_raw_vector_heap_layout(PAGE, ELEM));
+    RawVectorFreeList free_list;
+    uint32_t last = 0;
+    for (int i = 0; i < 3; ++i) last = heap.allocate_slot(free_list);  // page 0 only
+    std::vector<char> buf(ELEM);
+    uint32_t past = 7;  // first slot of page 1, which does not exist
+    t.expect_throw("write past allocated pages", [&] { heap.write_vector(past, buf.data()); });
+    t.expect_throw("read past allocated pages", [&] { heap.read_vector(past, buf.data()); });
+    t.expect_throw("occupancy past allocated pages", [&] { heap.is_slot_occupied(past); });
+    t.expect_throw("free past allocated pages", [&] { heap.free_slot(past, free_list); });
+    heap.write_vector(last, buf.data());  // slots within page 0 still work
+    t.check(heap.is_slot_occupied(last) && heap.allocated_pages() == 1, "in-range slot rejected");
+
+    t.expect_throw("cursor past the pages", [&] { heap.restore_slot_cursor(8, 1); });
+    heap.restore_slot_cursor(7, 1);  // exactly full is fine
+    heap.close();
+    ::unlink(path.c_str());
+    return t.done();
+}
+
 }  // namespace
 
 int main() {
@@ -304,5 +333,6 @@ int main() {
     all_pass &= test_open_refuses_existing_nonempty_file();
     all_pass &= test_bulk_writer_matches_per_slot_writes();
     all_pass &= test_bulk_writer_rejects_misuse();
+    all_pass &= test_rejects_bad_layout_and_out_of_range_slots();
     return all_pass ? 0 : 1;
 }
