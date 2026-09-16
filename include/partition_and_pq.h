@@ -5,6 +5,7 @@
 #include <cassert>
 #include <sstream>
 #include <stack>
+#include <optional>
 #include <string>
 #include <unordered_map>
 
@@ -68,12 +69,14 @@ DISKANN_DLLEXPORT int generate_pq_pivots(
     unsigned dim, unsigned num_centers, unsigned num_pq_chunks,
     unsigned max_k_means_reps, std::string pq_pivots_path);
 
+// `seed` makes the per-chunk pivot initialization deterministic.
 DISKANN_DLLEXPORT int generate_pq_pivots(const float *train_data,
                                          size_t num_train, unsigned dim,
                                          unsigned    num_centers,
                                          unsigned    num_pq_chunks,
                                          unsigned    max_k_means_reps,
-                                         std::string pq_pivots_path);
+                                         std::string pq_pivots_path,
+                                         std::optional<uint32_t> seed = std::nullopt);
 
 template<typename T>
 int generate_pq_data_from_pivots(const std::string data_file,

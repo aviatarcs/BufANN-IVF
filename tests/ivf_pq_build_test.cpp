@@ -16,7 +16,6 @@
 #include <cstring>
 #include <limits>
 #include <memory>
-#include <numeric>
 #include <random>
 #include <string>
 #include <vector>
@@ -381,8 +380,9 @@ bool test_pq_pivots_and_codes(const std::string& tag, const std::string& prefix,
                               uint32_t chunks) {
     TestCase t(tag + ": PQ codes are the nearest pivots and PQ distances rank blobs correctly");
     const uint32_t chunk_dim = BLOB_DIM / chunks;
-    PQMetadata pq = train_ivf_pq_pivots<T>(base_bin, chunks, 1.0, NUM_K_MEANS_ITERS, TRAIN_SEED);
-    encode_ivf_pq_codes<T>(base_bin, pq, 333);
+    train_ivf_pq_pivots<T>(base_bin, prefix, chunks, 1.0, NUM_K_MEANS_ITERS, TRAIN_SEED);
+    encode_ivf_pq_codes<T>(base_bin, prefix, chunks);
+    PQMetadata pq = load_ivf_pq(prefix);
     if (!t.check(pq.chunks == chunks && pq.chunk_dim == chunk_dim && pq.k == NUM_PQ_CENTERS &&
                      pq.pivots.size() == size_t(chunks) * NUM_PQ_CENTERS * chunk_dim &&
                      pq.codes.size() == size_t(NUM_POINTS) * chunks,
@@ -390,10 +390,14 @@ bool test_pq_pivots_and_codes(const std::string& tag, const std::string& prefix,
         return t.done();
     }
 
-    // Every code is a nearest pivot of its chunk. The encoder evaluates
-    // ||x||^2 + ||c||^2 - 2x.c in float, so near-ties can resolve either way
-    // within a few ulps of ||x_chunk||^2; a mis-indexed code would be off by
-    // whole pivot spacings, far outside that.
+    // Every code is a nearest pivot of its chunk. Upstream encodes x - mean
+    // via ||x-mean||^2 + ||p||^2 - 2(x-mean).p in float, so near-ties can
+    // resolve either way within a few ulps of ||x_chunk - mean_chunk||^2; a
+    // mis-indexed code would be off by whole pivot spacings, far outside that.
+    std::vector<float> mean(BLOB_DIM, 0.0f);
+    for (size_t i = 0; i < NUM_POINTS; ++i) {
+        for (uint32_t d = 0; d < BLOB_DIM; ++d) mean[d] += float(base[i * BLOB_DIM + d]) / NUM_POINTS;
+    }
     size_t not_nearest = 0;
     double total_sq_err = 0.0;
     std::vector<float> point(BLOB_DIM);
@@ -401,12 +405,14 @@ bool test_pq_pivots_and_codes(const std::string& tag, const std::string& prefix,
         std::copy_n(base.data() + i * BLOB_DIM, BLOB_DIM, point.begin());
         std::vector<float> table = pq_distance_table(point.data(), pq);
         for (uint32_t c = 0; c < chunks; ++c) {
-            const float* chunk = point.data() + c * chunk_dim;
-            float chunk_norm2 = std::inner_product(chunk, chunk + chunk_dim, chunk, 0.0f);
+            float centered_norm2 = 0.0f;
+            for (uint32_t d = c * chunk_dim; d < (c + 1) * chunk_dim; ++d) {
+                centered_norm2 += (point[d] - mean[d]) * (point[d] - mean[d]);
+            }
             const float* row = table.data() + size_t(c) * pq.k;
             float chosen = row[pq.codes[i * chunks + c]];
             float best = *std::min_element(row, row + pq.k);
-            not_nearest += chosen > best + 16 * std::numeric_limits<float>::epsilon() * chunk_norm2;
+            not_nearest += chosen > best + 16 * std::numeric_limits<float>::epsilon() * centered_norm2;
             total_sq_err += chosen;
         }
     }
@@ -430,30 +436,35 @@ bool test_pq_pivots_and_codes(const std::string& tag, const std::string& prefix,
         t.check(blob_first, "blob " + std::to_string(b) + " is not ranked first by PQ distance");
     }
 
-    save_ivf_pq(prefix, pq);
-    PQMetadata loaded = load_ivf_pq(prefix);
-    t.check(loaded.chunks == pq.chunks && loaded.chunk_dim == pq.chunk_dim && loaded.k == pq.k &&
-                loaded.pivots == pq.pivots && loaded.codes == pq.codes,
-            "PQ sidecars did not round-trip");
+    // Same seed -> same files; a codes file with the wrong width is refused.
+    train_ivf_pq_pivots<T>(base_bin, prefix + "_again", chunks, 1.0, NUM_K_MEANS_ITERS, TRAIN_SEED);
+    encode_ivf_pq_codes<T>(base_bin, prefix + "_again", chunks);
+    PQMetadata again = load_ivf_pq(prefix + "_again");
+    float max_diff = 0.0f;
+    for (size_t i = 0; i < pq.pivots.size() && again.pivots.size() == pq.pivots.size(); ++i) {
+        max_diff = std::max(max_diff, std::fabs(again.pivots[i] - pq.pivots[i]));
+    }
+    t.check(again.pivots.size() == pq.pivots.size() && max_diff <= 1e-3f,
+            "same seed gave pivots differing by " + std::to_string(max_diff));
     diskann::save_bin<uint8_t>(ivf_pq_codes_path(prefix), pq.codes.data(), NUM_POINTS * 2, chunks / 2);
     t.expect_throw("codes file with the wrong column count", [&] { load_ivf_pq(prefix); });
-    ::unlink(ivf_pq_pivots_path(prefix).c_str());
-    ::unlink(ivf_pq_codes_path(prefix).c_str());
+    for (const std::string& pre : {prefix, prefix + "_again"}) {
+        ::unlink(ivf_pq_pivots_path(pre).c_str());
+        ::unlink(ivf_pq_codes_path(pre).c_str());
+    }
     return t.done();
 }
 
-bool test_pq_error_paths(const std::string& base_bin) {
-    TestCase t("PQ rejects chunks == 0, dim % chunks != 0, a short sample, and a mismatched base");
-    t.expect_throw("chunks == 0", [&] { train_ivf_pq_pivots<float>(base_bin, 0); });
-    t.expect_throw("12 dims into 5 chunks", [&] { train_ivf_pq_pivots<float>(base_bin, 5); });
+bool test_pq_error_paths(const std::string& prefix, const std::string& base_bin) {
+    TestCase t("PQ rejects chunks == 0, dim % chunks != 0, a short sample, and missing files");
+    std::string pre = prefix + "_pqerr";
+    t.expect_throw("chunks == 0", [&] { train_ivf_pq_pivots<float>(base_bin, pre, 0); });
+    t.expect_throw("12 dims into 5 chunks", [&] { train_ivf_pq_pivots<float>(base_bin, pre, 5); });
     t.expect_throw("sample of ~0 rows", [&] {
-        train_ivf_pq_pivots<float>(base_bin, 4, 1e-6, NUM_K_MEANS_ITERS, TRAIN_SEED);
+        train_ivf_pq_pivots<float>(base_bin, pre, 4, 1e-6, NUM_K_MEANS_ITERS, TRAIN_SEED);
     });
-    t.expect_throw("encoding a base whose dim != chunks * chunk_dim", [&] {
-        PQMetadata pq = train_ivf_pq_pivots<float>(base_bin, 4, 1.0, NUM_K_MEANS_ITERS, TRAIN_SEED);
-        pq.chunk_dim = 2;
-        encode_ivf_pq_codes<float>(base_bin, pq);
-    });
+    t.expect_throw("encoding without a pivots file", [&] { encode_ivf_pq_codes<float>(base_bin, pre, 4); });
+    t.expect_throw("loading without files", [&] { load_ivf_pq(pre); });
     return t.done();
 }
 
@@ -477,7 +488,7 @@ int main() {
         all_pass &= test_assignment_error_paths(prefix, base_f32, meta);
         all_pass &= test_posting_lists_invert_assignments(prefix);
         all_pass &= test_pq_pivots_and_codes<float>("float", prefix, base_f32, data_f32, 4);
-        all_pass &= test_pq_error_paths(base_f32);
+        all_pass &= test_pq_error_paths(prefix, base_f32);
 
         // uint8 base: the heap must hold the 1-byte-per-dim input, not a float conversion.
         std::vector<uint8_t> data_u8 = write_synthetic_base<uint8_t>(base_u8, BLOB_SPACING_U8);

@@ -10,6 +10,7 @@
 #include "cached_io.h"
 #include "math_utils.h"
 #include "partition_and_pq.h"
+#include "pq_table.h"
 #include "utils.h"
 
 namespace diskann {
@@ -33,11 +34,12 @@ std::string ivf_posting_offsets_path(const std::string& index_prefix) {
 std::string ivf_posting_ids_path(const std::string& index_prefix) {
     return index_prefix + "_ivf_posting_ids.bin";
 }
+// Upstream's names, shared with the graph index's PQ files.
 std::string ivf_pq_pivots_path(const std::string& index_prefix) {
-    return index_prefix + "_ivf_pq_pivots.bin";
+    return index_prefix + "_pq_pivots.bin";
 }
 std::string ivf_pq_codes_path(const std::string& index_prefix) {
-    return index_prefix + "_ivf_pq_codes.bin";
+    return index_prefix + "_pq_compressed.bin";
 }
 
 namespace {
@@ -82,17 +84,29 @@ std::vector<float> sample_training_points(const std::string& data_bin, double sa
     return std::vector<float>(owned.get(), owned.get() + num_train * dim);
 }
 
+// diskann::load_bin reads garbage sizes from a missing file; fail up front.
+void require_file(const std::string& path) {
+    IVF_PQ_REQUIRE(file_exists(path), "file not found: " + path);
+}
+
+template<typename U>
+std::vector<U> load_bin_section(const std::string& path, size_t offset, size_t& rows, size_t& cols) {
+    require_file(path);
+    U* raw = nullptr;
+    diskann::load_bin<U>(path, raw, rows, cols, offset);
+    std::unique_ptr<U[]> owned(raw);
+    return std::vector<U>(owned.get(), owned.get() + rows * cols);
+}
+
 void save_u32_column(const std::string& path, const uint32_t* data, size_t n) {
     diskann::save_bin<uint32_t>(path, const_cast<uint32_t*>(data), n, 1);
 }
 
 std::vector<uint32_t> load_u32_column(const std::string& path) {
-    uint32_t* raw = nullptr;
     size_t n = 0, cols = 0;
-    diskann::load_bin<uint32_t>(path, raw, n, cols);
-    std::unique_ptr<uint32_t[]> owned(raw);
+    std::vector<uint32_t> column = load_bin_section<uint32_t>(path, 0, n, cols);
     IVF_PQ_REQUIRE(cols == 1, "expected a single-column uint32 bin file: " + path);
-    return std::vector<uint32_t>(owned.get(), owned.get() + n);
+    return column;
 }
 
 }  // namespace
@@ -136,17 +150,13 @@ void save_ivf_centroids(const std::string& index_prefix, const IVFMetadata& meta
 }
 
 IVFMetadata load_ivf_centroids(const std::string& index_prefix, uint32_t dim) {
-    float* raw = nullptr;
     size_t nlist = 0, aligned_dim = 0;
-    diskann::load_bin<float>(ivf_centroids_path(index_prefix), raw, nlist, aligned_dim);
-    std::unique_ptr<float[]> owned(raw);
-    IVF_PQ_REQUIRE(aligned_dim == align_dim(dim), "centroid file dimensionality does not match dim");
-
     IVFMetadata meta;
+    meta.centroids = load_bin_section<float>(ivf_centroids_path(index_prefix), 0, nlist, aligned_dim);
+    IVF_PQ_REQUIRE(aligned_dim == align_dim(dim), "centroid file dimensionality does not match dim");
     meta.nlist = uint32_t(nlist);
     meta.dim = dim;
     meta.aligned_dim = uint32_t(aligned_dim);
-    meta.centroids.assign(owned.get(), owned.get() + nlist * aligned_dim);
     return meta;
 }
 
@@ -269,110 +279,84 @@ PostingLists load_ivf_posting_lists(const std::string& index_prefix) {
 }
 
 template<typename T>
-PQMetadata train_ivf_pq_pivots(const std::string& data_bin, uint32_t chunks, double sampling_rate,
-                               uint32_t max_kmeans_reps, std::optional<uint32_t> seed) {
+void train_ivf_pq_pivots(const std::string& data_bin, const std::string& index_prefix,
+                         uint32_t chunks, double sampling_rate, uint32_t max_kmeans_reps,
+                         std::optional<uint32_t> seed) {
     IVF_PQ_REQUIRE(chunks > 0, "pq_chunks must be greater than zero");
     size_t npts = 0, dim = 0;
     get_bin_metadata(data_bin, npts, dim);
     IVF_PQ_REQUIRE(dim % chunks == 0, "dim " + std::to_string(dim) + " is not a multiple of pq_chunks " +
                                           std::to_string(chunks));
-    const uint32_t k = NUM_PQ_CENTERS;
-    const size_t chunk_dim = dim / chunks;
 
     uint32_t rng_seed = seed.has_value() ? *seed : std::random_device{}();
     size_t num_train = 0;
-    std::vector<float> train_data = sample_training_points<T>(data_bin, sampling_rate,
-                                                              IVF_PQ_TRAIN_POINTS, k, rng_seed,
-                                                              num_train);
-    diskann::cout << "Training " << chunks << " x " << k << " PQ pivots on " << num_train
-                  << " sampled points (chunk_dim " << chunk_dim << ")" << std::endl;
+    std::vector<float> train_data = sample_training_points<T>(
+        data_bin, sampling_rate, IVF_PQ_TRAIN_POINTS, NUM_PQ_CENTERS, rng_seed, num_train);
+    diskann::cout << "Training " << chunks << " x " << NUM_PQ_CENTERS << " PQ pivots on "
+                  << num_train << " sampled points (dim " << dim << ")" << std::endl;
 
-    PQMetadata pq;
-    pq.chunks = chunks;
-    pq.chunk_dim = uint32_t(chunk_dim);
-    pq.k = k;
-    pq.pivots.resize(size_t(chunks) * k * chunk_dim);
-
-    std::vector<float> chunk_data(num_train * chunk_dim);
-    for (uint32_t c = 0; c < chunks; ++c) {
-        copy_rows(train_data.data() + c * chunk_dim, dim, chunk_data.data(), chunk_dim, num_train,
-                  chunk_dim);
-        float* pivots = pq.pivots.data() + size_t(c) * k * chunk_dim;
-        kmeans::kmeanspp_selecting_pivots(chunk_data.data(), num_train, chunk_dim, pivots, k,
-                                          rng_seed + c);
-        kmeans::run_lloyds(chunk_data.data(), num_train, chunk_dim, pivots, k, max_kmeans_reps,
-                           NULL, NULL);
-    }
-    return pq;
+    int rc = generate_pq_pivots(train_data.data(), num_train, unsigned(dim), NUM_PQ_CENTERS,
+                                chunks, max_kmeans_reps, ivf_pq_pivots_path(index_prefix),
+                                rng_seed);
+    IVF_PQ_REQUIRE(rc == 0, "generate_pq_pivots failed");
 }
 
 template<typename T>
-void encode_ivf_pq_codes(const std::string& data_bin, PQMetadata& pq, size_t max_block_points) {
-    IVF_PQ_REQUIRE(max_block_points > 0, "max_block_points must be greater than zero");
-    IVF_PQ_REQUIRE(pq.k > 0 && pq.k <= 256, "PQ codes are uint8, so k must be in [1, 256]");
-    size_t npts = 0, dim = 0;
-    get_bin_metadata(data_bin, npts, dim);
-    IVF_PQ_REQUIRE(dim == size_t(pq.chunks) * pq.chunk_dim,
-                   "base file dimensionality does not match chunks * chunk_dim");
-    const size_t chunk_dim = pq.chunk_dim;
-
-    size_t block_size = streaming_block_size(npts, pq.k, max_block_points);
-    std::vector<T> block(block_size * dim);
-    std::vector<float> block_float(block_size * dim);
-    std::vector<float> chunk_data(block_size * chunk_dim);
-    std::vector<uint32_t> closest(block_size);
-    pq.codes.resize(npts * pq.chunks);
-
-    diskann::cout << "Encoding " << npts << " vectors with " << pq.chunks << " PQ chunks in blocks of "
-                  << block_size << std::endl;
-
-    cached_ifstream reader(data_bin, BASE_FILE_READ_CACHE_BYTES, BIN_FILE_HEADER_BYTES);
-    for (size_t start = 0; start < npts; start += block_size) {
-        size_t cur = std::min(block_size, npts - start);
-        reader.read(reinterpret_cast<char*>(block.data()), cur * dim * sizeof(T));
-        diskann::convert_types<T, float>(block.data(), block_float.data(), cur, dim);
-
-        for (uint32_t c = 0; c < pq.chunks; ++c) {
-            copy_rows(block_float.data() + c * chunk_dim, dim, chunk_data.data(), chunk_dim, cur,
-                      chunk_dim);
-            math_utils::compute_closest_centers(chunk_data.data(), cur, chunk_dim,
-                                                pq.pivots.data() + size_t(c) * pq.k * chunk_dim,
-                                                pq.k, 1, closest.data());
-            for (size_t i = 0; i < cur; ++i) {
-                pq.codes[(start + i) * pq.chunks + c] = uint8_t(closest[i]);
-            }
-        }
-    }
-}
-
-void save_ivf_pq(const std::string& index_prefix, const PQMetadata& pq) {
-    diskann::save_bin<float>(ivf_pq_pivots_path(index_prefix), const_cast<float*>(pq.pivots.data()),
-                             size_t(pq.chunks) * pq.k, pq.chunk_dim);
-    diskann::save_bin<uint8_t>(ivf_pq_codes_path(index_prefix),
-                               const_cast<uint8_t*>(pq.codes.data()), pq.codes.size() / pq.chunks,
-                               pq.chunks);
+void encode_ivf_pq_codes(const std::string& data_bin, const std::string& index_prefix,
+                         uint32_t chunks) {
+    int rc = generate_pq_data_from_pivots<T>(data_bin, NUM_PQ_CENTERS, chunks,
+                                             ivf_pq_pivots_path(index_prefix),
+                                             ivf_pq_codes_path(index_prefix));
+    IVF_PQ_REQUIRE(rc == 0, "generate_pq_data_from_pivots failed");
 }
 
 PQMetadata load_ivf_pq(const std::string& index_prefix) {
+    const std::string pivots_path = ivf_pq_pivots_path(index_prefix);
+    const uint32_t k = NUM_PQ_CENTERS;
+
+    // Upstream layout: [offsets u64 x 5][pivots f32 k x dim][mean f32 dim x 1]
+    // [rearrangement u32 dim x 1][chunk_offsets u32 chunks+1 x 1].
+    size_t rows = 0, cols = 0;
+    std::vector<uint64_t> offsets = load_bin_section<uint64_t>(pivots_path, 0, rows, cols);
+    IVF_PQ_REQUIRE(rows == NUM_PQ_OFFSETS && cols == 1, "PQ pivot file has no offsets table: " + pivots_path);
+    std::vector<float> full_pivots = load_bin_section<float>(pivots_path, offsets[0], rows, cols);
+    IVF_PQ_REQUIRE(rows == k, "PQ pivot file does not hold " + std::to_string(k) + " pivots");
+    const size_t dim = cols;
+    std::vector<float> mean = load_bin_section<float>(pivots_path, offsets[1], rows, cols);
+    IVF_PQ_REQUIRE(rows == dim && cols == 1, "PQ pivot file mean has the wrong shape");
+    std::vector<uint32_t> rearrangement = load_bin_section<uint32_t>(pivots_path, offsets[2], rows, cols);
+    IVF_PQ_REQUIRE(rows == dim && cols == 1, "PQ pivot file rearrangement has the wrong shape");
+    std::vector<uint32_t> chunk_offsets = load_bin_section<uint32_t>(pivots_path, offsets[3], rows, cols);
+    IVF_PQ_REQUIRE(rows >= 2 && cols == 1, "PQ pivot file chunk offsets have the wrong shape");
+
     PQMetadata pq;
-    pq.k = NUM_PQ_CENTERS;
+    pq.k = k;
+    pq.chunks = uint32_t(chunk_offsets.size() - 1);
+    pq.chunk_dim = uint32_t(dim / pq.chunks);
+    IVF_PQ_REQUIRE(dim % pq.chunks == 0, "PQ pivot file dim is not a multiple of its chunk count");
+    for (uint32_t d = 0; d < dim; ++d) {
+        IVF_PQ_REQUIRE(rearrangement[d] == d, "PQ pivot file rearranges dimensions; unsupported");
+    }
+    for (uint32_t c = 0; c <= pq.chunks; ++c) {
+        IVF_PQ_REQUIRE(chunk_offsets[c] == c * pq.chunk_dim,
+                       "PQ pivot file has non-uniform chunks; unsupported");
+    }
 
-    float* pivots = nullptr;
-    size_t pivot_rows = 0, chunk_dim = 0;
-    diskann::load_bin<float>(ivf_pq_pivots_path(index_prefix), pivots, pivot_rows, chunk_dim);
-    std::unique_ptr<float[]> owned_pivots(pivots);
-    IVF_PQ_REQUIRE(pivot_rows > 0 && pivot_rows % pq.k == 0,
-                   "PQ pivot file rows are not a multiple of " + std::to_string(pq.k));
-    pq.chunks = uint32_t(pivot_rows / pq.k);
-    pq.chunk_dim = uint32_t(chunk_dim);
-    pq.pivots.assign(owned_pivots.get(), owned_pivots.get() + pivot_rows * chunk_dim);
+    // [k x dim] with the mean subtracted -> [chunks x k x chunk_dim] on raw vectors.
+    pq.pivots.resize(size_t(pq.chunks) * k * pq.chunk_dim);
+    for (uint32_t c = 0; c < pq.chunks; ++c) {
+        for (uint32_t j = 0; j < k; ++j) {
+            for (uint32_t d = 0; d < pq.chunk_dim; ++d) {
+                uint32_t dim_index = c * pq.chunk_dim + d;
+                pq.pivots[(size_t(c) * k + j) * pq.chunk_dim + d] =
+                    full_pivots[size_t(j) * dim + dim_index] + mean[dim_index];
+            }
+        }
+    }
 
-    uint8_t* codes = nullptr;
-    size_t npts = 0, code_cols = 0;
-    diskann::load_bin<uint8_t>(ivf_pq_codes_path(index_prefix), codes, npts, code_cols);
-    std::unique_ptr<uint8_t[]> owned_codes(codes);
-    IVF_PQ_REQUIRE(code_cols == pq.chunks, "PQ codes file does not have one column per chunk");
-    pq.codes.assign(owned_codes.get(), owned_codes.get() + npts * code_cols);
+    std::vector<uint8_t> codes = load_bin_section<uint8_t>(ivf_pq_codes_path(index_prefix), 0, rows, cols);
+    IVF_PQ_REQUIRE(cols == pq.chunks, "PQ codes file does not have one column per chunk");
+    pq.codes = std::move(codes);
     return pq;
 }
 
@@ -390,16 +374,16 @@ template void assign_ivf_clusters<uint8_t>(const std::string&, const IVFMetadata
 template void assign_ivf_clusters<int8_t>(const std::string&, const IVFMetadata&, RawVectorHeap&,
                                           ClusterAssignments&, RawVectorRIDTable&, size_t);
 
-template PQMetadata train_ivf_pq_pivots<float>(const std::string&, uint32_t, double, uint32_t,
-                                               std::optional<uint32_t>);
-template PQMetadata train_ivf_pq_pivots<uint8_t>(const std::string&, uint32_t, double, uint32_t,
-                                                 std::optional<uint32_t>);
-template PQMetadata train_ivf_pq_pivots<int8_t>(const std::string&, uint32_t, double, uint32_t,
-                                                std::optional<uint32_t>);
+template void train_ivf_pq_pivots<float>(const std::string&, const std::string&, uint32_t, double,
+                                         uint32_t, std::optional<uint32_t>);
+template void train_ivf_pq_pivots<uint8_t>(const std::string&, const std::string&, uint32_t, double,
+                                           uint32_t, std::optional<uint32_t>);
+template void train_ivf_pq_pivots<int8_t>(const std::string&, const std::string&, uint32_t, double,
+                                          uint32_t, std::optional<uint32_t>);
 
-template void encode_ivf_pq_codes<float>(const std::string&, PQMetadata&, size_t);
-template void encode_ivf_pq_codes<uint8_t>(const std::string&, PQMetadata&, size_t);
-template void encode_ivf_pq_codes<int8_t>(const std::string&, PQMetadata&, size_t);
+template void encode_ivf_pq_codes<float>(const std::string&, const std::string&, uint32_t);
+template void encode_ivf_pq_codes<uint8_t>(const std::string&, const std::string&, uint32_t);
+template void encode_ivf_pq_codes<int8_t>(const std::string&, const std::string&, uint32_t);
 
 }  // namespace inplace
 }  // namespace diskann

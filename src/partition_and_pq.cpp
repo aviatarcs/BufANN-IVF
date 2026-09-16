@@ -252,7 +252,8 @@ int generate_pq_pivots(const std::unique_ptr<T[]> &passed_train_data,
 int generate_pq_pivots(const float *passed_train_data, size_t num_train,
                        unsigned dim, unsigned num_centers,
                        unsigned num_pq_chunks, unsigned max_k_means_reps,
-                       std::string pq_pivots_path) {
+                       std::string pq_pivots_path,
+                       std::optional<uint32_t> seed) {
   if (num_pq_chunks > dim) {
     diskann::cerr << " Error: number of chunks more than dimension"
                   << std::endl;
@@ -373,8 +374,14 @@ int generate_pq_pivots(const float *passed_train_data, size_t num_train,
     // kmeans::kmeanspp_selecting_pivots(cur_data.get(), num_train,
     // cur_chunk_size,
     //                                  cur_pivot_data.get(), num_centers);
-    kmeans::selecting_pivots(cur_data.get(), num_train, cur_chunk_size,
-                             cur_pivot_data.get(), num_centers);
+    if (seed.has_value()) {
+      kmeans::selecting_pivots(cur_data.get(), num_train, cur_chunk_size,
+                               cur_pivot_data.get(), num_centers,
+                               *seed + (uint32_t) i);
+    } else {
+      kmeans::selecting_pivots(cur_data.get(), num_train, cur_chunk_size,
+                               cur_pivot_data.get(), num_centers);
+    }
 
     unsigned k_means_reps = max_k_means_reps;
 
