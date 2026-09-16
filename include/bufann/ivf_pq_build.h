@@ -17,13 +17,16 @@ namespace inplace {
 // Training points sampled per centroid; ~40 is the practical floor for k-means.
 const uint32_t IVF_TRAIN_POINTS_PER_CENTROID = 64;
 
-// Cluster assignment streams the base file in blocks of at most
-// IVF_ASSIGN_MAX_BLOCK_POINTS vectors, shrunk further so the per-block
-// [points x nlist] float distance matrix stays under the byte budget.
+// Cluster assignment and PQ encoding stream the base file in blocks of at
+// most IVF_ASSIGN_MAX_BLOCK_POINTS vectors, shrunk further so the per-block
+// [points x centers] float distance matrix stays under the byte budget.
 const size_t IVF_ASSIGN_MAX_BLOCK_POINTS = size_t(1) << 20;
 const size_t IVF_ASSIGN_DIST_MATRIX_BYTES = size_t(256) << 20;
 
 const uint32_t IVF_BULK_LOAD_PAGES_PER_FLUSH = 256;
+
+// Points sampled to train the PQ pivots (all chunks train on the same sample).
+const size_t IVF_PQ_TRAIN_POINTS = size_t(1) << 17;
 
 std::string ivf_centroids_path(const std::string& index_prefix);
 std::string ivf_cluster_ids_path(const std::string& index_prefix);
@@ -31,6 +34,8 @@ std::string ivf_rid_table_path(const std::string& index_prefix);
 std::string ivf_raw_vectors_path(const std::string& index_prefix);
 std::string ivf_posting_offsets_path(const std::string& index_prefix);
 std::string ivf_posting_ids_path(const std::string& index_prefix);
+std::string ivf_pq_pivots_path(const std::string& index_prefix);
+std::string ivf_pq_codes_path(const std::string& index_prefix);
 
 // Step 1. Trains `nlist` centroids on a random sample of `data_bin` (k-means++
 // init, Lloyd's refinement), zero-padded to aligned_dim. sampling_rate 0
@@ -72,6 +77,27 @@ PostingLists build_ivf_posting_lists(const ClusterAssignments& assignments, uint
 // [nlist+1 x 1] and [N x 1] uint32 bins.
 void save_ivf_posting_lists(const std::string& index_prefix, const PostingLists& lists);
 PostingLists load_ivf_posting_lists(const std::string& index_prefix);
+
+// Step 4. Trains NUM_PQ_CENTERS pivots per chunk on a random sample of
+// `data_bin`; chunk c covers dimensions [c*chunk_dim, (c+1)*chunk_dim), so
+// dim must be a multiple of `chunks`. Returns pivots only (codes empty).
+// sampling_rate 0 targets IVF_PQ_TRAIN_POINTS; `seed` as for centroids.
+template<typename T>
+PQMetadata train_ivf_pq_pivots(const std::string& data_bin,
+                               uint32_t chunks,
+                               double sampling_rate = 0.0,
+                               uint32_t max_kmeans_reps = NUM_K_MEANS_ITERS,
+                               std::optional<uint32_t> seed = std::nullopt);
+
+// Step 5. Streams `data_bin` and fills pq.codes so that
+// codes[i*chunks + c] = argmin_j ||x_i[chunk c] - pivots[c][j]||^2.
+template<typename T>
+void encode_ivf_pq_codes(const std::string& data_bin, PQMetadata& pq,
+                         size_t max_block_points = IVF_ASSIGN_MAX_BLOCK_POINTS);
+
+// Pivots as a [chunks*k x chunk_dim] float bin, codes as an [N x chunks] uint8 bin.
+void save_ivf_pq(const std::string& index_prefix, const PQMetadata& pq);
+PQMetadata load_ivf_pq(const std::string& index_prefix);
 
 }  // namespace inplace
 }  // namespace diskann

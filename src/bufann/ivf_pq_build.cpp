@@ -33,6 +33,12 @@ std::string ivf_posting_offsets_path(const std::string& index_prefix) {
 std::string ivf_posting_ids_path(const std::string& index_prefix) {
     return index_prefix + "_ivf_posting_ids.bin";
 }
+std::string ivf_pq_pivots_path(const std::string& index_prefix) {
+    return index_prefix + "_ivf_pq_pivots.bin";
+}
+std::string ivf_pq_codes_path(const std::string& index_prefix) {
+    return index_prefix + "_ivf_pq_codes.bin";
+}
 
 namespace {
 
@@ -46,6 +52,34 @@ void copy_rows(const float* src, size_t src_stride, float* dst, size_t dst_strid
     for (size_t r = 0; r < rows; ++r) {
         std::copy_n(src + r * src_stride, cols, dst + r * dst_stride);
     }
+}
+
+// Points per streaming block: capped, and small enough that the
+// [points x num_centers] float distance matrix stays within budget.
+size_t streaming_block_size(size_t npts, size_t num_centers, size_t max_block_points) {
+    size_t by_budget = IVF_ASSIGN_DIST_MATRIX_BYTES / (num_centers * sizeof(float));
+    return std::max<size_t>(1, std::min({by_budget, max_block_points, npts}));
+}
+
+// Samples `data_bin` at sampling_rate (0 -> aim for target_points) into a
+// float matrix; requires at least min_points rows.
+template<typename T>
+std::vector<float> sample_training_points(const std::string& data_bin, double sampling_rate,
+                                          size_t target_points, size_t min_points,
+                                          uint32_t seed, size_t& num_train) {
+    size_t npts = 0, dim = 0;
+    get_bin_metadata(data_bin, npts, dim);
+    if (sampling_rate <= 0.0) {
+        sampling_rate = double(std::min(target_points, npts)) / double(npts);
+    }
+    float* raw = nullptr;
+    size_t sample_dim = 0;
+    gen_random_slice<T>(data_bin, sampling_rate, raw, num_train, sample_dim, seed);
+    std::unique_ptr<float[]> owned(raw);
+    IVF_PQ_REQUIRE(num_train >= min_points,
+                   "sampled " + std::to_string(num_train) + " training points, need at least " +
+                       std::to_string(min_points) + "; raise sampling_rate");
+    return std::vector<float>(owned.get(), owned.get() + num_train * dim);
 }
 
 void save_u32_column(const std::string& path, const uint32_t* data, size_t n) {
@@ -72,27 +106,18 @@ IVFMetadata train_ivf_centroids(const std::string& data_bin, uint32_t nlist,
     get_bin_metadata(data_bin, npts, dim);
     IVF_PQ_REQUIRE(npts >= nlist, "ivf_nlist exceeds the number of base vectors");
 
-    if (sampling_rate <= 0.0) {
-        size_t target = std::min<size_t>(size_t(nlist) * IVF_TRAIN_POINTS_PER_CENTROID, npts);
-        sampling_rate = double(target) / double(npts);
-    }
     uint32_t rng_seed = seed.has_value() ? *seed : std::random_device{}();
-
-    float* raw_sample = nullptr;
-    size_t num_train = 0, sample_dim = 0;
-    gen_random_slice<T>(data_bin, sampling_rate, raw_sample, num_train, sample_dim, rng_seed);
-    std::unique_ptr<float[]> train_data(raw_sample);
-    IVF_PQ_REQUIRE(num_train >= nlist,
-                   "sampled " + std::to_string(num_train) + " training points for " +
-                       std::to_string(nlist) + " centroids; raise sampling_rate or lower ivf_nlist");
-
+    size_t num_train = 0;
+    std::vector<float> train_data = sample_training_points<T>(
+        data_bin, sampling_rate, size_t(nlist) * IVF_TRAIN_POINTS_PER_CENTROID, nlist, rng_seed,
+        num_train);
     diskann::cout << "Training " << nlist << " IVF centroids on " << num_train
                   << " sampled points (dim " << dim << ")" << std::endl;
 
     std::vector<float> centers(size_t(nlist) * dim);
-    kmeans::kmeanspp_selecting_pivots(train_data.get(), num_train, dim, centers.data(), nlist,
+    kmeans::kmeanspp_selecting_pivots(train_data.data(), num_train, dim, centers.data(), nlist,
                                       rng_seed);
-    kmeans::run_lloyds(train_data.get(), num_train, dim, centers.data(), nlist, max_kmeans_reps,
+    kmeans::run_lloyds(train_data.data(), num_train, dim, centers.data(), nlist, max_kmeans_reps,
                        NULL, NULL);
 
     IVFMetadata meta;
@@ -144,8 +169,7 @@ void assign_ivf_clusters(const std::string& data_bin, const IVFMetadata& meta,
     std::vector<float> centroids(size_t(meta.nlist) * dim);
     copy_rows(meta.centroids.data(), meta.aligned_dim, centroids.data(), dim, meta.nlist, dim);
 
-    size_t block_size = IVF_ASSIGN_DIST_MATRIX_BYTES / (size_t(meta.nlist) * sizeof(float));
-    block_size = std::max<size_t>(1, std::min({block_size, max_block_points, npts}));
+    size_t block_size = streaming_block_size(npts, meta.nlist, max_block_points);
     std::vector<T> block(block_size * dim);
     std::vector<float> block_float(block_size * dim);
     std::vector<uint32_t> block_closest(block_size);
@@ -244,6 +268,114 @@ PostingLists load_ivf_posting_lists(const std::string& index_prefix) {
     return lists;
 }
 
+template<typename T>
+PQMetadata train_ivf_pq_pivots(const std::string& data_bin, uint32_t chunks, double sampling_rate,
+                               uint32_t max_kmeans_reps, std::optional<uint32_t> seed) {
+    IVF_PQ_REQUIRE(chunks > 0, "pq_chunks must be greater than zero");
+    size_t npts = 0, dim = 0;
+    get_bin_metadata(data_bin, npts, dim);
+    IVF_PQ_REQUIRE(dim % chunks == 0, "dim " + std::to_string(dim) + " is not a multiple of pq_chunks " +
+                                          std::to_string(chunks));
+    const uint32_t k = NUM_PQ_CENTERS;
+    const size_t chunk_dim = dim / chunks;
+
+    uint32_t rng_seed = seed.has_value() ? *seed : std::random_device{}();
+    size_t num_train = 0;
+    std::vector<float> train_data = sample_training_points<T>(data_bin, sampling_rate,
+                                                              IVF_PQ_TRAIN_POINTS, k, rng_seed,
+                                                              num_train);
+    diskann::cout << "Training " << chunks << " x " << k << " PQ pivots on " << num_train
+                  << " sampled points (chunk_dim " << chunk_dim << ")" << std::endl;
+
+    PQMetadata pq;
+    pq.chunks = chunks;
+    pq.chunk_dim = uint32_t(chunk_dim);
+    pq.k = k;
+    pq.pivots.resize(size_t(chunks) * k * chunk_dim);
+
+    std::vector<float> chunk_data(num_train * chunk_dim);
+    for (uint32_t c = 0; c < chunks; ++c) {
+        copy_rows(train_data.data() + c * chunk_dim, dim, chunk_data.data(), chunk_dim, num_train,
+                  chunk_dim);
+        float* pivots = pq.pivots.data() + size_t(c) * k * chunk_dim;
+        kmeans::kmeanspp_selecting_pivots(chunk_data.data(), num_train, chunk_dim, pivots, k,
+                                          rng_seed + c);
+        kmeans::run_lloyds(chunk_data.data(), num_train, chunk_dim, pivots, k, max_kmeans_reps,
+                           NULL, NULL);
+    }
+    return pq;
+}
+
+template<typename T>
+void encode_ivf_pq_codes(const std::string& data_bin, PQMetadata& pq, size_t max_block_points) {
+    IVF_PQ_REQUIRE(max_block_points > 0, "max_block_points must be greater than zero");
+    IVF_PQ_REQUIRE(pq.k > 0 && pq.k <= 256, "PQ codes are uint8, so k must be in [1, 256]");
+    size_t npts = 0, dim = 0;
+    get_bin_metadata(data_bin, npts, dim);
+    IVF_PQ_REQUIRE(dim == size_t(pq.chunks) * pq.chunk_dim,
+                   "base file dimensionality does not match chunks * chunk_dim");
+    const size_t chunk_dim = pq.chunk_dim;
+
+    size_t block_size = streaming_block_size(npts, pq.k, max_block_points);
+    std::vector<T> block(block_size * dim);
+    std::vector<float> block_float(block_size * dim);
+    std::vector<float> chunk_data(block_size * chunk_dim);
+    std::vector<uint32_t> closest(block_size);
+    pq.codes.resize(npts * pq.chunks);
+
+    diskann::cout << "Encoding " << npts << " vectors with " << pq.chunks << " PQ chunks in blocks of "
+                  << block_size << std::endl;
+
+    cached_ifstream reader(data_bin, BASE_FILE_READ_CACHE_BYTES, BIN_FILE_HEADER_BYTES);
+    for (size_t start = 0; start < npts; start += block_size) {
+        size_t cur = std::min(block_size, npts - start);
+        reader.read(reinterpret_cast<char*>(block.data()), cur * dim * sizeof(T));
+        diskann::convert_types<T, float>(block.data(), block_float.data(), cur, dim);
+
+        for (uint32_t c = 0; c < pq.chunks; ++c) {
+            copy_rows(block_float.data() + c * chunk_dim, dim, chunk_data.data(), chunk_dim, cur,
+                      chunk_dim);
+            math_utils::compute_closest_centers(chunk_data.data(), cur, chunk_dim,
+                                                pq.pivots.data() + size_t(c) * pq.k * chunk_dim,
+                                                pq.k, 1, closest.data());
+            for (size_t i = 0; i < cur; ++i) {
+                pq.codes[(start + i) * pq.chunks + c] = uint8_t(closest[i]);
+            }
+        }
+    }
+}
+
+void save_ivf_pq(const std::string& index_prefix, const PQMetadata& pq) {
+    diskann::save_bin<float>(ivf_pq_pivots_path(index_prefix), const_cast<float*>(pq.pivots.data()),
+                             size_t(pq.chunks) * pq.k, pq.chunk_dim);
+    diskann::save_bin<uint8_t>(ivf_pq_codes_path(index_prefix),
+                               const_cast<uint8_t*>(pq.codes.data()), pq.codes.size() / pq.chunks,
+                               pq.chunks);
+}
+
+PQMetadata load_ivf_pq(const std::string& index_prefix) {
+    PQMetadata pq;
+    pq.k = NUM_PQ_CENTERS;
+
+    float* pivots = nullptr;
+    size_t pivot_rows = 0, chunk_dim = 0;
+    diskann::load_bin<float>(ivf_pq_pivots_path(index_prefix), pivots, pivot_rows, chunk_dim);
+    std::unique_ptr<float[]> owned_pivots(pivots);
+    IVF_PQ_REQUIRE(pivot_rows > 0 && pivot_rows % pq.k == 0,
+                   "PQ pivot file rows are not a multiple of " + std::to_string(pq.k));
+    pq.chunks = uint32_t(pivot_rows / pq.k);
+    pq.chunk_dim = uint32_t(chunk_dim);
+    pq.pivots.assign(owned_pivots.get(), owned_pivots.get() + pivot_rows * chunk_dim);
+
+    uint8_t* codes = nullptr;
+    size_t npts = 0, code_cols = 0;
+    diskann::load_bin<uint8_t>(ivf_pq_codes_path(index_prefix), codes, npts, code_cols);
+    std::unique_ptr<uint8_t[]> owned_codes(codes);
+    IVF_PQ_REQUIRE(code_cols == pq.chunks, "PQ codes file does not have one column per chunk");
+    pq.codes.assign(owned_codes.get(), owned_codes.get() + npts * code_cols);
+    return pq;
+}
+
 template IVFMetadata train_ivf_centroids<float>(const std::string&, uint32_t, double, uint32_t,
                                                 std::optional<uint32_t>);
 template IVFMetadata train_ivf_centroids<uint8_t>(const std::string&, uint32_t, double, uint32_t,
@@ -257,6 +389,17 @@ template void assign_ivf_clusters<uint8_t>(const std::string&, const IVFMetadata
                                            ClusterAssignments&, RawVectorRIDTable&, size_t);
 template void assign_ivf_clusters<int8_t>(const std::string&, const IVFMetadata&, RawVectorHeap&,
                                           ClusterAssignments&, RawVectorRIDTable&, size_t);
+
+template PQMetadata train_ivf_pq_pivots<float>(const std::string&, uint32_t, double, uint32_t,
+                                               std::optional<uint32_t>);
+template PQMetadata train_ivf_pq_pivots<uint8_t>(const std::string&, uint32_t, double, uint32_t,
+                                                 std::optional<uint32_t>);
+template PQMetadata train_ivf_pq_pivots<int8_t>(const std::string&, uint32_t, double, uint32_t,
+                                                std::optional<uint32_t>);
+
+template void encode_ivf_pq_codes<float>(const std::string&, PQMetadata&, size_t);
+template void encode_ivf_pq_codes<uint8_t>(const std::string&, PQMetadata&, size_t);
+template void encode_ivf_pq_codes<int8_t>(const std::string&, PQMetadata&, size_t);
 
 }  // namespace inplace
 }  // namespace diskann

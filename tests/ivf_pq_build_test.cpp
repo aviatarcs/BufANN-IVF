@@ -2,7 +2,8 @@
 // training (shape, padding, blob recovery, seeding, save/load), cluster
 // assignment + raw-vector bulk load (exact nearest-centroid agreement,
 // RID/heap contents, multi-block streaming, sidecar round-trips, error paths),
-// and posting-list construction (exact inverse of the assignments).
+// posting-list construction (exact inverse of the assignments), and PQ
+// (codes are the nearest pivots; PQ distances rank blobs correctly).
 
 #include "bufann/ivf_pq_build.h"
 #include "ivf_pq_test_util.h"
@@ -15,6 +16,7 @@
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <numeric>
 #include <random>
 #include <string>
 #include <vector>
@@ -345,6 +347,116 @@ bool test_posting_lists_invert_assignments(const std::string& prefix) {
     return t.done();
 }
 
+// --- PQ pivots and codes ---------------------------------------------------
+
+// The design doc's query formula: per-chunk table of ||query_chunk - pivot||^2,
+// summed by code.
+std::vector<float> pq_distance_table(const float* query, const PQMetadata& pq) {
+    std::vector<float> table(size_t(pq.chunks) * pq.k);
+    for (uint32_t c = 0; c < pq.chunks; ++c) {
+        for (uint32_t j = 0; j < pq.k; ++j) {
+            const float* pivot = pq.pivots.data() + (size_t(c) * pq.k + j) * pq.chunk_dim;
+            float sum = 0.0f;
+            for (uint32_t d = 0; d < pq.chunk_dim; ++d) {
+                float diff = query[c * pq.chunk_dim + d] - pivot[d];
+                sum += diff * diff;
+            }
+            table[size_t(c) * pq.k + j] = sum;
+        }
+    }
+    return table;
+}
+
+float pq_distance(const std::vector<float>& table, const PQMetadata& pq, const uint8_t* code) {
+    float dist = 0.0f;
+    for (uint32_t c = 0; c < pq.chunks; ++c) {
+        dist += table[size_t(c) * pq.k + code[c]];
+    }
+    return dist;
+}
+
+template<typename T>
+bool test_pq_pivots_and_codes(const std::string& tag, const std::string& prefix,
+                              const std::string& base_bin, const std::vector<T>& base,
+                              uint32_t chunks) {
+    TestCase t(tag + ": PQ codes are the nearest pivots and PQ distances rank blobs correctly");
+    const uint32_t chunk_dim = BLOB_DIM / chunks;
+    PQMetadata pq = train_ivf_pq_pivots<T>(base_bin, chunks, 1.0, NUM_K_MEANS_ITERS, TRAIN_SEED);
+    encode_ivf_pq_codes<T>(base_bin, pq, 333);
+    if (!t.check(pq.chunks == chunks && pq.chunk_dim == chunk_dim && pq.k == NUM_PQ_CENTERS &&
+                     pq.pivots.size() == size_t(chunks) * NUM_PQ_CENTERS * chunk_dim &&
+                     pq.codes.size() == size_t(NUM_POINTS) * chunks,
+                 "unexpected PQ shape")) {
+        return t.done();
+    }
+
+    // Every code is a nearest pivot of its chunk. The encoder evaluates
+    // ||x||^2 + ||c||^2 - 2x.c in float, so near-ties can resolve either way
+    // within a few ulps of ||x_chunk||^2; a mis-indexed code would be off by
+    // whole pivot spacings, far outside that.
+    size_t not_nearest = 0;
+    double total_sq_err = 0.0;
+    std::vector<float> point(BLOB_DIM);
+    for (size_t i = 0; i < NUM_POINTS; ++i) {
+        std::copy_n(base.data() + i * BLOB_DIM, BLOB_DIM, point.begin());
+        std::vector<float> table = pq_distance_table(point.data(), pq);
+        for (uint32_t c = 0; c < chunks; ++c) {
+            const float* chunk = point.data() + c * chunk_dim;
+            float chunk_norm2 = std::inner_product(chunk, chunk + chunk_dim, chunk, 0.0f);
+            const float* row = table.data() + size_t(c) * pq.k;
+            float chosen = row[pq.codes[i * chunks + c]];
+            float best = *std::min_element(row, row + pq.k);
+            not_nearest += chosen > best + 16 * std::numeric_limits<float>::epsilon() * chunk_norm2;
+            total_sq_err += chosen;
+        }
+    }
+    t.check(not_nearest == 0, std::to_string(not_nearest) + " codes are not the nearest pivot");
+    // 256 pivots per chunk over 8 unit-variance blobs quantize far finer than
+    // the noise, so reconstruction error is well under the noise energy.
+    t.check(total_sq_err / NUM_POINTS < BLOB_DIM, "mean squared reconstruction error too high");
+
+    // Querying with a blob's first point, PQ distance puts that blob's 500
+    // points strictly ahead of every other point.
+    for (uint32_t b = 0; b < NUM_BLOBS; ++b) {
+        std::copy_n(base.data() + size_t(b) * POINTS_PER_BLOB * BLOB_DIM, BLOB_DIM, point.begin());
+        std::vector<float> table = pq_distance_table(point.data(), pq);
+        std::vector<std::pair<float, uint32_t>> ranked;
+        for (uint32_t i = 0; i < NUM_POINTS; ++i) {
+            ranked.emplace_back(pq_distance(table, pq, pq.codes.data() + size_t(i) * chunks), i);
+        }
+        std::sort(ranked.begin(), ranked.end());
+        bool blob_first = std::all_of(ranked.begin(), ranked.begin() + POINTS_PER_BLOB,
+                                      [&](auto& r) { return r.second / POINTS_PER_BLOB == b; });
+        t.check(blob_first, "blob " + std::to_string(b) + " is not ranked first by PQ distance");
+    }
+
+    save_ivf_pq(prefix, pq);
+    PQMetadata loaded = load_ivf_pq(prefix);
+    t.check(loaded.chunks == pq.chunks && loaded.chunk_dim == pq.chunk_dim && loaded.k == pq.k &&
+                loaded.pivots == pq.pivots && loaded.codes == pq.codes,
+            "PQ sidecars did not round-trip");
+    diskann::save_bin<uint8_t>(ivf_pq_codes_path(prefix), pq.codes.data(), NUM_POINTS * 2, chunks / 2);
+    t.expect_throw("codes file with the wrong column count", [&] { load_ivf_pq(prefix); });
+    ::unlink(ivf_pq_pivots_path(prefix).c_str());
+    ::unlink(ivf_pq_codes_path(prefix).c_str());
+    return t.done();
+}
+
+bool test_pq_error_paths(const std::string& base_bin) {
+    TestCase t("PQ rejects chunks == 0, dim % chunks != 0, a short sample, and a mismatched base");
+    t.expect_throw("chunks == 0", [&] { train_ivf_pq_pivots<float>(base_bin, 0); });
+    t.expect_throw("12 dims into 5 chunks", [&] { train_ivf_pq_pivots<float>(base_bin, 5); });
+    t.expect_throw("sample of ~0 rows", [&] {
+        train_ivf_pq_pivots<float>(base_bin, 4, 1e-6, NUM_K_MEANS_ITERS, TRAIN_SEED);
+    });
+    t.expect_throw("encoding a base whose dim != chunks * chunk_dim", [&] {
+        PQMetadata pq = train_ivf_pq_pivots<float>(base_bin, 4, 1.0, NUM_K_MEANS_ITERS, TRAIN_SEED);
+        pq.chunk_dim = 2;
+        encode_ivf_pq_codes<float>(base_bin, pq);
+    });
+    return t.done();
+}
+
 }  // namespace
 
 int main() {
@@ -364,6 +476,8 @@ int main() {
         all_pass &= test_assign_clusters_and_load_heap<float>("float", prefix, base_f32, data_f32, meta);
         all_pass &= test_assignment_error_paths(prefix, base_f32, meta);
         all_pass &= test_posting_lists_invert_assignments(prefix);
+        all_pass &= test_pq_pivots_and_codes<float>("float", prefix, base_f32, data_f32, 4);
+        all_pass &= test_pq_error_paths(base_f32);
 
         // uint8 base: the heap must hold the 1-byte-per-dim input, not a float conversion.
         std::vector<uint8_t> data_u8 = write_synthetic_base<uint8_t>(base_u8, BLOB_SPACING_U8);
@@ -372,6 +486,7 @@ int main() {
         all_pass &= test_centroids_recover_blobs(meta_u8, BLOB_SPACING_U8);
         all_pass &= test_assign_clusters_and_load_heap<uint8_t>("uint8", prefix + "_u8", base_u8,
                                                                 data_u8, meta_u8);
+        all_pass &= test_pq_pivots_and_codes<uint8_t>("uint8", prefix + "_u8", base_u8, data_u8, 3);
     } catch (const diskann::ANNException& e) {
         std::cout << "  FAIL: " << e.message() << std::endl;
         all_pass = false;
