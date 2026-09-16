@@ -7,6 +7,7 @@
 // CTest registers a small smoke configuration; run the default by hand.
 
 #include "bufann/ivf_pq_build.h"
+#include "bufann/ivf_pq_index_file.h"
 #include "ivf_pq_test_util.h"
 #include "utils.h"
 
@@ -134,23 +135,27 @@ int main(int argc, char** argv) {
 
         PQMetadata pq;
         bool round_trip = false;
-        step("save + reload sidecars", [&] {
-            save_ivf_centroids(prefix, meta);
-            save_ivf_cluster_assignments(prefix, assignments);
-            save_ivf_rid_table(prefix, rid_table);
-            save_ivf_posting_lists(prefix, lists);
-            IVFMetadata m2 = load_ivf_centroids(prefix, p.dim);
-            ClusterAssignments a2 = load_ivf_cluster_assignments(prefix);
-            RawVectorRIDTable r2 = load_ivf_rid_table(prefix);
-            PostingLists l2 = load_ivf_posting_lists(prefix);
-            pq = load_ivf_pq(prefix);
-            round_trip = m2.centroids == meta.centroids && a2.cluster_id == assignments.cluster_id &&
-                         r2.rid.size() == rid_table.rid.size() && l2.ids == lists.ids &&
-                         l2.offsets == lists.offsets;
+        step("6 write index file", [&] {
+            IVFPQIndex ix;
+            ix.meta = meta;
+            ix.assignments = assignments;
+            ix.lists = lists;
+            ix.pq = load_ivf_pq(prefix);
+            ix.rid_table = rid_table;
+            ix.heap_layout = layout;
+            ix.heap_pages = heap.allocated_pages();
+            write_ivf_pq_index(prefix, ix);
+        });
+        step("load index file (validating)", [&] {
+            IVFPQIndex ix = load_ivf_pq_index(prefix);
+            pq = std::move(ix.pq);
+            round_trip = ix.meta.centroids == meta.centroids && ix.assignments.cluster_id == assignments.cluster_id &&
+                         ix.rid_table.rid.size() == rid_table.rid.size() && ix.lists.ids == lists.ids &&
+                         ix.lists.offsets == lists.offsets && ix.heap_pages == heap.allocated_pages();
         });
 
         TestCase t("invariants over every vector");
-        t.check(round_trip, "sidecar round-trip mismatch");
+        t.check(round_trip, "index file round-trip mismatch");
         uint32_t pages = uint32_t((p.n + layout.slots_per_page - 1) / layout.slots_per_page);
         t.check(heap.next_flat_slot() == p.n && heap.allocated_pages() == pages, "heap cursor");
         t.check(size_t(get_file_size(ivf_raw_vectors_path(prefix))) == size_t(pages) * layout.page_size,
@@ -222,9 +227,7 @@ int main(int argc, char** argv) {
         all_pass = false;
     }
 
-    for (const std::string& f : {base_bin, ivf_centroids_path(prefix), ivf_cluster_ids_path(prefix),
-                                 ivf_rid_table_path(prefix), ivf_raw_vectors_path(prefix),
-                                 ivf_posting_offsets_path(prefix), ivf_posting_ids_path(prefix),
+    for (const std::string& f : {base_bin, ivf_pq_index_path(prefix), ivf_raw_vectors_path(prefix),
                                  ivf_pq_pivots_path(prefix), ivf_pq_codes_path(prefix)}) {
         ::unlink(f.c_str());
     }

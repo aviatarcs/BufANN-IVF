@@ -2,10 +2,12 @@
 // training (shape, padding, blob recovery, seeding, save/load), cluster
 // assignment + raw-vector bulk load (exact nearest-centroid agreement,
 // RID/heap contents, multi-block streaming, sidecar round-trips, error paths),
-// posting-list construction (exact inverse of the assignments), and PQ
-// (codes are the nearest pivots; PQ distances rank blobs correctly).
+// posting-list construction (exact inverse of the assignments), PQ (codes
+// are the nearest pivots; PQ distances rank blobs correctly), and the
+// combined index file (round-trip, atomic replace, corruption detection).
 
 #include "bufann/ivf_pq_build.h"
+#include "bufann/ivf_pq_index_file.h"
 #include "ivf_pq_test_util.h"
 #include "math_utils.h"
 #include "partition_and_pq.h"
@@ -13,7 +15,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <cstring>
+#include <fstream>
 #include <limits>
 #include <memory>
 #include <random>
@@ -483,6 +487,95 @@ bool test_pq_error_paths(const std::string& prefix, const std::string& base_bin)
     return t.done();
 }
 
+// --- combined index file ---------------------------------------------------
+
+template<typename T>
+void patch(const std::string& path, uint64_t offset, T value) {
+    std::fstream f(path, std::ios::in | std::ios::out | std::ios::binary);
+    f.seekp(std::streamoff(offset));
+    f.write(reinterpret_cast<const char*>(&value), sizeof(value));
+}
+
+bool test_index_file(const std::string& prefix, const std::string& base_bin, const IVFMetadata& meta) {
+    TestCase t("combined index file round-trips, replaces atomically, and rejects corruption");
+    std::string pre = prefix + "_index";
+    IVFPQIndex ix;
+    ix.meta = meta;
+    ix.heap_layout = compute_raw_vector_heap_layout(4096, meta.dim * sizeof(float));
+    {
+        RawVectorHeap heap;
+        heap.open(ivf_raw_vectors_path(pre), ix.heap_layout);
+        assign_ivf_clusters<float>(base_bin, meta, heap, ix.assignments, ix.rid_table);
+        ix.heap_pages = heap.allocated_pages();
+    }
+    ix.lists = build_ivf_posting_lists(ix.assignments, meta.nlist);
+    train_ivf_pq_pivots<float>(base_bin, pre, 4, 1.0, NUM_K_MEANS_ITERS, TRAIN_SEED);
+    encode_ivf_pq_codes<float>(base_bin, pre, 4);
+    ix.pq = load_ivf_pq(pre);
+
+    const std::string path = ivf_pq_index_path(pre);
+    write_ivf_pq_index(pre, ix);
+    t.check(!file_exists(path + ".tmp"), "temporary file left behind");
+    uint64_t expected_size = sizeof(IVFPQIndexFileHeader) + ix.meta.centroids.size() * 4 +
+                             ix.assignments.cluster_id.size() * 4 + ix.lists.offsets.size() * 4 +
+                             ix.lists.ids.size() * 4 + ix.pq.pivots.size() * 4 + ix.pq.codes.size() +
+                             ix.rid_table.rid.size() * 4;
+    t.check(get_file_size(path) == expected_size, "file size is not header + sections");
+
+    IVFPQIndex loaded = load_ivf_pq_index(pre);
+    bool rids_equal = std::equal(ix.rid_table.rid.begin(), ix.rid_table.rid.end(), loaded.rid_table.rid.begin(),
+                                 [](RawVectorRID a, RawVectorRID b) { return a.packed == b.packed; });
+    t.check(loaded.meta.nlist == ix.meta.nlist && loaded.meta.dim == ix.meta.dim &&
+                loaded.meta.aligned_dim == ix.meta.aligned_dim && loaded.meta.centroids == ix.meta.centroids &&
+                loaded.assignments.cluster_id == ix.assignments.cluster_id &&
+                loaded.lists.offsets == ix.lists.offsets && loaded.lists.ids == ix.lists.ids &&
+                loaded.pq.chunks == ix.pq.chunks && loaded.pq.chunk_dim == ix.pq.chunk_dim &&
+                loaded.pq.k == ix.pq.k && loaded.pq.pivots == ix.pq.pivots && loaded.pq.codes == ix.pq.codes &&
+                loaded.rid_table.rid.size() == ix.rid_table.rid.size() && rids_equal &&
+                loaded.heap_layout.slots_per_page == ix.heap_layout.slots_per_page &&
+                loaded.heap_pages == ix.heap_pages,
+            "loaded index differs from what was written");
+
+    // Writing again replaces the file in place and still loads.
+    write_ivf_pq_index(pre, ix);
+    t.check(load_ivf_pq_index(pre).lists.ids == ix.lists.ids, "rewrite did not replace cleanly");
+
+    // Each corruption is applied to a fresh copy and must be rejected.
+    IVFPQIndexFileHeader h;
+    {
+        std::ifstream in(path, std::ios::binary);
+        in.read(reinterpret_cast<char*>(&h), sizeof(h));
+    }
+    auto corrupt = [&](const char* what, auto&& fn) {
+        write_ivf_pq_index(pre, ix);
+        fn();
+        t.expect_throw(what, [&] { load_ivf_pq_index(pre); });
+    };
+    corrupt("wrong magic", [&] { patch<uint32_t>(path, 0, 0x12345678u); });
+    corrupt("unsupported version", [&] { patch<uint32_t>(path, 4, IVF_PQ_INDEX_VERSION + 1); });
+    corrupt("num_vectors changed", [&] { patch<uint64_t>(path, offsetof(IVFPQIndexFileHeader, num_vectors), NUM_POINTS - 1); });
+    corrupt("file truncated", [&] { ::truncate(path.c_str(), off_t(get_file_size(path) - 4)); });
+    corrupt("posting id >= N", [&] { patch<uint32_t>(path, h.posting_ids_offset, NUM_POINTS); });
+    corrupt("posting id listed twice", [&] { patch<uint32_t>(path, h.posting_ids_offset + 4, ix.lists.ids[0]); });
+    corrupt("cluster id disagrees with posting lists", [&] {
+        patch<uint32_t>(path, h.cluster_assignments_offset, (ix.assignments.cluster_id[0] + 1) % meta.nlist);
+    });
+    corrupt("cluster id >= nlist", [&] { patch<uint32_t>(path, h.cluster_assignments_offset, meta.nlist); });
+    corrupt("RID past the heap", [&] {
+        patch<uint32_t>(path, h.rid_table_offset, make_raw_vector_rid(ix.heap_pages * ix.heap_layout.slots_per_page, true).packed);
+    });
+    corrupt("heap file shorter than recorded", [&] {
+        ::truncate(ivf_raw_vectors_path(pre).c_str(), off_t(h.raw_vectors_bytes - 1));
+    });
+    corrupt("heap file missing", [&] { ::unlink(ivf_raw_vectors_path(pre).c_str()); });
+
+    ::unlink(path.c_str());
+    ::unlink(ivf_raw_vectors_path(pre).c_str());
+    ::unlink(ivf_pq_pivots_path(pre).c_str());
+    ::unlink(ivf_pq_codes_path(pre).c_str());
+    return t.done();
+}
+
 }  // namespace
 
 int main() {
@@ -504,6 +597,7 @@ int main() {
         all_pass &= test_posting_lists_invert_assignments(prefix);
         all_pass &= test_pq_pivots_and_codes<float>("float", prefix, base_f32, data_f32, 4);
         all_pass &= test_pq_error_paths(prefix, base_f32);
+        all_pass &= test_index_file(prefix, base_f32, meta);
 
         // uint8 base: the heap must hold the 1-byte-per-dim input, not a float conversion.
         std::vector<uint8_t> data_u8 = write_synthetic_base<uint8_t>(base_u8, BLOB_SPACING_U8);

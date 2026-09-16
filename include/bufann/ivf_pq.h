@@ -12,6 +12,8 @@
 
 #include "tsl/robin_set.h"
 
+#include "bufann/ivf_pq_raw_vector_heap_layout.h"
+
 namespace diskann {
 namespace inplace {
 
@@ -99,7 +101,24 @@ struct DynamicPQCodes {
     std::unordered_map<uint32_t, std::vector<uint8_t>> codes;  // vector_id -> [chunks]
 };
 
-// IVFPQIndexFileHeader: on-disk header for the combined IVF-PQ index file
+// IVFPQIndex: everything the combined index file persists, in memory. The
+// raw vectors themselves stay in the heap file; heap_layout and heap_pages
+// describe it.
+struct IVFPQIndex {
+    IVFMetadata meta;
+    ClusterAssignments assignments;
+    PostingLists lists;
+    PQMetadata pq;
+    RawVectorRIDTable rid_table;
+    RawVectorHeapLayout heap_layout;
+    uint32_t heap_pages = 0;
+};
+
+// IVFPQIndexFileHeader: on-disk header for the combined IVF-PQ index file.
+// Fixed layout, written and read as raw bytes; bump version on any change.
+constexpr uint32_t IVF_PQ_INDEX_MAGIC   = 0x51465649;  // "IVFQ" little-endian
+constexpr uint32_t IVF_PQ_INDEX_VERSION = 1;
+
 struct IVFPQIndexFileHeader {
     uint32_t magic   = 0;
     uint32_t version = 0;
@@ -137,6 +156,7 @@ struct IVFPQIndexFileHeader {
     uint32_t raw_vector_page_size = 0;
     uint64_t raw_vectors_bytes    = 0;
 };
+static_assert(sizeof(IVFPQIndexFileHeader) == 168, "header layout is part of the file format");
 
 }  // namespace inplace
 }  // namespace diskann

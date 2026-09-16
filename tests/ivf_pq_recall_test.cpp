@@ -11,6 +11,7 @@
 // RECALL_FLOOR.
 
 #include "bufann/ivf_pq_build.h"
+#include "bufann/ivf_pq_index_file.h"
 #include "ivf_pq_test_util.h"
 #include "utils.h"
 
@@ -50,16 +51,9 @@ std::vector<uint32_t> top_k(const std::vector<float>& values, uint32_t k) {
     return order;
 }
 
-struct Index {
-    IVFMetadata meta;
-    PostingLists lists;
-    PQMetadata pq;
-    RawVectorRIDTable rids;
-    RawVectorHeap heap;
-};
-
-// The reference search. `pq_only` skips the exact re-rank.
-std::vector<uint32_t> search(const Index& ix, const float* q, uint32_t nprobe, bool pq_only) {
+// The reference search over a loaded index. `pq_only` skips the exact re-rank.
+std::vector<uint32_t> search(const IVFPQIndex& ix, const RawVectorHeap& heap, const float* q,
+                             uint32_t nprobe, bool pq_only) {
     const uint32_t dim = ix.meta.dim;
     std::vector<float> centroid_dist(ix.meta.nlist);
     for (uint32_t c = 0; c < ix.meta.nlist; ++c) {
@@ -97,7 +91,7 @@ std::vector<uint32_t> search(const Index& ix, const float* q, uint32_t nprobe, b
     std::vector<float> exact;
     std::vector<float> vec(dim);
     for (uint32_t i : top_k(pq_dist, RERANK_M)) {
-        ix.heap.read_vector(rid_flat_slot(ix.rids.rid[candidates[i]]), vec.data());
+        heap.read_vector(rid_flat_slot(ix.rid_table.rid[candidates[i]]), vec.data());
         shortlist.push_back(candidates[i]);
         exact.push_back(sq_dist(q, vec.data(), dim));
     }
@@ -199,18 +193,26 @@ int main(int argc, char** argv) {
         delete[] qraw;
         if (!synthetic) gt = load_gt(argv[3], nq);
 
+        // Build, persist as the combined file, and search what loads back --
+        // the heap is reopened read-only on the file the build wrote.
         auto t0 = std::chrono::steady_clock::now();
-        Index ix;
-        ix.meta = train_ivf_centroids<float>(base_bin, nlist);
-        ix.heap.open(ivf_raw_vectors_path(prefix), compute_raw_vector_heap_layout(4096, uint32_t(dim) * sizeof(float)));
-        ClusterAssignments assignments;
-        assign_ivf_clusters<float>(base_bin, ix.meta, ix.heap, assignments, ix.rids);
-        ix.lists = build_ivf_posting_lists(assignments, nlist);
-        train_ivf_pq_pivots<float>(base_bin, prefix, chunks, synthetic ? 0.3 : 0.0);
-        encode_ivf_pq_codes<float>(base_bin, prefix, chunks);
-        ix.pq = load_ivf_pq(prefix);
+        RawVectorHeap heap;
+        {
+            IVFPQIndex built;
+            built.meta = train_ivf_centroids<float>(base_bin, nlist);
+            built.heap_layout = compute_raw_vector_heap_layout(4096, uint32_t(dim) * sizeof(float));
+            heap.open(ivf_raw_vectors_path(prefix), built.heap_layout);
+            assign_ivf_clusters<float>(base_bin, built.meta, heap, built.assignments, built.rid_table);
+            built.lists = build_ivf_posting_lists(built.assignments, nlist);
+            train_ivf_pq_pivots<float>(base_bin, prefix, chunks, synthetic ? 0.3 : 0.0);
+            encode_ivf_pq_codes<float>(base_bin, prefix, chunks);
+            built.pq = load_ivf_pq(prefix);
+            built.heap_pages = heap.allocated_pages();
+            write_ivf_pq_index(prefix, built);
+        }
+        IVFPQIndex ix = load_ivf_pq_index(prefix);
         std::cout << "build: " << std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count()
-                  << " s (nlist " << nlist << ", " << chunks << " PQ chunks, N " << assignments.cluster_id.size()
+                  << " s (nlist " << nlist << ", " << chunks << " PQ chunks, N " << ix.assignments.cluster_id.size()
                   << ")" << std::endl;
 
         TestCase t("recall@" + std::to_string(K) + " over " + std::to_string(nq) + " queries");
@@ -220,7 +222,7 @@ int main(int argc, char** argv) {
                 auto s0 = std::chrono::steady_clock::now();
                 size_t hits = 0;
                 for (size_t q = 0; q < nq; ++q) {
-                    std::vector<uint32_t> got = search(ix, queries.data() + q * dim, nprobe, pq_only);
+                    std::vector<uint32_t> got = search(ix, heap, queries.data() + q * dim, nprobe, pq_only);
                     for (uint32_t id : got) {
                         hits += std::find(gt[q].begin(), gt[q].begin() + K, id) != gt[q].begin() + K;
                     }
@@ -235,13 +237,14 @@ int main(int argc, char** argv) {
         t.check(best_recall >= RECALL_FLOOR,
                 "recall " + std::to_string(best_recall) + " below " + std::to_string(RECALL_FLOOR));
         all_pass &= t.done();
-        ix.heap.close();
+        heap.close();
     } catch (const diskann::ANNException& e) {
         std::cout << "  FAIL: " << e.message() << std::endl;
         all_pass = false;
     }
 
-    for (const std::string& f : {ivf_raw_vectors_path(prefix), ivf_pq_pivots_path(prefix), ivf_pq_codes_path(prefix)}) {
+    for (const std::string& f : {ivf_pq_index_path(prefix), ivf_raw_vectors_path(prefix), ivf_pq_pivots_path(prefix),
+                                 ivf_pq_codes_path(prefix)}) {
         ::unlink(f.c_str());
     }
     if (synthetic) {
