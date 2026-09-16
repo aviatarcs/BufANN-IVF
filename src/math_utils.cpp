@@ -178,18 +178,22 @@ namespace math_utils {
           pts_norms_blk, pivs_norms_squared, closest_centers, distance_matrix,
           k);
 
-#pragma omp parallel for schedule(static, 1)
-      for (int64_t j = cur_blk * PAR_BLOCK_SIZE;
-           j <
-           std::min((_s64) num_points, (_s64) ((cur_blk + 1) * PAR_BLOCK_SIZE));
-           j++) {
+      int64_t blk_end =
+          std::min((_s64) num_points, (_s64) ((cur_blk + 1) * PAR_BLOCK_SIZE));
+#pragma omp parallel for schedule(static, 8192)
+      for (int64_t j = cur_blk * PAR_BLOCK_SIZE; j < blk_end; j++) {
         for (size_t l = 0; l < k; l++) {
-          size_t this_center_id =
-              closest_centers[(j - cur_blk * PAR_BLOCK_SIZE) * k + l];
-          closest_centers_ivf[j * k + l] = (uint32_t) this_center_id;
-          if (inverted_index != NULL) {
-#pragma omp critical
-            inverted_index[this_center_id].push_back(j);
+          closest_centers_ivf[j * k + l] =
+              (uint32_t) closest_centers[(j - cur_blk * PAR_BLOCK_SIZE) * k + l];
+        }
+      }
+      // Serial: a critical section per point serialized the parallel loop
+      // above and left each list in thread-arrival order. This is O(n) and
+      // gives ascending, deterministic lists.
+      if (inverted_index != NULL) {
+        for (int64_t j = cur_blk * PAR_BLOCK_SIZE; j < blk_end; j++) {
+          for (size_t l = 0; l < k; l++) {
+            inverted_index[closest_centers_ivf[j * k + l]].push_back(j);
           }
         }
       }

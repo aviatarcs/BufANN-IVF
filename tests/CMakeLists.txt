@@ -64,6 +64,11 @@ target_link_libraries(ivf_pq_raw_vector_heap_test ${PROJECT_NAME} aio -ltcmalloc
 add_executable(ivf_pq_build_test ivf_pq_build_test.cpp)
 target_link_libraries(ivf_pq_build_test ${PROJECT_NAME} aio -ltcmalloc)
 
+# Whole-pipeline run at realistic shapes; see the file header for arguments.
+add_executable(ivf_pq_scale_test ivf_pq_scale_test.cpp)
+target_link_libraries(ivf_pq_scale_test ${PROJECT_NAME} aio -ltcmalloc)
+
 # Self-checking tests (non-zero exit on failure); run with `ctest`.
 add_test(NAME ivf_pq_raw_vector_heap COMMAND ivf_pq_raw_vector_heap_test)
 add_test(NAME ivf_pq_build COMMAND ivf_pq_build_test)
+add_test(NAME ivf_pq_scale_smoke COMMAND ivf_pq_scale_test 50000 128 64 32)
