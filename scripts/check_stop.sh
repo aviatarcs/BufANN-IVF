@@ -13,9 +13,12 @@ reasons=()
 if [[ -n "$(git -C "$REPO" status --porcelain --untracked-files=no)" ]]; then
     reasons+=("tracked files have uncommitted changes: $(git -C "$REPO" status --porcelain --untracked-files=no | head -5 | tr '\n' ' ')")
 fi
-failed="$REPO/build/Testing/Temporary/LastTestsFailed.log"
-if [[ -s "$failed" ]]; then
-    reasons+=("the last ctest run failed: $(tr '\n' ' ' < "$failed")")
+# LastTest.log is rewritten by every ctest run; LastTestsFailed.log is not
+# removed by a later green run on this host, so it cannot be the signal.
+last="$REPO/build/Testing/Temporary/LastTest.log"
+if [[ -f "$last" ]] && grep -q '^Test Failed\.$' "$last"; then
+    failed="$(grep -B40 '^Test Failed\.$' "$last" | grep -oE '^[0-9]+/[0-9]+ Testing: .*' | sed 's/^[0-9]*\/[0-9]* Testing: //' | tr '\n' ' ')"
+    reasons+=("the last ctest run failed: ${failed:-see build/Testing/Temporary/LastTest.log}")
 fi
 if (( ${#reasons[@]} )); then
     reason="$(printf '%s; ' "${reasons[@]}")"

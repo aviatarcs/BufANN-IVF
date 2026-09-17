@@ -1,10 +1,29 @@
 {
   "permissions": {
-    "defaultMode": "default",
+    "defaultMode": "acceptEdits",
     "deny": [
-      "Edit(include/**)", "Edit(src/**)", "Edit(tests/**)", "Edit(scripts/**)", "Edit(CMakeLists.txt)",
-      "Write(include/**)", "Write(src/**)", "Write(tests/**)", "Write(scripts/**)",
-      "Bash(git add *)", "Bash(git commit *)", "Bash(git push *)", "Bash(git checkout *)", "Bash(git stash *)"
+      "Edit(include/**)",
+      "Edit(src/**)",
+      "Edit(tests/**)",
+      "Edit(scripts/**)",
+      "Edit(CMakeLists.txt)",
+      "Write(include/**)",
+      "Write(src/**)",
+      "Write(tests/**)",
+      "Write(scripts/**)",
+      "Bash(git add *)",
+      "Bash(git commit *)",
+      "Bash(git push *)",
+      "Bash(git checkout *)",
+      "Bash(git stash *)",
+      "Edit(REVIEW.md)",
+      "Write(REVIEW.md)",
+      "Edit(PLAN.md)",
+      "Write(PLAN.md)",
+      "Edit(.claude/**)",
+      "Write(.claude/**)",
+      "Edit(CLAUDE.md)",
+      "Write(CLAUDE.md)"
     ]
   }
 }

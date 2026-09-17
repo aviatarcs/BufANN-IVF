@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # Reproducible build environment for this host, which has no system MKL,
 # iomp5 or tcmalloc. The home directory is NFS with a small quota, so the
-# shim (.build-env) and the build tree live on local disk under
-# BUFANN_BUILD_ROOT (default /var/tmp/bufann-ivf-$USER) and are symlinked
-# into the repo as .build-env and build. Idempotent; safe to run at the start
-# of every agent cycle.
+# shim and the build tree live on local disk under BUFANN_BUILD_ROOT
+# (default /var/tmp/bufann-ivf-$USER): one shared build-env, and one build
+# directory per checkout (keyed by the checkout's directory name, so git
+# worktrees do not share object files). Both are symlinked into the checkout
+# as .build-env and build. Idempotent; safe to run at the start of every
+# agent cycle.
 #
 #   scripts/dev_env.sh            configure + build the IVF-PQ test targets
 #   scripts/dev_env.sh test       ... then run ctest
@@ -15,8 +17,9 @@ set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ROOT="${BUFANN_BUILD_ROOT:-/var/tmp/bufann-ivf-$USER}"
-mkdir -p "$ROOT/build-env" "$ROOT/build"
-for link in .build-env:build-env build:build; do
+CHECKOUT="$(basename "$REPO")"
+mkdir -p "$ROOT/build-env" "$ROOT/build-$CHECKOUT"
+for link in .build-env:build-env build:build-$CHECKOUT; do
     name="${link%%:*}" target="$ROOT/${link##*:}"
     if [[ -e "$REPO/$name" && ! -L "$REPO/$name" ]]; then
         echo "ERROR: $REPO/$name exists and is not a symlink; remove it (it belongs on local disk)" >&2
@@ -25,7 +28,7 @@ for link in .build-env:build-env build:build; do
     ln -sfn "$target" "$REPO/$name"
 done
 ENV="$ROOT/build-env"
-BUILD="$ROOT/build"
+BUILD="$ROOT/build-$CHECKOUT"
 MKL_VERSION="2025.2.0"
 MKL_LIB_DIR="${MKL_LIB_DIR:-/lusr/opt/julia-depot/1.12/artifacts/27edf95310a71d47422663c3aea849f56efb1360/lib}"
 

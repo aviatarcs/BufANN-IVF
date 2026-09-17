@@ -3,7 +3,7 @@
 The worker takes the first unchecked item whose dependencies are checked,
 unless `REVIEW.md` has open findings, which come first. Each item is one
 PR-sized change with tests. Check an item off in the same commit that
-completes it, with the commit hash.
+completes it, citing the commit subject.
 
 ## Queue
 

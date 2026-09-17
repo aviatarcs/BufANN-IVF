@@ -20,7 +20,7 @@ Findings with status `open` block new plan items.
   file (the build tree resolves to `/var/tmp`). Suggested fix: compare it
   against `LastTest.log` by mtime, or parse the pass/fail summary out of
   `LastTest.log` instead. Not fixed here because `scripts/` and `.claude/`
-  had uncommitted edits from another session at the time. Status: open
+  had uncommitted edits from another session at the time. Status: fixed (check_stop.sh now parses LastTest.log, which every ctest run rewrites)
 
 ## Review of 47f5324..f0b986b (2026-09-16)
 
