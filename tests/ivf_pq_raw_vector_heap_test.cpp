@@ -1,7 +1,7 @@
 // Tests for RawVectorHeap: layout, on-disk format, allocate/write/read/free/
 // reuse, concurrent bitmap updates, slot-space limit, the fresh-open guard,
-// reopening a closed heap (and refusing a bad one), page-id verification on
-// read, and the bulk writer.
+// reopening a closed heap (and refusing a bad one or a wrong geometry),
+// page-header verification on read, and the bulk writer.
 
 #include "bufann/ivf_pq_raw_vector_heap.h"
 #include "ivf_pq_test_util.h"
@@ -33,8 +33,8 @@ std::vector<char> read_whole_file(const std::string& path) {
 bool test_layout() {
     TestCase t("layout matches the design-doc example and is maximal for every geometry");
     RawVectorHeapLayout l = compute_raw_vector_heap_layout(PAGE, ELEM);
-    t.check(l.slots_per_page == 7 && l.bitmap_bytes == 1 && l.slots_offset == 9,
-            "expected 7 slots, 1 bitmap byte, slots at offset 9");
+    t.check(l.slots_per_page == 7 && l.bitmap_bytes == 1 && l.slots_offset == 17,
+            "expected 7 slots, 1 bitmap byte, slots at offset 17");
 
     // Whatever the geometry, the page holds the slots and one more would not fit.
     for (uint32_t page : {64u, 512u, 4096u, 16384u}) {
@@ -54,15 +54,18 @@ bool test_layout() {
         }
     }
     t.expect_throw("one slot + header + bitmap byte exceeds the page",
-                   [] { compute_raw_vector_heap_layout(PAGE, PAGE - 8); });
+                   [] { compute_raw_vector_heap_layout(PAGE, PAGE - RAW_VECTOR_PAGE_HEADER_BYTES); });
     t.expect_throw("elem_size == 0", [] { compute_raw_vector_heap_layout(PAGE, 0); });
     return t.done();
 }
 
-// Little-endian bytes the header of page `id` should carry: "IVFH", then the id.
-std::vector<char> page_header_bytes(uint32_t id) {
+// Little-endian bytes the header of page `id` should carry: "IVFH", the id,
+// then the page_size and elem_size the page was written with.
+std::vector<char> page_header_bytes(uint32_t id, uint32_t page_size = PAGE, uint32_t elem_size = ELEM) {
     std::vector<char> h = {'I', 'V', 'F', 'H'};
-    for (int i = 0; i < 4; ++i) h.push_back(char((id >> (8 * i)) & 0xFF));
+    for (uint32_t v : {id, page_size, elem_size}) {
+        for (int i = 0; i < 4; ++i) h.push_back(char((v >> (8 * i)) & 0xFF));
+    }
     return h;
 }
 
@@ -72,9 +75,9 @@ bool page_header_is(const std::vector<char>& f, uint32_t page_id) {
     return offset + want.size() <= f.size() && std::equal(want.begin(), want.end(), f.begin() + offset);
 }
 
-// Pins the on-disk format: page header = magic + page id, bitmap bit i (LSB
-// first) for slot i, slot i at slots_offset + i * elem_size, second page at
-// page_size.
+// Pins the on-disk format: page header = magic + page id + page_size +
+// elem_size, bitmap bit i (LSB first) for slot i, slot i at
+// slots_offset + i * elem_size, second page at page_size.
 bool test_on_disk_format() {
     TestCase t("on-disk page format: header, LSB-first bitmap, slot placement");
     std::string path = temp_path("ivf_heap_format");
@@ -93,13 +96,13 @@ bool test_on_disk_format() {
         return offset + ELEM <= f.size() && std::equal(want.begin(), want.end(), f.begin() + offset);
     };
     t.check(f.size() == 2 * PAGE, "file is not exactly two pages");
-    t.check(page_header_is(f, 0), "page 0 header is not magic + id 0");
-    t.check(uint8_t(f[8]) == 0b00000101, "page 0 bitmap is not bits 0 and 2");
-    t.check(slot_is(9, 10), "slot 0 not at offset 9");
-    t.check(slot_is(9 + 2 * ELEM, 12), "slot 2 not at offset 9 + 2 * elem_size");
-    t.check(page_header_is(f, 1), "page 1 header is not magic + id 1");
-    t.check(uint8_t(f[PAGE + 8]) == 0b00000001, "page 1 bitmap is not bit 0");
-    t.check(slot_is(PAGE + 9, 17), "slot 7 not at page 1 offset 9");
+    t.check(page_header_is(f, 0), "page 0 header is not magic + id 0 + geometry");
+    t.check(uint8_t(f[16]) == 0b00000101, "page 0 bitmap is not bits 0 and 2");
+    t.check(slot_is(17, 10), "slot 0 not at offset 17");
+    t.check(slot_is(17 + 2 * ELEM, 12), "slot 2 not at offset 17 + 2 * elem_size");
+    t.check(page_header_is(f, 1), "page 1 header is not magic + id 1 + geometry");
+    t.check(uint8_t(f[PAGE + 16]) == 0b00000001, "page 1 bitmap is not bit 0");
+    t.check(slot_is(PAGE + 17, 17), "slot 7 not at page 1 offset 17");
     ::unlink(path.c_str());
     return t.done();
 }
@@ -194,7 +197,7 @@ bool test_rejects_slots_past_the_rid_slot_space() {
     TestCase t("allocate_slot hands out the last addressable slot, then refuses");
     std::string path = temp_path("ivf_heap_full");
     RawVectorHeap heap;
-    heap.open(path, compute_raw_vector_heap_layout(PAGE, PAGE - 9));  // 1 slot per page
+    heap.open(path, compute_raw_vector_heap_layout(PAGE, PAGE - RAW_VECTOR_PAGE_HEADER_BYTES - 1));  // 1 slot per page
     RawVectorFreeList free_list;
 
     // Page count already past the cursor, so neither call extends the file.
@@ -312,9 +315,22 @@ bool test_reopen_rejects_bad_file() {
     // double-size page is page 2's, not page 1's.
     RawVectorHeapLayout doubled = compute_raw_vector_heap_layout(2 * PAGE, ELEM);
     t.expect_throw("different page_size", [&] { heap.open_existing(path, doubled, 0, 2); });
+    // Geometries under which the file's size and its first and last page ids
+    // both line up, so only the geometry in the page header tells them apart:
+    // the whole file as one page (first == last == page 0), and the same
+    // pages holding elements twice the size.
+    RawVectorHeapLayout one_page = compute_raw_vector_heap_layout(pages * PAGE, ELEM);
+    t.expect_throw("whole file as a single page", [&] { heap.open_existing(path, one_page, 0, 1); });
+    RawVectorHeapLayout wider = compute_raw_vector_heap_layout(PAGE, 2 * ELEM);
+    t.expect_throw("same pages, different elem_size",
+                   [&] { heap.open_existing(path, wider, pages * wider.slots_per_page, pages); });
 
     t.expect_throw("page 0 without a header", [&] {
-        patch_bytes(path, 0, std::vector<char>(8, 0));
+        patch_bytes(path, 0, std::vector<char>(RAW_VECTOR_PAGE_HEADER_BYTES, 0));
+        heap.open_existing(path, layout, n, pages);
+    });
+    t.expect_throw("page 0 recording another elem_size", [&] {
+        patch_bytes(path, 0, page_header_bytes(0, PAGE, ELEM + 4));
         heap.open_existing(path, layout, n, pages);
     });
     patch_bytes(path, 0, page_header_bytes(0));
@@ -348,19 +364,22 @@ bool test_reopen_rejects_bad_file() {
 }
 
 bool test_read_rejects_misplaced_page() {
-    TestCase t("a page whose header names another page is rejected on read, and on bulk write");
+    TestCase t("a page whose header names another page or geometry is rejected on read, and on bulk write");
     std::string path = temp_path("ivf_heap_misplaced");
     RawVectorHeapLayout layout = compute_raw_vector_heap_layout(PAGE, ELEM);
-    const uint32_t spp = layout.slots_per_page, pages = 4, n = pages * spp;
+    const uint32_t spp = layout.slots_per_page, pages = 5, n = pages * spp;
     write_closed_heap(path, layout, n);
-    patch_bytes(path, 1 * PAGE, page_header_bytes(2));  // page 1 now claims to be page 2
+    patch_bytes(path, 1 * PAGE, page_header_bytes(2));                  // page 1 now claims to be page 2
+    patch_bytes(path, 2 * PAGE, page_header_bytes(2, 2 * PAGE, ELEM));  // page 2 claims a wider page
+    patch_bytes(path, 3 * PAGE, page_header_bytes(3, PAGE, ELEM / 2));  // page 3 claims smaller elements
 
     RawVectorHeap heap;
     heap.open_existing(path, layout, n, pages);  // first and last pages are intact
     std::vector<char> got(ELEM);
     uint32_t wrong = 0;
     for (uint32_t i = 0; i < n; ++i) {
-        bool in_bad_page = layout.page_of(i) == 1;
+        uint32_t page = layout.page_of(i);
+        bool in_bad_page = page >= 1 && page <= 3;
         try {
             heap.read_vector(i, got.data());
             wrong += in_bad_page || got != pattern(i);
@@ -368,12 +387,15 @@ bool test_read_rejects_misplaced_page() {
             wrong += !in_bad_page;
         }
     }
-    t.check(wrong == 0, std::to_string(wrong) + " slots were accepted from the misplaced page or rejected elsewhere");
+    t.check(wrong == 0, std::to_string(wrong) + " slots were accepted from a bad page or rejected elsewhere");
 
     std::vector<char> before = read_whole_file(path);
     std::vector<char> page(PAGE, 0);
-    std::copy_n(page_header_bytes(3).data(), 8, page.data());
+    auto stamp = [&](std::vector<char> header) { std::copy(header.begin(), header.end(), page.begin()); };
+    stamp(page_header_bytes(3));
     t.expect_throw("write_pages with a header for another page", [&] { heap.write_pages(2, page.data(), 1); });
+    stamp(page_header_bytes(2, PAGE, 2 * ELEM));
+    t.expect_throw("write_pages with a header for another elem_size", [&] { heap.write_pages(2, page.data(), 1); });
     t.check(read_whole_file(path) == before, "rejected write_pages touched the file");
     heap.close();
     ::unlink(path.c_str());

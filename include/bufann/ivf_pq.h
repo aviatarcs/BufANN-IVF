@@ -117,9 +117,11 @@ struct IVFPQIndex {
 
 // IVFPQIndexFileHeader: on-disk header for the combined IVF-PQ index file.
 // Fixed layout, written and read as raw bytes; bump version on any change.
-// Version 2 added raw_vector_next_slot and the RawVectorPageHeader.
+// Version 2 added raw_vector_next_slot and the RawVectorPageHeader; version 3
+// grew that page header from 8 to 16 bytes to record page_size and elem_size,
+// which moves every slot in the heap file.
 constexpr uint32_t IVF_PQ_INDEX_MAGIC   = 0x51465649;  // "IVFQ" little-endian
-constexpr uint32_t IVF_PQ_INDEX_VERSION = 2;
+constexpr uint32_t IVF_PQ_INDEX_VERSION = 3;
 
 struct IVFPQIndexFileHeader {
     uint32_t magic   = 0;

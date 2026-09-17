@@ -8,18 +8,24 @@
 namespace diskann {
 namespace inplace {
 
-constexpr uint32_t RAW_VECTOR_PAGE_HEADER_BYTES = 8;
+constexpr uint32_t RAW_VECTOR_PAGE_HEADER_BYTES = 16;
 constexpr uint32_t RAW_VECTOR_PAGE_MAGIC        = 0x48465649;  // "IVFH" little-endian
 
-// Every page starts with its own id, so a page read from the wrong offset
-// (a spliced, truncated-and-regrown, or foreign file) is detected on read.
+// Every page starts with its own id and the geometry it was written with, so
+// a page read from the wrong offset (a spliced, truncated-and-regrown, or
+// foreign file) or through the wrong layout (an index file that describes a
+// different heap) is detected on read. The heap file carries no header of its
+// own, so this is the only place the file states its geometry.
 struct RawVectorPageHeader {
-    uint32_t magic   = 0;
-    uint32_t page_id = 0;
+    uint32_t magic     = 0;
+    uint32_t page_id   = 0;
+    uint32_t page_size = 0;
+    uint32_t elem_size = 0;
 };
 static_assert(sizeof(RawVectorPageHeader) == RAW_VECTOR_PAGE_HEADER_BYTES, "page header is part of the file format");
 
 // Page layout: [RawVectorPageHeader][occupancy bitmap, 1 bit per slot, LSB first][slot 0..N-1][pad].
+// page_size and elem_size determine the rest, and are what every page header records.
 struct RawVectorHeapLayout {
     uint32_t page_size      = 0;
     uint32_t elem_size      = 0;

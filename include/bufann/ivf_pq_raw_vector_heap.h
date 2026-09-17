@@ -37,7 +37,8 @@ public:
 
     // Resumes a heap that open()/bulk load wrote earlier. The file must be
     // exactly `allocated_pages` pages and its first and last page headers must
-    // carry their own ids; every other page is verified when it is read.
+    // carry their own ids and this layout's page_size/elem_size; every other
+    // page is verified when it is read.
     void open_existing(const std::string& path, RawVectorHeapLayout layout,
                        uint32_t next_flat_slot, uint32_t allocated_pages);
     void close();
@@ -45,7 +46,7 @@ public:
     // Pops from free_list if possible, else grows the heap by a page as needed.
     uint32_t allocate_slot(RawVectorFreeList& free_list);
     void write_vector(uint32_t flat_slot, const void* data);  // sets the occupancy bit
-    void read_vector(uint32_t flat_slot, void* out) const;    // throws if the page header is not the slot's page
+    void read_vector(uint32_t flat_slot, void* out) const;    // throws if the page header is not the slot's page and geometry
     bool is_slot_occupied(uint32_t flat_slot) const;
     void free_slot(uint32_t flat_slot, RawVectorFreeList& free_list);  // clears the bit
 
