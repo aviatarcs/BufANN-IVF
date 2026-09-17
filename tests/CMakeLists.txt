@@ -68,12 +68,17 @@ target_link_libraries(ivf_pq_build_test ${PROJECT_NAME} aio -ltcmalloc)
 add_executable(ivf_pq_scale_test ivf_pq_scale_test.cpp)
 target_link_libraries(ivf_pq_scale_test ${PROJECT_NAME} aio -ltcmalloc)
 
-# Recall of a reference IVF-PQ search against ground truth; see the file header.
+# Recall of ivf_pq_search against ground truth; see the file header.
 add_executable(ivf_pq_recall_test ivf_pq_recall_test.cpp)
 target_link_libraries(ivf_pq_recall_test ${PROJECT_NAME} aio -ltcmalloc)
+
+# ivf_pq_search against a reference search, brute force, and its guards.
+add_executable(ivf_pq_search_test ivf_pq_search_test.cpp)
+target_link_libraries(ivf_pq_search_test ${PROJECT_NAME} aio -ltcmalloc)
 
 # Self-checking tests (non-zero exit on failure); run with `ctest`.
 add_test(NAME ivf_pq_raw_vector_heap COMMAND ivf_pq_raw_vector_heap_test)
 add_test(NAME ivf_pq_build COMMAND ivf_pq_build_test)
 add_test(NAME ivf_pq_scale_smoke COMMAND ivf_pq_scale_test 50000 128 64 32)
 add_test(NAME ivf_pq_recall_synthetic COMMAND ivf_pq_recall_test)
+add_test(NAME ivf_pq_search COMMAND ivf_pq_search_test)

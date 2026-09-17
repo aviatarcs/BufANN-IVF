@@ -15,12 +15,14 @@ completes it, with the commit hash.
       reopen, read every vector back; corrupt one page id and see it rejected.
       (Done in "Add raw-vector heap reopen and page-id headers"; the header
       now also records the slot cursor, index file version 2.)
-- [ ] **Query path, single query.** `ivf_pq_search(const IVFPQIndex&, const RawVectorHeap&, const float* q, k, nprobe, rerank_m) -> ids+dists`
+- [x] **Query path, single query.** `ivf_pq_search(const IVFPQIndex&, const RawVectorHeap&, const float* q, k, nprobe, rerank_m) -> ids+dists`
       in `include/bufann/ivf_pq_search.h`, implementing exactly the reference
       search in `tests/ivf_pq_recall_test.cpp` (which then calls it instead of
       its own loop). Centroid distances via one GEMM against the padded
       centroids; PQ table in a per-query scratch; re-rank from the heap.
       Recall must match the reference to within ties.
+      (Done in "Add the single-query IVF-PQ search path"; the reference loop
+      now lives in `tests/ivf_pq_search_test.cpp` as the oracle.)
 - [ ] **Query path, batched.** Batch the centroid GEMM over many queries and
       parallelize across queries with OpenMP; measure QPS on SIFT1M at nprobe
       16 and 64 and record it in the commit message.

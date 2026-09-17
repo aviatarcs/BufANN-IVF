@@ -63,7 +63,8 @@ cmake -S "$REPO" -B "$BUILD" -DCMAKE_BUILD_TYPE=Release \
 }
 rm -f "$BUILD.cmake.log"
 make -C "$BUILD" -j"$(nproc)" \
-    ivf_pq_raw_vector_heap_test ivf_pq_build_test ivf_pq_scale_test ivf_pq_recall_test 2>&1 | \
+    ivf_pq_raw_vector_heap_test ivf_pq_build_test ivf_pq_scale_test ivf_pq_recall_test \
+    ivf_pq_search_test 2>&1 | \
     grep -E "error|warning: unused|Built target" || true
 [[ -x "$BUILD/tests/ivf_pq_build_test" ]] || { echo "ERROR: build failed" >&2; exit 1; }
 
