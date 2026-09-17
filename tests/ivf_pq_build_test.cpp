@@ -586,6 +586,12 @@ bool test_index_file(const std::string& prefix, const std::string& base_bin, con
         patch<uint64_t>(path, offsetof(IVFPQIndexFileHeader, raw_vector_next_slot),
                         uint64_t(ix.heap_pages) * ix.heap_layout.slots_per_page + 1);
     });
+    // Truncating this value to uint32_t gives back the true cursor, so only the
+    // header's bound on raw_vector_next_slot can reject it.
+    corrupt("slot cursor with a set bit above the RID slot space", [&] {
+        patch<uint64_t>(path, offsetof(IVFPQIndexFileHeader, raw_vector_next_slot),
+                        (uint64_t(1) << 32) + ix.heap_next_slot);
+    });
     corrupt("heap file shorter than recorded", [&] {
         ::truncate(ivf_raw_vectors_path(pre).c_str(), off_t(h.raw_vectors_bytes - 1));
     });
