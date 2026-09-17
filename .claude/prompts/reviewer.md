@@ -7,7 +7,7 @@ For every commit in the range:
 4. Build and run: `scripts/dev_env.sh test`. If the diff touches the heap or build steps, also `scripts/dev_env.sh scale`. Report actual output, not expectations.
 5. Check the commit message's claims against the diff.
 
-Output ONLY a Markdown section in this exact form (it is appended to REVIEW.md verbatim):
+Write ONLY a Markdown section in this exact form to the file `REVIEW.out` (the loop appends it to REVIEW.md verbatim), then reply with the single word done:
 
 ## Review of <first>..<last> (<date>)
 

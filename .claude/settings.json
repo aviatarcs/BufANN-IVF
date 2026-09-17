@@ -44,7 +44,9 @@
       "Bash(python3 *)",
       "Bash(gh pr view *)",
       "Bash(gh pr comment *)",
-      "Bash(gh pr list *)"
+      "Bash(gh pr list *)",
+      "Bash(git pull *)",
+      "Bash(git worktree list*)"
     ],
     "deny": [
       "Bash(git push --force*)",
@@ -59,5 +61,8 @@
       "Bash(rm -rf .git*)",
       "Bash(sudo *)"
     ]
+  },
+  "worktree": {
+    "bgIsolation": "none"
   }
 }
