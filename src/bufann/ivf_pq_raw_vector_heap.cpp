@@ -122,11 +122,16 @@ void RawVectorHeap::open_existing(const std::string& path, RawVectorHeapLayout l
     _next_flat_slot = next_flat_slot;
 }
 
+// Also drops the cursor: a closed heap has nothing allocated, so a rejected
+// reopen cannot leave the previous file's cursor for allocate_slot to hand
+// out or for an index header to record.
 void RawVectorHeap::close() {
     if (_fd >= 0) {
         ::close(_fd);
         _fd = -1;
     }
+    _allocated_pages.store(0);
+    _next_flat_slot.store(0);
 }
 
 // pread/pwrite may transfer fewer bytes than asked (a signal, or a network

@@ -363,6 +363,51 @@ bool test_reopen_rejects_bad_file() {
     return t.done();
 }
 
+// A heap that was open before must not carry its cursor through close() or
+// through a reopen that is rejected, whether before the file is opened
+// (missing path) or after (bad page header). Either way allocate_slot must
+// throw instead of handing out the old file's next slot, and a rejected
+// reopen must not touch the file it looked at.
+bool test_rejected_reopen_after_use_leaves_nothing_behind() {
+    TestCase t("close() and a rejected open_existing drop the cursor of the heap that was open before");
+    std::string path = temp_path("ivf_heap_resume_stale");
+    RawVectorHeapLayout layout = compute_raw_vector_heap_layout(PAGE, ELEM);
+    const uint32_t spp = layout.slots_per_page, pages = 3, n = 2 * spp + 3;  // last page partial
+    write_closed_heap(path, layout, n);
+    std::vector<char> good = read_whole_file(path);
+    RawVectorFreeList free_list;
+
+    RawVectorHeap heap;
+    heap.open_existing(path, layout, n, pages);
+    t.check(heap.next_flat_slot() == n && heap.allocated_pages() == pages, "cursor not restored");
+    heap.close();
+    t.check(heap.next_flat_slot() == 0 && heap.allocated_pages() == 0, "close() left the cursor");
+
+    t.expect_throw("missing file", [&] { heap.open_existing(path + ".missing", layout, n, pages); });
+    t.check(heap.next_flat_slot() == 0 && heap.allocated_pages() == 0, "rejected reopen left the cursor");
+    t.expect_throw("allocate_slot after a rejected reopen", [&] { heap.allocate_slot(free_list); });
+
+    // Rejected after the fd was opened: the heap must be closed again, so the
+    // allocation attempt neither succeeds nor writes a page into the file.
+    heap.open_existing(path, layout, n, pages);
+    t.expect_throw("last page carrying another page's id", [&] {
+        patch_bytes(path, size_t(pages - 1) * PAGE, page_header_bytes(pages));
+        heap.open_existing(path, layout, n, pages);
+    });
+    t.check(heap.next_flat_slot() == 0 && heap.allocated_pages() == 0, "rejected reopen left the cursor");
+    t.expect_throw("allocate_slot after a rejected reopen", [&] { heap.allocate_slot(free_list); });
+    std::vector<char> got(ELEM);
+    t.expect_throw("read_vector after a rejected reopen", [&] { heap.read_vector(0, got.data()); });
+    patch_bytes(path, size_t(pages - 1) * PAGE, page_header_bytes(pages - 1));
+    t.check(read_whole_file(path) == good, "a rejected reopen or the allocation after it changed the file");
+
+    heap.open_existing(path, layout, n, pages);
+    t.check(heap.allocate_slot(free_list) == n, "allocation after the restored reopen skipped a slot");
+    heap.close();
+    ::unlink(path.c_str());
+    return t.done();
+}
+
 bool test_read_rejects_misplaced_page() {
     TestCase t("a page whose header names another page or geometry is rejected on read, and on bulk write");
     std::string path = temp_path("ivf_heap_misplaced");
@@ -531,6 +576,7 @@ int main() {
     all_pass &= test_open_refuses_existing_nonempty_file();
     all_pass &= test_reopen_resumes_the_heap();
     all_pass &= test_reopen_rejects_bad_file();
+    all_pass &= test_rejected_reopen_after_use_leaves_nothing_behind();
     all_pass &= test_read_rejects_misplaced_page();
     all_pass &= test_bulk_writer_matches_per_slot_writes();
     all_pass &= test_bulk_writer_rejects_misuse();

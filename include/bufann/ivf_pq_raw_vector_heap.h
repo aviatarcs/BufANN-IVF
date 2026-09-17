@@ -41,7 +41,7 @@ public:
     // page is verified when it is read.
     void open_existing(const std::string& path, RawVectorHeapLayout layout,
                        uint32_t next_flat_slot, uint32_t allocated_pages);
-    void close();
+    void close();  // afterwards next_flat_slot() == allocated_pages() == 0
 
     // Pops from free_list if possible, else grows the heap by a page as needed.
     uint32_t allocate_slot(RawVectorFreeList& free_list);
