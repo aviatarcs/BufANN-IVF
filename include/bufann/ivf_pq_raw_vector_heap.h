@@ -1,6 +1,9 @@
 // IVF-PQ raw-vector heap: fixed-size slots in fixed-size pages, addressed by
 // flat slot index (see RawVectorRID). Plain pread/pwrite, no buffer pool.
-// open() always creates a fresh heap; reopen/recovery is not implemented.
+// open() creates a fresh heap; open_existing() resumes one from the geometry
+// and allocation cursor the index file recorded. Nothing else is persisted
+// (in particular not the free list), so the heap file is only meaningful
+// together with the index file that describes it.
 
 #pragma once
 
@@ -31,17 +34,24 @@ public:
     RawVectorHeap& operator=(const RawVectorHeap&) = delete;
 
     void open(const std::string& path, RawVectorHeapLayout layout);
+
+    // Resumes a heap that open()/bulk load wrote earlier. The file must be
+    // exactly `allocated_pages` pages and its first and last page headers must
+    // carry their own ids; every other page is verified when it is read.
+    void open_existing(const std::string& path, RawVectorHeapLayout layout,
+                       uint32_t next_flat_slot, uint32_t allocated_pages);
     void close();
 
     // Pops from free_list if possible, else grows the heap by a page as needed.
     uint32_t allocate_slot(RawVectorFreeList& free_list);
     void write_vector(uint32_t flat_slot, const void* data);  // sets the occupancy bit
-    void read_vector(uint32_t flat_slot, void* out) const;
+    void read_vector(uint32_t flat_slot, void* out) const;    // throws if the page header is not the slot's page
     bool is_slot_occupied(uint32_t flat_slot) const;
     void free_slot(uint32_t flat_slot, RawVectorFreeList& free_list);  // clears the bit
 
     // Writes `num_pages` complete pages starting at `first_page_id` with one
-    // pwrite. Does not touch the allocation cursor; see RawVectorHeapBulkWriter.
+    // pwrite; each page must already carry its header. Does not touch the
+    // allocation cursor; see RawVectorHeapBulkWriter.
     void write_pages(uint32_t first_page_id, const void* pages, uint32_t num_pages);
 
     // Not safe to call concurrently with allocate_slot.
@@ -52,8 +62,10 @@ public:
     const RawVectorHeapLayout& layout() const { return _layout; }
 
 private:
+    void set_layout(RawVectorHeapLayout layout);
     void read_at(uint64_t offset, void* buf, size_t bytes, const char* what) const;
     void write_at(uint64_t offset, const void* buf, size_t bytes, const char* what);
+    void require_page_header_on_disk(uint32_t page_id) const;
     void set_occupancy_bit(uint32_t flat_slot, bool occupied);
     void require_allocated(uint32_t flat_slot) const;
     std::mutex& bitmap_mutex(uint32_t flat_slot) const {

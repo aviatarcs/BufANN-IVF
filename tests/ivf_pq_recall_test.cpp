@@ -194,23 +194,26 @@ int main(int argc, char** argv) {
         if (!synthetic) gt = load_gt(argv[3], nq);
 
         // Build, persist as the combined file, and search what loads back --
-        // the heap is reopened read-only on the file the build wrote.
+        // the heap is closed and reopened from what the index file records.
         auto t0 = std::chrono::steady_clock::now();
-        RawVectorHeap heap;
         {
             IVFPQIndex built;
             built.meta = train_ivf_centroids<float>(base_bin, nlist);
             built.heap_layout = compute_raw_vector_heap_layout(4096, uint32_t(dim) * sizeof(float));
-            heap.open(ivf_raw_vectors_path(prefix), built.heap_layout);
-            assign_ivf_clusters<float>(base_bin, built.meta, heap, built.assignments, built.rid_table);
+            RawVectorHeap build_heap;
+            build_heap.open(ivf_raw_vectors_path(prefix), built.heap_layout);
+            assign_ivf_clusters<float>(base_bin, built.meta, build_heap, built.assignments, built.rid_table);
             built.lists = build_ivf_posting_lists(built.assignments, nlist);
             train_ivf_pq_pivots<float>(base_bin, prefix, chunks, synthetic ? 0.3 : 0.0);
             encode_ivf_pq_codes<float>(base_bin, prefix, chunks);
             built.pq = load_ivf_pq(prefix);
-            built.heap_pages = heap.allocated_pages();
+            built.heap_pages = build_heap.allocated_pages();
+            built.heap_next_slot = build_heap.next_flat_slot();
             write_ivf_pq_index(prefix, built);
         }
         IVFPQIndex ix = load_ivf_pq_index(prefix);
+        RawVectorHeap heap;
+        heap.open_existing(ivf_raw_vectors_path(prefix), ix.heap_layout, ix.heap_next_slot, ix.heap_pages);
         std::cout << "build: " << std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count()
                   << " s (nlist " << nlist << ", " << chunks << " PQ chunks, N " << ix.assignments.cluster_id.size()
                   << ")" << std::endl;

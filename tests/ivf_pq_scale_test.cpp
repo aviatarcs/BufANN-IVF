@@ -144,6 +144,7 @@ int main(int argc, char** argv) {
             ix.rid_table = rid_table;
             ix.heap_layout = layout;
             ix.heap_pages = heap.allocated_pages();
+            ix.heap_next_slot = heap.next_flat_slot();
             write_ivf_pq_index(prefix, ix);
         });
         step("load index file (validating)", [&] {
@@ -151,7 +152,8 @@ int main(int argc, char** argv) {
             pq = std::move(ix.pq);
             round_trip = ix.meta.centroids == meta.centroids && ix.assignments.cluster_id == assignments.cluster_id &&
                          ix.rid_table.rid.size() == rid_table.rid.size() && ix.lists.ids == lists.ids &&
-                         ix.lists.offsets == lists.offsets && ix.heap_pages == heap.allocated_pages();
+                         ix.lists.offsets == lists.offsets && ix.heap_pages == heap.allocated_pages() &&
+                         ix.heap_next_slot == heap.next_flat_slot();
         });
 
         TestCase t("invariants over every vector");

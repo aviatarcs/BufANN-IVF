@@ -9,8 +9,17 @@ namespace diskann {
 namespace inplace {
 
 constexpr uint32_t RAW_VECTOR_PAGE_HEADER_BYTES = 8;
+constexpr uint32_t RAW_VECTOR_PAGE_MAGIC        = 0x48465649;  // "IVFH" little-endian
 
-// Page layout: [header][occupancy bitmap, 1 bit per slot, LSB first][slot 0..N-1][pad].
+// Every page starts with its own id, so a page read from the wrong offset
+// (a spliced, truncated-and-regrown, or foreign file) is detected on read.
+struct RawVectorPageHeader {
+    uint32_t magic   = 0;
+    uint32_t page_id = 0;
+};
+static_assert(sizeof(RawVectorPageHeader) == RAW_VECTOR_PAGE_HEADER_BYTES, "page header is part of the file format");
+
+// Page layout: [RawVectorPageHeader][occupancy bitmap, 1 bit per slot, LSB first][slot 0..N-1][pad].
 struct RawVectorHeapLayout {
     uint32_t page_size      = 0;
     uint32_t elem_size      = 0;

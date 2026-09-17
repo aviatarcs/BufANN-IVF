@@ -36,10 +36,29 @@ RawVectorHeapLayout compute_raw_vector_heap_layout(uint32_t page_size, uint32_t 
     return layout;
 }
 
+namespace {
+
+void stamp_page_header(void* page, uint32_t page_id) {
+    RawVectorPageHeader h;
+    h.magic = RAW_VECTOR_PAGE_MAGIC;
+    h.page_id = page_id;
+    std::memcpy(page, &h, sizeof(h));
+}
+
+void require_page_header(const void* page, uint32_t page_id) {
+    RawVectorPageHeader h;
+    std::memcpy(&h, page, sizeof(h));
+    IVF_PQ_REQUIRE(h.magic == RAW_VECTOR_PAGE_MAGIC,
+                   "raw-vector heap page " + std::to_string(page_id) + " does not carry a page header");
+    IVF_PQ_REQUIRE(h.page_id == page_id, "raw-vector heap page " + std::to_string(page_id) +
+                                             " carries the header of page " + std::to_string(h.page_id));
+}
+
+}  // namespace
+
 RawVectorHeap::~RawVectorHeap() { close(); }
 
-void RawVectorHeap::open(const std::string& path, RawVectorHeapLayout layout) {
-    close();
+void RawVectorHeap::set_layout(RawVectorHeapLayout layout) {
     IVF_PQ_REQUIRE(layout.slots_per_page > 0 && layout.elem_size > 0 &&
                        layout.slots_offset == RAW_VECTOR_PAGE_HEADER_BYTES + layout.bitmap_bytes &&
                        layout.bitmap_bytes * 8 >= layout.slots_per_page &&
@@ -47,16 +66,54 @@ void RawVectorHeap::open(const std::string& path, RawVectorHeapLayout layout) {
                            layout.page_size,
                    "raw-vector heap layout is inconsistent; use compute_raw_vector_heap_layout");
     _layout = layout;
+}
+
+void RawVectorHeap::open(const std::string& path, RawVectorHeapLayout layout) {
+    close();
+    set_layout(layout);
 
     struct stat st;
     IVF_PQ_REQUIRE(::stat(path.c_str(), &st) != 0 || st.st_size == 0,
                    "Refusing to overwrite existing non-empty raw-vector heap file "
-                   "(reopen/recovery not yet supported): " + path);
+                   "(use open_existing to resume it): " + path);
 
     _fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
     IVF_PQ_REQUIRE(_fd >= 0, "Failed to open raw-vector heap file: " + path);
     _allocated_pages = 0;
     _next_flat_slot = 0;
+}
+
+void RawVectorHeap::open_existing(const std::string& path, RawVectorHeapLayout layout,
+                                  uint32_t next_flat_slot, uint32_t allocated_pages) {
+    close();
+    set_layout(layout);
+    IVF_PQ_REQUIRE(uint64_t(next_flat_slot) <= uint64_t(allocated_pages) * _layout.slots_per_page,
+                   "slot cursor lies past the allocated pages");
+
+    struct stat st;
+    IVF_PQ_REQUIRE(::stat(path.c_str(), &st) == 0, "file not found: " + path);
+    const uint64_t expected_bytes = uint64_t(allocated_pages) * _layout.page_size;
+    IVF_PQ_REQUIRE(uint64_t(st.st_size) == expected_bytes,
+                   "raw-vector heap " + path + " is " + std::to_string(st.st_size) + " bytes, not the " +
+                       std::to_string(allocated_pages) + " pages of " + std::to_string(_layout.page_size) +
+                       " bytes recorded");
+
+    _fd = ::open(path.c_str(), O_RDWR);
+    IVF_PQ_REQUIRE(_fd >= 0, "Failed to open raw-vector heap file: " + path);
+
+    // The last page's id also disagrees when the file was written with a
+    // different page_size, which the size check alone cannot see.
+    if (allocated_pages > 0) {
+        try {
+            require_page_header_on_disk(0);
+            require_page_header_on_disk(allocated_pages - 1);
+        } catch (...) {
+            close();
+            throw;
+        }
+    }
+    _allocated_pages = allocated_pages;
+    _next_flat_slot = next_flat_slot;
 }
 
 void RawVectorHeap::close() {
@@ -91,6 +148,12 @@ void RawVectorHeap::require_allocated(uint32_t flat_slot) const {
                    "raw-vector slot " + std::to_string(flat_slot) + " is past the allocated pages");
 }
 
+void RawVectorHeap::require_page_header_on_disk(uint32_t page_id) const {
+    char header[RAW_VECTOR_PAGE_HEADER_BYTES];
+    read_at(_layout.page_offset(page_id), header, sizeof(header), "read raw-vector page header");
+    require_page_header(header, page_id);
+}
+
 uint32_t RawVectorHeap::allocate_slot(RawVectorFreeList& free_list) {
     {
         std::lock_guard<std::mutex> lg(free_list.mtx);
@@ -109,8 +172,9 @@ uint32_t RawVectorHeap::allocate_slot(RawVectorFreeList& free_list) {
     // Extend the file before publishing the slot, so a reader that sees the
     // new cursor also sees the page.
     while (allocated_pages() <= _layout.page_of(flat)) {
-        std::vector<char> zero_page(_layout.page_size, 0);
-        write_at(_layout.page_offset(allocated_pages()), zero_page.data(), _layout.page_size,
+        std::vector<char> page(_layout.page_size, 0);
+        stamp_page_header(page.data(), allocated_pages());
+        write_at(_layout.page_offset(allocated_pages()), page.data(), _layout.page_size,
                  "extend raw-vector heap file");
         _allocated_pages.fetch_add(1);
     }
@@ -124,9 +188,17 @@ void RawVectorHeap::write_vector(uint32_t flat_slot, const void* data) {
     set_occupancy_bit(flat_slot, true);
 }
 
+// One pread from the page start through the slot, so checking the header
+// costs no second system call; it copies at most a page instead of a slot.
 void RawVectorHeap::read_vector(uint32_t flat_slot, void* out) const {
     require_allocated(flat_slot);
-    read_at(_layout.slot_offset(flat_slot), out, _layout.elem_size, "read raw vector");
+    const uint32_t page_id = _layout.page_of(flat_slot);
+    const uint32_t slot_in_page = _layout.slot_offset_in_page(_layout.index_in_page(flat_slot));
+    thread_local std::vector<char> prefix;
+    prefix.resize(size_t(slot_in_page) + _layout.elem_size);
+    read_at(_layout.page_offset(page_id), prefix.data(), prefix.size(), "read raw vector");
+    require_page_header(prefix.data(), page_id);
+    std::memcpy(out, prefix.data() + slot_in_page, _layout.elem_size);
 }
 
 bool RawVectorHeap::is_slot_occupied(uint32_t flat_slot) const {
@@ -156,6 +228,9 @@ void RawVectorHeap::set_occupancy_bit(uint32_t flat_slot, bool occupied) {
 }
 
 void RawVectorHeap::write_pages(uint32_t first_page_id, const void* pages, uint32_t num_pages) {
+    for (uint32_t p = 0; p < num_pages; ++p) {
+        require_page_header(static_cast<const char*>(pages) + size_t(p) * _layout.page_size, first_page_id + p);
+    }
     write_at(_layout.page_offset(first_page_id), pages, size_t(num_pages) * _layout.page_size,
              "bulk-write raw-vector heap pages");
 }
@@ -186,7 +261,11 @@ uint32_t RawVectorHeapBulkWriter::append(const void* data) {
     uint32_t flat = _next_flat_slot++;
     uint32_t in_buf = slots_in_buffer() - 1;
     uint32_t index = in_buf % _layout.slots_per_page;
-    char* page = _buf.data() + size_t(in_buf / _layout.slots_per_page) * _layout.page_size;
+    uint32_t page_in_buf = in_buf / _layout.slots_per_page;
+    char* page = _buf.data() + size_t(page_in_buf) * _layout.page_size;
+    if (index == 0) {
+        stamp_page_header(page, _first_page_in_buf + page_in_buf);
+    }
     std::memcpy(page + _layout.slot_offset_in_page(index), data, _layout.elem_size);
     page[_layout.bitmap_byte_in_page(index)] |= _layout.bitmap_mask(index);
 
