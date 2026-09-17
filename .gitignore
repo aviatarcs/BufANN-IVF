@@ -385,3 +385,4 @@ eval_cached/
 .build-env
 logs
 build
+.nfs*
