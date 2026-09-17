@@ -380,3 +380,8 @@ eval_cached/
 /results/
 /datasets/
 /indexes/
+
+# Autonomous-agent tooling
+.build-env
+logs
+build

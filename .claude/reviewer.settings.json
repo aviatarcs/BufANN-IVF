@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "defaultMode": "default",
+    "deny": [
+      "Edit(include/**)", "Edit(src/**)", "Edit(tests/**)", "Edit(scripts/**)", "Edit(CMakeLists.txt)",
+      "Write(include/**)", "Write(src/**)", "Write(tests/**)", "Write(scripts/**)",
+      "Bash(git add *)", "Bash(git commit *)", "Bash(git push *)", "Bash(git checkout *)", "Bash(git stash *)"
+    ]
+  }
+}

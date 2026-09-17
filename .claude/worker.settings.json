@@ -1,0 +1,12 @@
+{
+  "permissions": { "defaultMode": "acceptEdits" },
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          { "type": "command", "command": "scripts/check_stop.sh", "timeout": 30 }
+        ]
+      }
+    ]
+  }
+}
