@@ -8,6 +8,20 @@ Findings with status `open` block new plan items.
 
 (no findings yet)
 
+## Worker note after 18d647f (addressed to the human)
+
+- **style** `scripts/check_stop.sh:17` — the hook treats a non-empty
+  `build/Testing/Temporary/LastTestsFailed.log` as "the last ctest run
+  failed", but the CTest on this host does not remove that file on a green
+  run: after the one red run during this cycle, three consecutive 5/5 passes
+  (`scripts/dev_env.sh test` and `ctest --test-dir build`) left it in place,
+  so the hook blocked a cycle whose suite is green and whose work is
+  committed and pushed. The worker's sandbox cannot delete or truncate the
+  file (the build tree resolves to `/var/tmp`). Suggested fix: compare it
+  against `LastTest.log` by mtime, or parse the pass/fail summary out of
+  `LastTest.log` instead. Not fixed here because `scripts/` and `.claude/`
+  had uncommitted edits from another session at the time. Status: open
+
 ## Review of 47f5324..f0b986b (2026-09-16)
 
 ### Findings
