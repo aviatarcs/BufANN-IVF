@@ -34,38 +34,34 @@ void select_smallest(const std::vector<float>& values, uint32_t m, std::vector<u
     order.resize(m);
 }
 
+// O(1) shape checks, run on every query; the structural invariants (sorted
+// offsets, ids in range, RIDs inside the heap) are the loader's job.
 void require_consistent(const IVFPQIndex& ix) {
     const size_t n = ix.assignments.cluster_id.size();
     IVF_PQ_REQUIRE(ix.meta.nlist > 0 && ix.meta.dim > 0 && ix.meta.aligned_dim >= ix.meta.dim &&
-                       ix.meta.centroids.size() == size_t(ix.meta.nlist) * ix.meta.aligned_dim,
-                   "IVFMetadata is inconsistent");
+                       ix.meta.centroids.size() == size_t(ix.meta.nlist) * ix.meta.aligned_dim &&
+                       ix.meta.centroid_l2sq.size() == ix.meta.nlist,
+                   "IVFMetadata is inconsistent (centroid_l2sq must be set; see set_ivf_centroid_norms)");
     IVF_PQ_REQUIRE(ix.pq.chunks > 0 && ix.pq.k > 0 && ix.pq.chunks * ix.pq.chunk_dim == ix.meta.dim &&
                        ix.pq.pivots.size() == size_t(ix.pq.chunks) * ix.pq.k * ix.pq.chunk_dim &&
                        ix.pq.codes.size() == n * ix.pq.chunks,
                    "PQMetadata is inconsistent with the index");
     IVF_PQ_REQUIRE(ix.lists.offsets.size() == size_t(ix.meta.nlist) + 1 && ix.lists.offsets.front() == 0 &&
-                       ix.lists.offsets.back() == n && ix.lists.ids.size() == n &&
-                       std::is_sorted(ix.lists.offsets.begin(), ix.lists.offsets.end()),
+                       ix.lists.offsets.back() == n && ix.lists.ids.size() == n,
                    "PostingLists are inconsistent with the index");
     IVF_PQ_REQUIRE(ix.rid_table.rid.size() == n, "RID table does not cover every vector");
 }
 
-}  // namespace
-
-void IVFPQSearchScratch::prepare(const IVFPQIndex& index) {
-    require_consistent(index);
+void size_scratch(IVFPQSearchScratch& s, const IVFPQIndex& index) {
     const IVFMetadata& meta = index.meta;
-    _centroid_l2sq.resize(meta.nlist);
-    for (uint32_t c = 0; c < meta.nlist; ++c) {
-        _centroid_l2sq[c] = l2sq(meta.centroids.data() + size_t(c) * meta.aligned_dim, meta.dim);
-    }
-    query_padded.assign(meta.aligned_dim, 0.0f);
-    centroid_dist.resize(meta.nlist);
-    probe_order.resize(meta.nlist);
-    pq_table.resize(size_t(index.pq.chunks) * index.pq.k);
-    vector.resize(meta.dim);
-    _index = &index;
+    s.query_padded.assign(meta.aligned_dim, 0.0f);
+    s.centroid_dist.resize(meta.nlist);
+    s.probe_order.resize(meta.nlist);
+    s.pq_table.resize(size_t(index.pq.chunks) * index.pq.k);
+    s.vector.resize(meta.dim);
 }
+
+}  // namespace
 
 template<typename T>
 IVFPQSearchResult ivf_pq_search(const IVFPQIndex& ix, const RawVectorHeap& heap, const float* query,
@@ -75,7 +71,8 @@ IVFPQSearchResult ivf_pq_search(const IVFPQIndex& ix, const RawVectorHeap& heap,
     IVF_PQ_REQUIRE(k > 0, "k must be greater than zero");
     IVF_PQ_REQUIRE(nprobe > 0, "nprobe must be greater than zero");
     IVF_PQ_REQUIRE(rerank_m == 0 || rerank_m >= k, "rerank_m must be 0 (no re-rank) or at least k");
-    if (!scratch.prepared_for(ix)) scratch.prepare(ix);
+    require_consistent(ix);
+    size_scratch(scratch, ix);
     const IVFMetadata& meta = ix.meta;
     const PQMetadata& pq = ix.pq;
     const uint32_t dim = meta.dim;
@@ -87,7 +84,7 @@ IVFPQSearchResult ivf_pq_search(const IVFPQIndex& ix, const RawVectorHeap& heap,
     std::copy_n(query, dim, scratch.query_padded.begin());
     const float q_l2sq = l2sq(query, dim);
     for (uint32_t c = 0; c < meta.nlist; ++c) {
-        scratch.centroid_dist[c] = q_l2sq + scratch.centroid_l2sq()[c];
+        scratch.centroid_dist[c] = q_l2sq + meta.centroid_l2sq[c];
     }
     const MKL_INT nlist = meta.nlist, aligned_dim = meta.aligned_dim;
     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, 1, nlist, aligned_dim, -2.0f, scratch.query_padded.data(),

@@ -230,6 +230,7 @@ IVFPQIndex load_ivf_pq_index(const std::string& index_prefix) {
     index.meta.dim = h.dim;
     index.meta.aligned_dim = h.aligned_dim;
     index.meta.centroids = in.read<float>(h.centroids_offset, h.centroids_bytes, "centroids");
+    set_ivf_centroid_norms(index.meta);
     index.assignments.cluster_id = in.read<uint32_t>(h.cluster_assignments_offset, h.cluster_assignments_bytes, "cluster ids");
     index.lists.offsets = in.read<uint32_t>(h.posting_offsets_offset, h.posting_offsets_bytes, "posting offsets");
     index.lists.ids = in.read<uint32_t>(h.posting_ids_offset, h.posting_ids_bytes, "posting ids");

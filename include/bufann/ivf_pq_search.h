@@ -22,16 +22,10 @@ struct IVFPQSearchResult {
     std::vector<float> dists;
 };
 
-// Buffers one thread reuses across queries. Holds the centroid norms of the
-// index it was last prepared for; ivf_pq_search re-prepares on a different
-// index, so a scratch must not be shared between threads.
-class IVFPQSearchScratch {
-public:
-    void prepare(const IVFPQIndex& index);
-    bool prepared_for(const IVFPQIndex& index) const { return _index == &index; }
-
-    const std::vector<float>& centroid_l2sq() const { return _centroid_l2sq; }
-
+// Buffers one thread reuses across queries; sized to the index on every
+// search (no-ops once they fit), so a scratch may be used on any index but
+// not shared between threads.
+struct IVFPQSearchScratch {
     std::vector<float> query_padded;    // [aligned_dim], zero beyond dim
     std::vector<float> centroid_dist;   // [nlist]
     std::vector<uint32_t> probe_order;  // [nlist] partition ids, nearest first
@@ -43,10 +37,6 @@ public:
     std::vector<float> exact_dist;      // parallel to shortlist
     std::vector<char> raw_vector;       // [heap elem_size]
     std::vector<float> vector;          // [dim]
-
-private:
-    const IVFPQIndex* _index = nullptr;
-    std::vector<float> _centroid_l2sq;  // [nlist]
 };
 
 // T is the raw vector element type the heap holds (float, uint8_t, int8_t);

@@ -325,7 +325,7 @@ bool test_inactive_rid_is_dropped(const std::string& tag, const Built& b, const 
 }
 
 bool test_scratch_follows_index(const Built& a, const Built& b, const std::vector<float>& queries) {
-    TestCase t("a scratch prepared for one index re-prepares for another");
+    TestCase t("one scratch used across two indexes gives each index's own results");
     const float* query = queries.data();
     IVFPQSearchScratch scratch;
     IVFPQSearchResult on_a = ivf_pq_search<float>(a.index, a.heap, query, K, 4, RERANK_M, scratch);
@@ -336,6 +336,19 @@ bool test_scratch_follows_index(const Built& a, const Built& b, const std::vecto
     t.check(on_b.ids == fresh_b.ids && on_b.dists == fresh_b.dists, "reused scratch gave a different result on b");
     t.check(on_a.ids == fresh_a.ids && on_a_again.ids == fresh_a.ids && on_a_again.dists == fresh_a.dists,
             "reused scratch gave a different result back on a");
+
+    // Same index object, centroids replaced in place (what a rebuild that
+    // reuses storage does): nothing cached per scratch may survive that.
+    IVFPQIndex& ix = const_cast<IVFPQIndex&>(a.index);
+    const IVFMetadata original = ix.meta;
+    for (float& v : ix.meta.centroids) v = -v;
+    set_ivf_centroid_norms(ix.meta);
+    IVFPQSearchResult mutated = ivf_pq_search<float>(ix, a.heap, query, K, 4, RERANK_M, scratch);
+    IVFPQSearchResult fresh_mutated = ivf_pq_search<float>(ix, a.heap, query, K, 4, RERANK_M);
+    ix.meta = original;
+    t.check(mutated.ids == fresh_mutated.ids && mutated.dists == fresh_mutated.dists,
+            "reused scratch gave a different result after the index's centroids changed in place");
+    t.check(mutated.ids != fresh_a.ids, "negated centroids should probe different partitions");
     return t.done();
 }
 

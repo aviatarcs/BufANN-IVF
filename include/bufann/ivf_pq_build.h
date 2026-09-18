@@ -48,6 +48,10 @@ IVFMetadata train_ivf_centroids(const std::string& data_bin,
                                 uint32_t max_kmeans_reps = NUM_K_MEANS_ITERS,
                                 std::optional<uint32_t> seed = std::nullopt);
 
+// Fills meta.centroid_l2sq from meta.centroids. Every producer of an
+// IVFMetadata calls this; search relies on the norms matching the centroids.
+void set_ivf_centroid_norms(IVFMetadata& meta);
+
 // [nlist x aligned_dim] float bin. `dim` is the unpadded dimensionality,
 // which the file does not record.
 void save_ivf_centroids(const std::string& index_prefix, const IVFMetadata& meta);

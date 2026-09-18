@@ -22,7 +22,8 @@ struct IVFMetadata {
     uint32_t nlist       = 0;
     uint32_t dim         = 0;
     uint32_t aligned_dim = 0;
-    std::vector<float> centroids;  // shape: [nlist, aligned_dim]
+    std::vector<float> centroids;      // shape: [nlist, aligned_dim]
+    std::vector<float> centroid_l2sq;  // shape: [nlist]; set by set_ivf_centroid_norms
 };
 
 // ClusterAssignments: centroid index per vector, indexed by internal ID

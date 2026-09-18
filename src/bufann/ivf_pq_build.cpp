@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <limits>
 #include <memory>
+#include <numeric>
 #include <random>
 #include <vector>
 
@@ -100,7 +101,8 @@ std::vector<U> load_bin_section(const std::string& path, size_t offset, size_t& 
 
 void require_valid(const IVFMetadata& meta) {
     IVF_PQ_REQUIRE(meta.nlist > 0 && meta.dim > 0 && meta.aligned_dim >= meta.dim &&
-                       meta.centroids.size() == size_t(meta.nlist) * meta.aligned_dim,
+                       meta.centroids.size() == size_t(meta.nlist) * meta.aligned_dim &&
+                       meta.centroid_l2sq.size() == meta.nlist,
                    "IVFMetadata is inconsistent");
 }
 
@@ -116,6 +118,14 @@ std::vector<uint32_t> load_u32_column(const std::string& path) {
 }
 
 }  // namespace
+
+void set_ivf_centroid_norms(IVFMetadata& meta) {
+    meta.centroid_l2sq.resize(meta.nlist);
+    for (uint32_t c = 0; c < meta.nlist; ++c) {
+        const float* centroid = meta.centroids.data() + size_t(c) * meta.aligned_dim;
+        meta.centroid_l2sq[c] = std::inner_product(centroid, centroid + meta.dim, centroid, 0.0f);
+    }
+}
 
 template<typename T>
 IVFMetadata train_ivf_centroids(const std::string& data_bin, uint32_t nlist,
@@ -146,6 +156,7 @@ IVFMetadata train_ivf_centroids(const std::string& data_bin, uint32_t nlist,
     meta.aligned_dim = align_dim(uint32_t(dim));
     meta.centroids.assign(size_t(nlist) * meta.aligned_dim, 0.0f);
     copy_rows(centers.data(), dim, meta.centroids.data(), meta.aligned_dim, nlist, dim);
+    set_ivf_centroid_norms(meta);
     return meta;
 }
 
@@ -164,6 +175,7 @@ IVFMetadata load_ivf_centroids(const std::string& index_prefix, uint32_t dim) {
     meta.nlist = uint32_t(nlist);
     meta.dim = dim;
     meta.aligned_dim = uint32_t(aligned_dim);
+    set_ivf_centroid_norms(meta);
     require_valid(meta);
     return meta;
 }
