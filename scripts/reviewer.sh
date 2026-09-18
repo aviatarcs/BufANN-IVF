@@ -8,7 +8,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/agent_lib.sh"
 cd "$REPO" && mkdir -p logs
 BRANCH="${REVIEW_BRANCH:-agent/work}"
 STATE="logs/reviewer.last"
-WT="$(ensure_worktree reviewer "review/scratch")"
+WT="$(ensure_worktree reviewer)"
 git -C "$REPO" fetch -q origin
 [[ -f "$STATE" ]] || git rev-parse "origin/$BRANCH" > "$STATE"
 while [[ ! -f logs/STOP ]]; do
@@ -16,6 +16,11 @@ while [[ ! -f logs/STOP ]]; do
     last="$(cat "$STATE")"; head="$(git rev-parse "origin/$BRANCH")"
     # Skip ranges that consist only of the reviewer's own commits.
     if [[ "$head" != "$last" ]] && git log --format=%s "$last..$head" | grep -qv '^Review '; then
+        wait="$(usage_limit_wait)"
+        if (( wait > 0 )); then
+            echo "usage window exhausted; sleeping ${wait}s until it resets ($(date -Is))" | tee -a logs/reviewer.log
+            sleep "$wait"; continue
+        fi
         echo "=== reviewing $last..$head $(date -Is) in $WT ===" | tee -a logs/reviewer.log
         git -C "$WT" fetch -q origin && git -C "$WT" checkout -q --detach "$head"
         rm -f "$WT/REVIEW.out"

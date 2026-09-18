@@ -8,6 +8,11 @@ cd "$REPO" && mkdir -p logs
 WT="$(ensure_worktree worker agent/work)"
 PROMPT="$(cat "$REPO/.claude/prompts/worker.md")"
 while [[ ! -f logs/STOP ]]; do
+    wait="$(usage_limit_wait)"
+    if (( wait > 0 )); then
+        echo "usage window exhausted; sleeping ${wait}s until it resets ($(date -Is))" | tee -a logs/worker.log
+        sleep "$wait"; continue
+    fi
     echo "=== worker cycle $(date -Is) in $WT ===" | tee -a logs/worker.log
     git -C "$WT" fetch -q origin && git -C "$WT" pull -q --ff-only origin agent/work 2>&1 | tee -a logs/worker.log
     run_cycle "$WT" "$WT/.claude/worker.settings.json" "$PROMPT" "$REPO/logs/worker.log" "${WORKER_TIMEOUT:-7200}"
