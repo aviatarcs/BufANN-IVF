@@ -7,9 +7,11 @@
 #include "ivf_pq_test_util.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <fstream>
 #include <iterator>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -408,6 +410,75 @@ bool test_rejected_reopen_after_use_leaves_nothing_behind() {
     return t.done();
 }
 
+// Atomically points `path` at the file `target` (a hard link, so the inode
+// the heap opens is `target`'s even while `path` keeps changing).
+void relink(const std::string& path, const std::string& target) {
+    std::string tmp = path + ".relink";
+    ::unlink(tmp.c_str());
+    if (::link(target.c_str(), tmp.c_str()) != 0 || ::rename(tmp.c_str(), path.c_str()) != 0) {
+        throw std::runtime_error("relink failed");
+    }
+}
+
+// The size open_existing accepts must belong to the descriptor it reads
+// through, not to whatever the path named an instant earlier. Two files
+// share the path by turns: the heap itself, and a copy one byte longer whose
+// slot 1 holds other bytes but whose first and last page headers are intact,
+// so nothing after the size check tells the two apart. Every open must
+// either be refused or read the true slot 1. Checking the size with
+// stat(path) before open() lets the copy through whenever the swap lands in
+// between; over this many attempts that window is hit reliably.
+bool test_reopen_sizes_the_file_it_opened() {
+    TestCase t("open_existing checks the size of the file it opened, not of the path it was given");
+    std::string path = temp_path("ivf_heap_swap");
+    std::string good = path + ".good", longer = path + ".longer";
+    RawVectorHeapLayout layout = compute_raw_vector_heap_layout(PAGE, ELEM);
+    const uint32_t spp = layout.slots_per_page, pages = 2, n = pages * spp;
+    write_closed_heap(good, layout, n);
+    std::vector<char> bytes = read_whole_file(good);
+    std::vector<char> other = pattern(n + 1);
+    std::copy(other.begin(), other.end(), bytes.begin() + layout.slot_offset(1));
+    bytes.push_back(0);
+    ::unlink(longer.c_str());
+    std::ofstream(longer, std::ios::binary).write(bytes.data(), std::streamsize(bytes.size()));
+    ::unlink(path.c_str());
+    relink(path, good);
+
+    std::atomic<bool> stop{false};
+    std::thread swapper([&] {
+        while (!stop.load()) {
+            relink(path, longer);
+            relink(path, good);
+        }
+    });
+
+    RawVectorHeap heap;
+    std::vector<char> got(ELEM);
+    uint32_t accepted = 0, refused = 0, wrong = 0;
+    for (uint32_t attempt = 0; attempt < 20000; ++attempt) {
+        try {
+            heap.open_existing(path, layout, n, pages);
+        } catch (const diskann::ANNException&) {
+            ++refused;
+            continue;
+        }
+        ++accepted;
+        heap.read_vector(1, got.data());
+        wrong += got != pattern(1);
+        heap.close();
+    }
+    stop.store(true);
+    swapper.join();
+
+    t.check(accepted > 0 && refused > 0, "the swap never raced an open (" + std::to_string(accepted) +
+                                              " accepted, " + std::to_string(refused) + " refused)");
+    t.check(wrong == 0, std::to_string(wrong) + " opens accepted the longer file and read its slot 1");
+    ::unlink(path.c_str());
+    ::unlink(good.c_str());
+    ::unlink(longer.c_str());
+    return t.done();
+}
+
 bool test_read_rejects_misplaced_page() {
     TestCase t("a page whose header names another page or geometry is rejected on read, and on bulk write");
     std::string path = temp_path("ivf_heap_misplaced");
@@ -577,6 +648,7 @@ int main() {
     all_pass &= test_reopen_resumes_the_heap();
     all_pass &= test_reopen_rejects_bad_file();
     all_pass &= test_rejected_reopen_after_use_leaves_nothing_behind();
+    all_pass &= test_reopen_sizes_the_file_it_opened();
     all_pass &= test_read_rejects_misplaced_page();
     all_pass &= test_bulk_writer_matches_per_slot_writes();
     all_pass &= test_bulk_writer_rejects_misuse();

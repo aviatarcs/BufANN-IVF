@@ -5,6 +5,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <cstring>
 
 #include "bufann/ivf_pq_require.h"
@@ -95,28 +96,31 @@ void RawVectorHeap::open_existing(const std::string& path, RawVectorHeapLayout l
     IVF_PQ_REQUIRE(uint64_t(next_flat_slot) <= uint64_t(allocated_pages) * _layout.slots_per_page,
                    "slot cursor lies past the allocated pages");
 
-    struct stat st;
-    IVF_PQ_REQUIRE(::stat(path.c_str(), &st) == 0, "file not found: " + path);
-    const uint64_t expected_bytes = uint64_t(allocated_pages) * _layout.page_size;
-    IVF_PQ_REQUIRE(uint64_t(st.st_size) == expected_bytes,
-                   "raw-vector heap " + path + " is " + std::to_string(st.st_size) + " bytes, not the " +
-                       std::to_string(allocated_pages) + " pages of " + std::to_string(_layout.page_size) +
-                       " bytes recorded");
-
     _fd = ::open(path.c_str(), O_RDWR);
-    IVF_PQ_REQUIRE(_fd >= 0, "Failed to open raw-vector heap file: " + path);
+    const int open_errno = errno;
+    IVF_PQ_REQUIRE(_fd >= 0,
+                   (open_errno == ENOENT ? "file not found: " : "Failed to open raw-vector heap file: ") + path);
 
-    // The headers carry the geometry, so a file written with another
-    // page_size or elem_size is refused here even when its byte count and
+    // Everything from here on is checked through _fd, not the path: the size
+    // of whatever the path names now is no evidence about the file this heap
+    // will read. The headers carry the geometry, so a file written with
+    // another page_size or elem_size is refused even when its byte count and
     // page ids happen to line up with this layout.
-    if (allocated_pages > 0) {
-        try {
+    try {
+        struct stat st;
+        IVF_PQ_REQUIRE(::fstat(_fd, &st) == 0, "Failed to stat raw-vector heap file: " + path);
+        const uint64_t expected_bytes = uint64_t(allocated_pages) * _layout.page_size;
+        IVF_PQ_REQUIRE(uint64_t(st.st_size) == expected_bytes,
+                       "raw-vector heap " + path + " is " + std::to_string(st.st_size) + " bytes, not the " +
+                           std::to_string(allocated_pages) + " pages of " + std::to_string(_layout.page_size) +
+                           " bytes recorded");
+        if (allocated_pages > 0) {
             require_page_header_on_disk(0);
             require_page_header_on_disk(allocated_pages - 1);
-        } catch (...) {
-            close();
-            throw;
         }
+    } catch (...) {
+        close();
+        throw;
     }
     _allocated_pages = allocated_pages;
     _next_flat_slot = next_flat_slot;
