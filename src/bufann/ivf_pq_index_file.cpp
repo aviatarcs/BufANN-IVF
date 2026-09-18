@@ -41,6 +41,7 @@ IVFPQIndexFileHeader make_header(const IVFPQIndex& index) {
     h.raw_vector_elem_size = index.heap_layout.elem_size;
     h.raw_vector_page_size = index.heap_layout.page_size;
     h.raw_vectors_bytes = uint64_t(index.heap_pages) * index.heap_layout.page_size;
+    h.raw_vector_next_slot = index.heap_next_slot;
 
     uint64_t next = sizeof(IVFPQIndexFileHeader);
     auto place = [&](uint64_t& offset, uint64_t& bytes, uint64_t n) {
@@ -149,13 +150,15 @@ void require_header(const IVFPQIndexFileHeader& h, const std::string& path) {
     IVF_PQ_REQUIRE(h.num_vectors <= uint64_t(RAW_VECTOR_RID_SLOT_MASK) + 1,
                    "IVF-PQ index header num_vectors exceeds the RID slot space");
     IVF_PQ_REQUIRE(h.raw_vector_elem_size > 0 && h.raw_vector_elem_size % h.dim == 0 &&
-                       h.raw_vector_page_size > 0 && h.raw_vectors_bytes % h.raw_vector_page_size == 0,
+                       h.raw_vector_page_size > 0 && h.raw_vectors_bytes % h.raw_vector_page_size == 0 &&
+                       h.raw_vectors_bytes / h.raw_vector_page_size <= UINT32_MAX &&
+                       h.raw_vector_next_slot <= uint64_t(RAW_VECTOR_RID_SLOT_MASK) + 1,
                    "IVF-PQ index header has an invalid raw-vector heap descriptor");
     require_section_sizes(h);
 }
 
-// Posting lists are the exact inverse of the cluster ids; RIDs point into
-// the heap's allocated slots.
+// Posting lists are the exact inverse of the cluster ids; RIDs point below
+// the heap's allocation cursor, which lies within its allocated pages.
 void require_consistent(const IVFPQIndex& index) {
     const size_t n = index.assignments.cluster_id.size();
     const uint32_t nlist = index.meta.nlist;
@@ -180,9 +183,10 @@ void require_consistent(const IVFPQIndex& index) {
     }
 
     const uint64_t slots = uint64_t(index.heap_pages) * index.heap_layout.slots_per_page;
+    IVF_PQ_REQUIRE(index.heap_next_slot <= slots, "heap slot cursor lies past the heap's allocated pages");
     for (size_t i = 0; i < n; ++i) {
-        IVF_PQ_REQUIRE(rid_flat_slot(index.rid_table.rid[i]) < slots,
-                       "RID of vector " + std::to_string(i) + " lies past the heap's allocated slots");
+        IVF_PQ_REQUIRE(rid_flat_slot(index.rid_table.rid[i]) < index.heap_next_slot,
+                       "RID of vector " + std::to_string(i) + " lies at or past the heap's slot cursor");
     }
 }
 
@@ -240,6 +244,7 @@ IVFPQIndex load_ivf_pq_index(const std::string& index_prefix) {
 
     index.heap_layout = compute_raw_vector_heap_layout(h.raw_vector_page_size, h.raw_vector_elem_size);
     index.heap_pages = uint32_t(h.raw_vectors_bytes / h.raw_vector_page_size);
+    index.heap_next_slot = uint32_t(h.raw_vector_next_slot);
     require_consistent(index);
 
     const std::string heap_path = ivf_raw_vectors_path(index_prefix);

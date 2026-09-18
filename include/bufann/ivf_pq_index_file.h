@@ -11,7 +11,8 @@
 //   [rid table       u32  N]
 //
 // The raw vectors stay in the heap file next to it; the header records the
-// heap's geometry and size. The file is written to a temporary name and
+// heap's geometry, size and allocation cursor, enough to reopen it with
+// RawVectorHeap::open_existing. The file is written to a temporary name and
 // renamed into place, so a crash leaves the previous file or none.
 
 #pragma once

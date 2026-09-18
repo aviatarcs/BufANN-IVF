@@ -496,8 +496,9 @@ void patch(const std::string& path, uint64_t offset, T value) {
     f.write(reinterpret_cast<const char*>(&value), sizeof(value));
 }
 
-bool test_index_file(const std::string& prefix, const std::string& base_bin, const IVFMetadata& meta) {
-    TestCase t("combined index file round-trips, replaces atomically, and rejects corruption");
+bool test_index_file(const std::string& prefix, const std::string& base_bin, const std::vector<float>& data,
+                     const IVFMetadata& meta) {
+    TestCase t("combined index file round-trips, reopens the heap, replaces atomically, and rejects corruption");
     std::string pre = prefix + "_index";
     IVFPQIndex ix;
     ix.meta = meta;
@@ -507,6 +508,7 @@ bool test_index_file(const std::string& prefix, const std::string& base_bin, con
         heap.open(ivf_raw_vectors_path(pre), ix.heap_layout);
         assign_ivf_clusters<float>(base_bin, meta, heap, ix.assignments, ix.rid_table);
         ix.heap_pages = heap.allocated_pages();
+        ix.heap_next_slot = heap.next_flat_slot();
     }
     ix.lists = build_ivf_posting_lists(ix.assignments, meta.nlist);
     train_ivf_pq_pivots<float>(base_bin, pre, 4, 1.0, NUM_K_MEANS_ITERS, TRAIN_SEED);
@@ -533,8 +535,24 @@ bool test_index_file(const std::string& prefix, const std::string& base_bin, con
                 loaded.pq.k == ix.pq.k && loaded.pq.pivots == ix.pq.pivots && loaded.pq.codes == ix.pq.codes &&
                 loaded.rid_table.rid.size() == ix.rid_table.rid.size() && rids_equal &&
                 loaded.heap_layout.slots_per_page == ix.heap_layout.slots_per_page &&
-                loaded.heap_pages == ix.heap_pages,
+                loaded.heap_pages == ix.heap_pages && loaded.heap_next_slot == ix.heap_next_slot,
             "loaded index differs from what was written");
+
+    // What the loaded header says about the heap is enough to reopen it, and
+    // every RID then reads back the base vector it was assigned for.
+    {
+        RawVectorHeap heap;
+        heap.open_existing(ivf_raw_vectors_path(pre), loaded.heap_layout, loaded.heap_next_slot, loaded.heap_pages);
+        std::vector<float> got(meta.dim);
+        size_t mismatches = 0;
+        for (size_t i = 0; i < NUM_POINTS; ++i) {
+            heap.read_vector(rid_flat_slot(loaded.rid_table.rid[i]), got.data());
+            mismatches += !std::equal(got.begin(), got.end(), data.begin() + i * meta.dim);
+        }
+        t.check(mismatches == 0, std::to_string(mismatches) + " vectors differ from the base after reopen");
+        t.check(heap.next_flat_slot() == NUM_POINTS && heap.allocated_pages() == ix.heap_pages,
+                "reopened heap cursor differs from the index file");
+    }
 
     // Writing again replaces the file in place and still loads.
     write_ivf_pq_index(pre, ix);
@@ -561,8 +579,18 @@ bool test_index_file(const std::string& prefix, const std::string& base_bin, con
         patch<uint32_t>(path, h.cluster_assignments_offset, (ix.assignments.cluster_id[0] + 1) % meta.nlist);
     });
     corrupt("cluster id >= nlist", [&] { patch<uint32_t>(path, h.cluster_assignments_offset, meta.nlist); });
-    corrupt("RID past the heap", [&] {
-        patch<uint32_t>(path, h.rid_table_offset, make_raw_vector_rid(ix.heap_pages * ix.heap_layout.slots_per_page, true).packed);
+    corrupt("RID at the heap's slot cursor", [&] {
+        patch<uint32_t>(path, h.rid_table_offset, make_raw_vector_rid(ix.heap_next_slot, true).packed);
+    });
+    corrupt("slot cursor past the heap's pages", [&] {
+        patch<uint64_t>(path, offsetof(IVFPQIndexFileHeader, raw_vector_next_slot),
+                        uint64_t(ix.heap_pages) * ix.heap_layout.slots_per_page + 1);
+    });
+    // Truncating this value to uint32_t gives back the true cursor, so only the
+    // header's bound on raw_vector_next_slot can reject it.
+    corrupt("slot cursor with a set bit above the RID slot space", [&] {
+        patch<uint64_t>(path, offsetof(IVFPQIndexFileHeader, raw_vector_next_slot),
+                        (uint64_t(1) << 32) + ix.heap_next_slot);
     });
     corrupt("heap file shorter than recorded", [&] {
         ::truncate(ivf_raw_vectors_path(pre).c_str(), off_t(h.raw_vectors_bytes - 1));
@@ -597,7 +625,7 @@ int main() {
         all_pass &= test_posting_lists_invert_assignments(prefix);
         all_pass &= test_pq_pivots_and_codes<float>("float", prefix, base_f32, data_f32, 4);
         all_pass &= test_pq_error_paths(prefix, base_f32);
-        all_pass &= test_index_file(prefix, base_f32, meta);
+        all_pass &= test_index_file(prefix, base_f32, data_f32, meta);
 
         // uint8 base: the heap must hold the 1-byte-per-dim input, not a float conversion.
         std::vector<uint8_t> data_u8 = write_synthetic_base<uint8_t>(base_u8, BLOB_SPACING_U8);

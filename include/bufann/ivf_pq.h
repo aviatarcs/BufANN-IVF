@@ -102,8 +102,8 @@ struct DynamicPQCodes {
 };
 
 // IVFPQIndex: everything the combined index file persists, in memory. The
-// raw vectors themselves stay in the heap file; heap_layout and heap_pages
-// describe it.
+// raw vectors themselves stay in the heap file; heap_layout, heap_pages and
+// heap_next_slot describe it and are what RawVectorHeap::open_existing needs.
 struct IVFPQIndex {
     IVFMetadata meta;
     ClusterAssignments assignments;
@@ -111,13 +111,17 @@ struct IVFPQIndex {
     PQMetadata pq;
     RawVectorRIDTable rid_table;
     RawVectorHeapLayout heap_layout;
-    uint32_t heap_pages = 0;
+    uint32_t heap_pages     = 0;
+    uint32_t heap_next_slot = 0;  // RawVectorHeap::next_flat_slot() when the file was written
 };
 
 // IVFPQIndexFileHeader: on-disk header for the combined IVF-PQ index file.
 // Fixed layout, written and read as raw bytes; bump version on any change.
+// Version 2 added raw_vector_next_slot and the RawVectorPageHeader; version 3
+// grew that page header from 8 to 16 bytes to record page_size and elem_size,
+// which moves every slot in the heap file.
 constexpr uint32_t IVF_PQ_INDEX_MAGIC   = 0x51465649;  // "IVFQ" little-endian
-constexpr uint32_t IVF_PQ_INDEX_VERSION = 1;
+constexpr uint32_t IVF_PQ_INDEX_VERSION = 3;
 
 struct IVFPQIndexFileHeader {
     uint32_t magic   = 0;
@@ -155,8 +159,9 @@ struct IVFPQIndexFileHeader {
     uint32_t raw_vector_elem_size = 0;
     uint32_t raw_vector_page_size = 0;
     uint64_t raw_vectors_bytes    = 0;
+    uint64_t raw_vector_next_slot = 0;
 };
-static_assert(sizeof(IVFPQIndexFileHeader) == 168, "header layout is part of the file format");
+static_assert(sizeof(IVFPQIndexFileHeader) == 176, "header layout is part of the file format");
 
 }  // namespace inplace
 }  // namespace diskann

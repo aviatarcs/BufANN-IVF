@@ -7,18 +7,22 @@ completes it, citing the commit subject.
 
 ## Queue
 
-- [ ] **Heap reopen.** `RawVectorHeap::open_existing(path, layout, next_flat_slot, allocated_pages)`
+- [x] **Heap reopen.** `RawVectorHeap::open_existing(path, layout, next_flat_slot, allocated_pages)`
       driven by `IVFPQIndexFileHeader`; refuse a file whose size disagrees
       with `allocated_pages * page_size`. Put a page id in the 8-byte page
       header (bump `IVF_PQ_INDEX_VERSION` and the bulk writer) and verify it
       on `read_vector`, so a misplaced page is detected. Tests: build, close,
       reopen, read every vector back; corrupt one page id and see it rejected.
-- [ ] **Query path, single query.** `ivf_pq_search(const IVFPQIndex&, const RawVectorHeap&, const float* q, k, nprobe, rerank_m) -> ids+dists`
+      (Done in "Add raw-vector heap reopen and page-id headers"; the header
+      now also records the slot cursor, index file version 2.)
+- [x] **Query path, single query.** `ivf_pq_search(const IVFPQIndex&, const RawVectorHeap&, const float* q, k, nprobe, rerank_m) -> ids+dists`
       in `include/bufann/ivf_pq_search.h`, implementing exactly the reference
       search in `tests/ivf_pq_recall_test.cpp` (which then calls it instead of
       its own loop). Centroid distances via one GEMM against the padded
       centroids; PQ table in a per-query scratch; re-rank from the heap.
       Recall must match the reference to within ties.
+      (Done in "Add the single-query IVF-PQ search path"; the reference loop
+      now lives in `tests/ivf_pq_search_test.cpp` as the oracle.)
 - [ ] **Query path, batched.** Batch the centroid GEMM over many queries and
       parallelize across queries with OpenMP; measure QPS on SIFT1M at nprobe
       16 and 64 and record it in the commit message.

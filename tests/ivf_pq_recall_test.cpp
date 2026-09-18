@@ -1,8 +1,7 @@
 // End-to-end quality check: builds an IVF-PQ index and measures recall@K of
-// a reference search (centroid scan -> top-nprobe partitions -> PQ table
-// lookup over their posting lists -> exact re-rank of the top M from the
-// raw-vector heap) against ground truth. The search loop here is the spec
-// for the real query path.
+// ivf_pq_search, with and without the exact re-rank, against ground truth.
+// ivf_pq_search_test checks the search against a reference loop; this test
+// checks that the whole pipeline finds true neighbours.
 //
 //   ivf_pq_recall_test                                     synthetic base, exact GT computed here
 //   ivf_pq_recall_test base.bin query.bin gt nlist chunks  gt is a DiskANN truthset .bin or an .ivecs
@@ -12,6 +11,7 @@
 
 #include "bufann/ivf_pq_build.h"
 #include "bufann/ivf_pq_index_file.h"
+#include "bufann/ivf_pq_search.h"
 #include "ivf_pq_test_util.h"
 #include "utils.h"
 
@@ -49,54 +49,6 @@ std::vector<uint32_t> top_k(const std::vector<float>& values, uint32_t k) {
                       [&](uint32_t a, uint32_t b) { return values[a] < values[b]; });
     order.resize(k);
     return order;
-}
-
-// The reference search over a loaded index. `pq_only` skips the exact re-rank.
-std::vector<uint32_t> search(const IVFPQIndex& ix, const RawVectorHeap& heap, const float* q,
-                             uint32_t nprobe, bool pq_only) {
-    const uint32_t dim = ix.meta.dim;
-    std::vector<float> centroid_dist(ix.meta.nlist);
-    for (uint32_t c = 0; c < ix.meta.nlist; ++c) {
-        centroid_dist[c] = sq_dist(q, ix.meta.centroids.data() + size_t(c) * ix.meta.aligned_dim, dim);
-    }
-
-    std::vector<float> table(size_t(ix.pq.chunks) * ix.pq.k);
-    for (uint32_t c = 0; c < ix.pq.chunks; ++c) {
-        for (uint32_t j = 0; j < ix.pq.k; ++j) {
-            table[size_t(c) * ix.pq.k + j] =
-                sq_dist(q + c * ix.pq.chunk_dim,
-                        ix.pq.pivots.data() + (size_t(c) * ix.pq.k + j) * ix.pq.chunk_dim, ix.pq.chunk_dim);
-        }
-    }
-
-    std::vector<uint32_t> candidates;
-    std::vector<float> pq_dist;
-    for (uint32_t part : top_k(centroid_dist, nprobe)) {
-        for (uint32_t k = ix.lists.offsets[part]; k < ix.lists.offsets[part + 1]; ++k) {
-            uint32_t id = ix.lists.ids[k];
-            const uint8_t* code = ix.pq.codes.data() + size_t(id) * ix.pq.chunks;
-            float d = 0.0f;
-            for (uint32_t c = 0; c < ix.pq.chunks; ++c) d += table[size_t(c) * ix.pq.k + code[c]];
-            candidates.push_back(id);
-            pq_dist.push_back(d);
-        }
-    }
-
-    std::vector<uint32_t> result;
-    if (pq_only) {
-        for (uint32_t i : top_k(pq_dist, K)) result.push_back(candidates[i]);
-        return result;
-    }
-    std::vector<uint32_t> shortlist;
-    std::vector<float> exact;
-    std::vector<float> vec(dim);
-    for (uint32_t i : top_k(pq_dist, RERANK_M)) {
-        heap.read_vector(rid_flat_slot(ix.rid_table.rid[candidates[i]]), vec.data());
-        shortlist.push_back(candidates[i]);
-        exact.push_back(sq_dist(q, vec.data(), dim));
-    }
-    for (uint32_t i : top_k(exact, K)) result.push_back(shortlist[i]);
-    return result;
 }
 
 // Ground truth as [nq][>= K] ids, from a DiskANN truthset .bin or an .ivecs.
@@ -194,36 +146,41 @@ int main(int argc, char** argv) {
         if (!synthetic) gt = load_gt(argv[3], nq);
 
         // Build, persist as the combined file, and search what loads back --
-        // the heap is reopened read-only on the file the build wrote.
+        // the heap is closed and reopened from what the index file records.
         auto t0 = std::chrono::steady_clock::now();
-        RawVectorHeap heap;
         {
             IVFPQIndex built;
             built.meta = train_ivf_centroids<float>(base_bin, nlist);
             built.heap_layout = compute_raw_vector_heap_layout(4096, uint32_t(dim) * sizeof(float));
-            heap.open(ivf_raw_vectors_path(prefix), built.heap_layout);
-            assign_ivf_clusters<float>(base_bin, built.meta, heap, built.assignments, built.rid_table);
+            RawVectorHeap build_heap;
+            build_heap.open(ivf_raw_vectors_path(prefix), built.heap_layout);
+            assign_ivf_clusters<float>(base_bin, built.meta, build_heap, built.assignments, built.rid_table);
             built.lists = build_ivf_posting_lists(built.assignments, nlist);
             train_ivf_pq_pivots<float>(base_bin, prefix, chunks, synthetic ? 0.3 : 0.0);
             encode_ivf_pq_codes<float>(base_bin, prefix, chunks);
             built.pq = load_ivf_pq(prefix);
-            built.heap_pages = heap.allocated_pages();
+            built.heap_pages = build_heap.allocated_pages();
+            built.heap_next_slot = build_heap.next_flat_slot();
             write_ivf_pq_index(prefix, built);
         }
         IVFPQIndex ix = load_ivf_pq_index(prefix);
+        RawVectorHeap heap;
+        heap.open_existing(ivf_raw_vectors_path(prefix), ix.heap_layout, ix.heap_next_slot, ix.heap_pages);
         std::cout << "build: " << std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count()
                   << " s (nlist " << nlist << ", " << chunks << " PQ chunks, N " << ix.assignments.cluster_id.size()
                   << ")" << std::endl;
 
         TestCase t("recall@" + std::to_string(K) + " over " + std::to_string(nq) + " queries");
+        IVFPQSearchScratch scratch;
         float best_recall = 0.0f;
         for (uint32_t nprobe : NPROBES) {
             for (bool pq_only : {true, false}) {
                 auto s0 = std::chrono::steady_clock::now();
                 size_t hits = 0;
                 for (size_t q = 0; q < nq; ++q) {
-                    std::vector<uint32_t> got = search(ix, heap, queries.data() + q * dim, nprobe, pq_only);
-                    for (uint32_t id : got) {
+                    IVFPQSearchResult got = ivf_pq_search<float>(ix, heap, queries.data() + q * dim, K, nprobe,
+                                                                 pq_only ? 0 : RERANK_M, scratch);
+                    for (uint32_t id : got.ids) {
                         hits += std::find(gt[q].begin(), gt[q].begin() + K, id) != gt[q].begin() + K;
                     }
                 }
