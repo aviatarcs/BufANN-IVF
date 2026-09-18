@@ -8,6 +8,7 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -16,6 +17,7 @@
 #include "utils.h"
 #include "bufann/inplace_backend.h"
 #include "bufann/ivf_pq.h"
+#include "bufann/ivf_pq_backend.h"
 
 namespace diskann {
 namespace inplace {
@@ -41,8 +43,9 @@ struct BufANNConfig {
 
     // --- IVF-PQ parameters (only used when index_type == IvfPq) ---
     uint32_t ivf_nlist     = 0;  // number of coarse-quantizer partitions
-    uint32_t ivf_nprobe    = 0;  // partitions probed per search
-    uint32_t ivf_pq_chunks = 0;  // PQ subvector count for IVF-PQ codes/pivots
+    uint32_t ivf_nprobe    = 0;  // partitions probed per search (search_L overrides it per query)
+    uint32_t ivf_pq_chunks = 0;  // PQ subvector count for IVF-PQ codes/pivots; dim must be a multiple
+    uint32_t ivf_rerank_m  = 0;  // PQ candidates re-ranked exactly per query; 0 = max(100, 10 * topK)
 
     // --- graph parameters ---
     uint32_t R           = 64;  // max graph degree (used for build and insert pruning)
@@ -106,6 +109,10 @@ struct BufANNIndex {
     FixedChunkPQTable<T>  pq_table;
     uint32_t              aligned_dim = 0;
     std::string           pq_prefix;  // path prefix used for PQ files
+
+    // Set when config.index_type == IndexType::IvfPq; the graph members above
+    // are then unused. Search scratch is per thread.
+    std::unique_ptr<IVFPQBackend> ivf;
 
     BufANNIndex()  = default;
     ~BufANNIndex() {
@@ -211,7 +218,9 @@ uint32_t bufann_flush_dirty_budget(BufANNIndex<T>& idx, uint32_t max_pages);
 // query_vec - raw query vector with config.dim elements. Zero-padded
 //             internally to the aligned dimension.
 // topK      - number of results to return.
-// search_L  - beam width. Pass 0 to use config.L.
+// search_L  - beam width. Pass 0 to use config.L. For an IVF-PQ index this
+//             is the number of partitions probed (0 = config.ivf_nprobe), so
+//             a sweep over L sweeps nprobe.
 // out_tags  - caller-provided buffer with capacity >= topK. When nullptr,
 //             results are discarded and only the count is returned.
 //

@@ -528,6 +528,17 @@ BufANNIndex<T>* diskann::inplace::bufann_build(
 
     if (config.dim == 0)
         throw std::invalid_argument("bufann_build: config.dim must be non-zero");
+    if (config.index_type == IndexType::IvfPq) {
+        auto* idx = new BufANNIndex<T>();
+        idx->config = config;
+        try {
+            idx->ivf = ivf_pq_backend_build<T>(data_bin, index_prefix, config);
+        } catch (...) {
+            delete idx;
+            throw;
+        }
+        return idx;
+    }
 
     size_t npts = 0, raw_dim = 0;
     diskann::get_bin_metadata(data_bin, npts, raw_dim);
@@ -610,6 +621,17 @@ BufANNIndex<T>* diskann::inplace::bufann_load(
 
     if (config.dim == 0)
         throw std::invalid_argument("bufann_load: config.dim must be non-zero");
+    if (config.index_type == IndexType::IvfPq) {
+        auto* idx = new BufANNIndex<T>();
+        idx->config = config;
+        try {
+            idx->ivf = ivf_pq_backend_load<T>(index_prefix, config);
+        } catch (...) {
+            delete idx;
+            throw;
+        }
+        return idx;
+    }
 
     const std::string heap_path          = index_prefix + ".heap";
     const std::string heap_meta_path     = index_prefix + ".meta";
@@ -672,6 +694,8 @@ void diskann::inplace::bufann_insert(
         TagType tag,
         const T* coords,
         uint32_t search_L) {
+    if (idx.ivf)
+        throw std::runtime_error("bufann_insert: not supported for an IVF-PQ index yet");
     if (tag == INVALID_TAG) {
         throw std::invalid_argument("bufann_insert: INVALID_TAG is reserved");
     }
@@ -766,6 +790,8 @@ template<typename T>
 void diskann::inplace::bufann_delete(
         BufANNIndex<T>& idx,
         TagType tag) {
+    if (idx.ivf)
+        throw std::runtime_error("bufann_delete: not supported for an IVF-PQ index yet");
     idx.store.mark_tag_deleted(tag);
 }
 
@@ -778,6 +804,8 @@ void diskann::inplace::bufann_delete_batch(
         BufANNIndex<T>& idx,
         const TagType* tags,
         size_t count) {
+    if (idx.ivf)
+        throw std::runtime_error("bufann_delete_batch: not supported for an IVF-PQ index yet");
     if (count == 0) return;
     for (size_t i = 0; i < count; ++i) {
         idx.store.mark_tag_deleted(tags[i]);
@@ -788,6 +816,8 @@ template<typename T>
 void diskann::inplace::bufann_cleanup_deleted_edges(BufANNIndex<T>& idx,
                                                     uint32_t num_threads,
                                                     uint32_t delete_micro_batch) {
+    if (idx.ivf)
+        throw std::runtime_error("bufann_cleanup_deleted_edges: not supported for an IVF-PQ index yet");
     const auto maintenance_begin = std::chrono::steady_clock::now();
     auto elapsed_s = [](const std::chrono::steady_clock::time_point& begin) {
         return std::chrono::duration<double>(
@@ -884,12 +914,14 @@ void diskann::inplace::bufann_cleanup_deleted_edges(BufANNIndex<T>& idx,
 
 template<typename T>
 void diskann::inplace::bufann_flush_dirty(BufANNIndex<T>& idx) {
+    if (idx.ivf) return;
     idx.store.flush();
 }
 
 template<typename T>
 uint32_t diskann::inplace::bufann_flush_dirty_budget(BufANNIndex<T>& idx,
                                                       uint32_t max_pages) {
+    if (idx.ivf) return 0;
     return idx.store.flush_dirty_budget(max_pages);
 }
 
@@ -904,6 +936,11 @@ uint32_t diskann::inplace::bufann_query_into(
         uint32_t topK,
         TagType* out_tags,
         uint32_t search_L) {
+
+    if (idx.ivf) {
+        thread_local IVFPQSearchScratch ivf_scratch;
+        return ivf_pq_backend_query<T>(*idx.ivf, idx.config, query_vec, topK, out_tags, search_L, 0, ivf_scratch);
+    }
 
     const uint32_t L = (search_L == 0) ? idx.config.L : search_L;
     const uint32_t effective_L = std::max(L, topK);

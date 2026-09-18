@@ -27,11 +27,11 @@ completes it, citing the commit subject.
       parallelize across queries with OpenMP; measure QPS on SIFT1M at nprobe
       16 and 64 and record it in the commit message. (Add the batched IVF-PQ
       search path)
-- [ ] **Wire `BufANNConfig::index_type`.** `IndexType::IvfPq` selects the
+- [x] **Wire `BufANNConfig::index_type`.** `IndexType::IvfPq` selects the
       IVF-PQ build (steps 1-6 from `ivf_nlist`, `pq_chunks`) and search
       (`ivf_nprobe`) through the existing BufANN entry points; the graph path
       is untouched. Test: build + search through the public API on the blob
-      fixture.
+      fixture. (Wire IndexType::IvfPq into the BufANN API)
 - [ ] **Free-slot grace period.** Freed slots enter a deferred list and are
       only reusable after every search that could hold the slot has finished
       (epoch counter). Required before concurrent search + delete. Test with

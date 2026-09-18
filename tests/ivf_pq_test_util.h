@@ -5,6 +5,7 @@
 
 #include <unistd.h>
 
+#include <exception>
 #include <iostream>
 #include <string>
 
@@ -29,6 +30,18 @@ public:
         try {
             fn();
             check(false, what + " did not throw");
+        } catch (const diskann::ANNException&) {
+        }
+    }
+
+    // For code paths that throw std::invalid_argument / std::runtime_error
+    // rather than ANNException (the public API does).
+    template<typename Fn>
+    void expect_throw_any(const std::string& what, Fn&& fn) {
+        try {
+            fn();
+            check(false, what + " did not throw");
+        } catch (const std::exception&) {
         } catch (const diskann::ANNException&) {
         }
     }

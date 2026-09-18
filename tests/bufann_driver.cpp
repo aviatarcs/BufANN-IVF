@@ -1980,6 +1980,19 @@ static int run_workload(int argc, char **argv) {
     cfg.max_dataset_size = static_cast<uint32_t>(
         std::stoul(get_arg(argc, argv, "--max_dataset_size", "0")));
 
+    // IVF-PQ: --index_type ivf_pq selects it; --search_L then sweeps nprobe.
+    const std::string index_type = get_arg(argc, argv, "--index_type", "graph");
+    if (index_type == "ivf_pq") {
+        cfg.index_type = IndexType::IvfPq;
+    } else if (index_type != "graph") {
+        std::cerr << "ERROR: --index_type must be graph or ivf_pq" << std::endl;
+        return 1;
+    }
+    cfg.ivf_nlist = static_cast<uint32_t>(std::stoul(get_arg(argc, argv, "--ivf_nlist", "0")));
+    cfg.ivf_nprobe = static_cast<uint32_t>(std::stoul(get_arg(argc, argv, "--ivf_nprobe", "0")));
+    cfg.ivf_pq_chunks = static_cast<uint32_t>(std::stoul(get_arg(argc, argv, "--ivf_pq_chunks", "0")));
+    cfg.ivf_rerank_m = static_cast<uint32_t>(std::stoul(get_arg(argc, argv, "--ivf_rerank_m", "0")));
+
     const uint32_t recall_at = static_cast<uint32_t>(
         std::stoul(get_arg(argc, argv, "--recall_at", "10")));
     // --search_L accepts either a single value or a whitespace/comma-separated
@@ -3201,6 +3214,8 @@ int main(int argc, char **argv) {
             << "        [--beamwidth N] [--query_threads N] [--warmup_threads N]\n"
             << "        [--R N] [--L N] [--C N] [--buffer_pool_frames N]\n"
             << "        [--pq_chunks N] [--max_dataset_size N] [--result_file <path>]\n"
+            << "        [--index_type graph|ivf_pq] [--ivf_nlist N] [--ivf_nprobe N]\n"
+            << "        [--ivf_pq_chunks N] [--ivf_rerank_m N]  (ivf_pq: --search_L sweeps nprobe)\n"
             << "  update workloads:\n"
             << "        [--full_data_file <path>]\n"
             << "        [--insert_ids_file <path>] [--delete_ids_file <path>]\n"
