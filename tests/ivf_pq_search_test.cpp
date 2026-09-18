@@ -247,6 +247,41 @@ bool test_matches_reference(const std::string& tag, const Built& b, const std::v
     return t.done();
 }
 
+// The batch path must agree with single-query searches on every query, in
+// query order, for a batch that spans several GEMM blocks, with and without
+// the re-rank; an empty batch is empty.
+template<typename T>
+bool test_batch_matches_single(const std::string& tag, const Built& b, const std::vector<float>& queries) {
+    TestCase t(tag + ": ivf_pq_search_batch matches single-query searches across GEMM blocks");
+    IVFPQSearchScratch scratch;
+    const uint32_t gemm_rows = 37;  // does not divide NQ, so the last block is partial
+    for (uint32_t nprobe : {1u, 8u}) {
+        for (uint32_t rerank_m : {0u, RERANK_M}) {
+            std::vector<IVFPQSearchResult> batch =
+                ivf_pq_search_batch<T>(b.index, b.heap, queries.data(), NQ, K, nprobe, rerank_m, gemm_rows);
+            if (!t.check(batch.size() == NQ, "batch returned the wrong number of results")) return t.done();
+            for (uint32_t q = 0; q < NQ; ++q) {
+                // A batched GEMM rounds differently from a one-row one, so a
+                // probe boundary tied to within ulps can go either way.
+                if (probe_boundary_is_tied(b.index, queries.data() + size_t(q) * DIM, nprobe)) continue;
+                IVFPQSearchResult single =
+                    ivf_pq_search<T>(b.index, b.heap, queries.data() + size_t(q) * DIM, K, nprobe, rerank_m, scratch);
+                if (!t.check(same_within_ties(batch[q], single), "query " + std::to_string(q) + " nprobe " +
+                                                                     std::to_string(nprobe) + " rerank_m " +
+                                                                     std::to_string(rerank_m) + " differs")) {
+                    return t.done();
+                }
+            }
+        }
+    }
+    t.check(ivf_pq_search_batch<T>(b.index, b.heap, queries.data(), 0, K, 8, RERANK_M).empty(),
+            "empty batch is not empty");
+    t.expect_throw("gemm_rows == 0",
+                   [&] { ivf_pq_search_batch<T>(b.index, b.heap, queries.data(), NQ, K, 8, RERANK_M, 0); });
+    t.expect_throw("null queries with nq > 0", [&] { ivf_pq_search_batch<T>(b.index, b.heap, nullptr, NQ, K, 8, 0); });
+    return t.done();
+}
+
 template<typename T>
 bool test_exact_distances_and_full_probe(const std::string& tag, const Built& b, const std::vector<T>& base,
                                          const std::vector<float>& queries) {
@@ -391,6 +426,8 @@ int main() {
 
         all_pass &= test_matches_reference<float>("f32", *f, queries);
         all_pass &= test_matches_reference<uint8_t>("u8", *u, queries);
+        all_pass &= test_batch_matches_single<float>("f32", *f, queries);
+        all_pass &= test_batch_matches_single<uint8_t>("u8", *u, queries);
         all_pass &= test_exact_distances_and_full_probe<float>("f32", *f, base_f, queries);
         all_pass &= test_exact_distances_and_full_probe<uint8_t>("u8", *u, base_u, queries);
         all_pass &= test_result_size_follows_candidates<float>("f32", *f, queries);

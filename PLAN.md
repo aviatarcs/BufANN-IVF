@@ -23,9 +23,10 @@ completes it, citing the commit subject.
       Recall must match the reference to within ties.
       (Done in "Add the single-query IVF-PQ search path"; the reference loop
       now lives in `tests/ivf_pq_search_test.cpp` as the oracle.)
-- [ ] **Query path, batched.** Batch the centroid GEMM over many queries and
+- [x] **Query path, batched.** Batch the centroid GEMM over many queries and
       parallelize across queries with OpenMP; measure QPS on SIFT1M at nprobe
-      16 and 64 and record it in the commit message.
+      16 and 64 and record it in the commit message. (Add the batched IVF-PQ
+      search path)
 - [ ] **Wire `BufANNConfig::index_type`.** `IndexType::IvfPq` selects the
       IVF-PQ build (steps 1-6 from `ivf_nlist`, `pq_chunks`) and search
       (`ivf_nprobe`) through the existing BufANN entry points; the graph path

@@ -15,6 +15,8 @@
 #include "ivf_pq_test_util.h"
 #include "utils.h"
 
+#include <omp.h>
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -56,9 +58,13 @@ std::vector<std::vector<uint32_t>> load_gt(const std::string& path, size_t nq) {
     std::vector<std::vector<uint32_t>> gt(nq);
     if (path.size() > 6 && path.compare(path.size() - 6, 6, ".ivecs") == 0) {
         std::ifstream in(path, std::ios::binary);
+        if (!in) throw diskann::ANNException("ground truth file not found: " + path, -1);
         for (size_t i = 0; i < nq; ++i) {
             int32_t d = 0;
             in.read(reinterpret_cast<char*>(&d), 4);
+            if (!in || d < int32_t(K)) {
+                throw diskann::ANNException("ground truth row " + std::to_string(i) + " is missing or shorter than K", -1);
+            }
             gt[i].resize(d);
             in.read(reinterpret_cast<char*>(gt[i].data()), size_t(d) * 4);
         }
@@ -171,23 +177,41 @@ int main(int argc, char** argv) {
                   << ")" << std::endl;
 
         TestCase t("recall@" + std::to_string(K) + " over " + std::to_string(nq) + " queries");
+        auto recall_of = [&](const std::vector<IVFPQSearchResult>& results) {
+            size_t hits = 0;
+            for (size_t q = 0; q < results.size(); ++q) {
+                for (uint32_t id : results[q].ids) {
+                    hits += std::find(gt[q].begin(), gt[q].begin() + K, id) != gt[q].begin() + K;
+                }
+            }
+            return float(hits) / float(nq * K);
+        };
+        const int max_threads = omp_get_max_threads();
         IVFPQSearchScratch scratch;
         float best_recall = 0.0f;
         for (uint32_t nprobe : NPROBES) {
             for (bool pq_only : {true, false}) {
+                const uint32_t rerank_m = pq_only ? 0 : RERANK_M;
                 auto s0 = std::chrono::steady_clock::now();
-                size_t hits = 0;
+                std::vector<IVFPQSearchResult> single(nq);
                 for (size_t q = 0; q < nq; ++q) {
-                    IVFPQSearchResult got = ivf_pq_search<float>(ix, heap, queries.data() + q * dim, K, nprobe,
-                                                                 pq_only ? 0 : RERANK_M, scratch);
-                    for (uint32_t id : got.ids) {
-                        hits += std::find(gt[q].begin(), gt[q].begin() + K, id) != gt[q].begin() + K;
-                    }
+                    single[q] = ivf_pq_search<float>(ix, heap, queries.data() + q * dim, K, nprobe, rerank_m, scratch);
                 }
-                float recall = float(hits) / float(nq * K);
-                double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - s0).count() / nq;
+                double single_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - s0).count();
+
+                omp_set_num_threads(max_threads);
+                s0 = std::chrono::steady_clock::now();
+                std::vector<IVFPQSearchResult> batch =
+                    ivf_pq_search_batch<float>(ix, heap, queries.data(), nq, K, nprobe, rerank_m);
+                double batch_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - s0).count();
+
+                float recall = recall_of(single), batch_recall = recall_of(batch);
                 std::cout << "  nprobe " << nprobe << (pq_only ? " PQ only " : " re-rank ") << "recall " << recall
-                          << "  (" << us << " us/query, single thread)" << std::endl;
+                          << "  single-query " << long(nq / single_s) << " q/s (1 thread), batched "
+                          << long(nq / batch_s) << " q/s (" << max_threads << " threads)" << std::endl;
+                t.check(std::fabs(batch_recall - recall) <= 0.002f,
+                        "batched recall " + std::to_string(batch_recall) + " differs from single-query " +
+                            std::to_string(recall));
                 if (!pq_only) best_recall = std::max(best_recall, recall);
             }
         }

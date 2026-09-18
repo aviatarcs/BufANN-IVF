@@ -1,7 +1,8 @@
-// IVF-PQ query path, one query at a time: centroid scan -> top-nprobe
-// partitions -> PQ table lookup over their posting lists -> exact re-rank of
-// the top rerank_m from the raw-vector heap. Recall is the spec, not speed;
-// the batched path builds on this.
+// IVF-PQ query path: centroid scan -> top-nprobe partitions -> PQ table
+// lookup over their posting lists -> exact re-rank of the top rerank_m from
+// the raw-vector heap. A batch computes every query's centroid distances
+// with one GEMM and then handles the queries in parallel; a single query is
+// a batch of one.
 
 #pragma once
 
@@ -55,6 +56,18 @@ IVFPQSearchResult ivf_pq_search(const IVFPQIndex& index, const RawVectorHeap& he
 template<typename T>
 IVFPQSearchResult ivf_pq_search(const IVFPQIndex& index, const RawVectorHeap& heap, const float* query,
                                 uint32_t k, uint32_t nprobe, uint32_t rerank_m);
+
+// `queries` is row-major [nq x dim]. Centroid distances come from one GEMM per
+// `gemm_rows` queries; the queries of each such block are then searched in
+// parallel with OpenMP, one scratch per thread. Results are in query order and
+// identical to nq single-query searches up to the rounding of the batched GEMM.
+const uint32_t IVF_PQ_SEARCH_GEMM_ROWS = 1024;
+
+template<typename T>
+std::vector<IVFPQSearchResult> ivf_pq_search_batch(const IVFPQIndex& index, const RawVectorHeap& heap,
+                                                   const float* queries, size_t nq, uint32_t k,
+                                                   uint32_t nprobe, uint32_t rerank_m,
+                                                   uint32_t gemm_rows = IVF_PQ_SEARCH_GEMM_ROWS);
 
 }  // namespace inplace
 }  // namespace diskann
