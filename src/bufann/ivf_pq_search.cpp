@@ -95,6 +95,10 @@ IVFPQSearchResult search_from_centroid_dist(const IVFPQIndex& ix, const RawVecto
     const uint32_t dim = meta.dim;
     size_scratch(scratch, ix);
 
+    // Held from the first RID load through the last read_vector, so a slot a
+    // concurrent delete frees is not refilled under this query's re-rank.
+    RawVectorHeap::ReadGuard guard(heap);
+
     std::copy_n(centroid_dist, meta.nlist, scratch.centroid_dist.begin());
     select_smallest(scratch.centroid_dist, std::min(nprobe, meta.nlist), scratch.probe_order);
 

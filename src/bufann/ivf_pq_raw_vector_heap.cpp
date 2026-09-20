@@ -62,7 +62,51 @@ void require_page_header(const void* page, const RawVectorHeapLayout& layout, ui
 
 }  // namespace
 
+RawVectorHeap::RawVectorHeap(uint32_t max_readers) : _readers(max_readers) {
+    IVF_PQ_REQUIRE(max_readers > 0, "raw-vector heap needs at least one reader registry entry");
+}
+
 RawVectorHeap::~RawVectorHeap() { close(); }
+
+// Everything the grace period relies on is seq_cst: the epoch load and the
+// CAS here, the deleter's RID store and the epoch increment in free_slot,
+// and the registry scan in oldest_reader_epoch. In that single total order,
+// a reclaim that found this entry empty precedes the CAS, so every RID this
+// reader loads afterwards is one the deleter had already cleared; and a
+// reader whose recorded epoch is newer than a free loaded the epoch after
+// that free's increment, hence after its RID store. The epoch may advance
+// between the load and the CAS; recording the older value only makes the
+// reader block reclaims it did not need to.
+uint32_t RawVectorHeap::enter_reader() const {
+    thread_local uint32_t hint = 0;
+    const uint64_t epoch = _epoch.load();
+    const uint32_t n = uint32_t(_readers.size());
+    for (uint32_t tries = 0; tries < n; ++tries) {
+        const uint32_t i = (hint + tries) % n;
+        uint64_t expected = 0;
+        if (_readers[i].epoch.compare_exchange_strong(expected, epoch)) {
+            hint = i;
+            return i;
+        }
+    }
+    IVF_PQ_REQUIRE(false, "raw-vector heap has more than " + std::to_string(n) + " readers registered at once");
+    return 0;
+}
+
+void RawVectorHeap::leave_reader(uint32_t reader) const { _readers[reader].epoch.store(0); }
+
+uint64_t RawVectorHeap::oldest_reader_epoch() const {
+    uint64_t oldest = UINT64_MAX;
+    for (const ReaderEntry& r : _readers) {
+        const uint64_t e = r.epoch.load();
+        if (e != 0 && e < oldest) oldest = e;
+    }
+    return oldest;
+}
+
+RawVectorHeap::ReadGuard::ReadGuard(const RawVectorHeap& heap) : _heap(heap), _reader(heap.enter_reader()) {}
+
+RawVectorHeap::ReadGuard::~ReadGuard() { _heap.leave_reader(_reader); }
 
 void RawVectorHeap::set_layout(RawVectorHeapLayout layout) {
     IVF_PQ_REQUIRE(layout.slots_per_page > 0 && layout.elem_size > 0 &&
@@ -172,6 +216,7 @@ void RawVectorHeap::require_page_header_on_disk(uint32_t page_id) const {
 uint32_t RawVectorHeap::allocate_slot(RawVectorFreeList& free_list) {
     {
         std::lock_guard<std::mutex> lg(free_list.mtx);
+        if (free_list.free_slots.empty()) reclaim_locked(free_list);
         if (!free_list.free_slots.empty()) {
             uint32_t flat = free_list.free_slots.back();
             free_list.free_slots.pop_back();
@@ -228,7 +273,28 @@ void RawVectorHeap::free_slot(uint32_t flat_slot, RawVectorFreeList& free_list) 
     require_allocated(flat_slot);
     set_occupancy_bit(flat_slot, false);
     std::lock_guard<std::mutex> lg(free_list.mtx);
-    free_list.free_slots.push_back(flat_slot);
+    // The epoch is taken under the lock so `deferred` stays ascending.
+    free_list.deferred.push_back({_epoch.fetch_add(1), flat_slot});
+}
+
+size_t RawVectorHeap::reclaim_freed_slots(RawVectorFreeList& free_list) {
+    std::lock_guard<std::mutex> lg(free_list.mtx);
+    return reclaim_locked(free_list);
+}
+
+// A slot freed at epoch f may still be addressed by a reader whose recorded
+// epoch is <= f, and by no other; `deferred` is ascending, so the reclaimable
+// entries are a prefix.
+size_t RawVectorHeap::reclaim_locked(RawVectorFreeList& free_list) {
+    if (free_list.deferred.empty()) return 0;
+    const uint64_t oldest = oldest_reader_epoch();
+    auto& deferred = free_list.deferred;
+    auto end = std::find_if(deferred.begin(), deferred.end(),
+                            [&](const RawVectorFreeList::Deferred& d) { return d.epoch >= oldest; });
+    for (auto it = deferred.begin(); it != end; ++it) free_list.free_slots.push_back(it->flat_slot);
+    const size_t reclaimed = size_t(end - deferred.begin());
+    deferred.erase(deferred.begin(), end);
+    return reclaimed;
 }
 
 void RawVectorHeap::set_occupancy_bit(uint32_t flat_slot, bool occupied) {

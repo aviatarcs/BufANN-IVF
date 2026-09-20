@@ -32,11 +32,12 @@ completes it, citing the commit subject.
       (`ivf_nprobe`) through the existing BufANN entry points; the graph path
       is untouched. Test: build + search through the public API on the blob
       fixture. (Wire IndexType::IvfPq into the BufANN API)
-- [ ] **Free-slot grace period.** Freed slots enter a deferred list and are
+- [x] **Free-slot grace period.** Freed slots enter a deferred list and are
       only reusable after every search that could hold the slot has finished
       (epoch counter). Required before concurrent search + delete. Test with
       threads: a reader holding a slot across a free never observes the
-      replacement's bytes.
+      replacement's bytes. (Defer freed heap slots until in-flight readers
+      have left)
 - [ ] **Mutation: insert.** Allocate a slot (free list or grow), write raw
       bytes, assign to nearest centroid, encode PQ code into `DynamicPQCodes`,
       append to `PostingListDelta::pending_inserts`, set RID active. Search

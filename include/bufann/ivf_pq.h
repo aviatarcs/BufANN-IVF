@@ -83,10 +83,19 @@ struct RawVectorRIDTable {
     std::vector<RawVectorRID> rid;
 };
 
-// Slots released by deletes, reused by inserts.
+// Slots released by deletes, reused by inserts -- but not before every
+// search that may still address a slot has finished (RawVectorHeap::ReadGuard).
+// free_slot appends to `deferred` with the epoch of the free; allocate_slot
+// moves the entries no in-flight reader can still see onto `free_slots` and
+// pops from there. Both vectors are guarded by mtx.
 struct RawVectorFreeList {
+    struct Deferred {
+        uint64_t epoch;      // RawVectorHeap epoch at the free
+        uint32_t flat_slot;  // see RawVectorRID
+    };
     std::mutex mtx;
-    std::vector<uint32_t> free_slots;  // flat slot indices, see RawVectorRID
+    std::vector<Deferred> deferred;    // ascending by epoch
+    std::vector<uint32_t> free_slots;  // reusable now
 };
 
 // PostingListDelta: pending mutations not yet folded into PostingLists

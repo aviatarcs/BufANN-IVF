@@ -21,14 +21,15 @@ namespace diskann {
 namespace inplace {
 
 constexpr uint32_t RAW_VECTOR_BITMAP_LOCK_STRIPES = 64;
+constexpr uint32_t RAW_VECTOR_MAX_READERS         = 1024;  // ReadGuards held at once
 
 // allocate_slot/write_vector/free_slot may be called concurrently: allocation
 // is serialized on _grow_mtx, bitmap read-modify-writes on a per-page stripe.
-// A freed slot is reusable immediately, with no grace period, so read_vector
-// must not race free_slot on the same slot.
+// A freed slot is not handed out again while a ReadGuard that could still
+// address it is held; see ReadGuard for what readers and freers must do.
 class RawVectorHeap {
 public:
-    RawVectorHeap() = default;
+    explicit RawVectorHeap(uint32_t max_readers = RAW_VECTOR_MAX_READERS);
     ~RawVectorHeap();
     RawVectorHeap(const RawVectorHeap&)            = delete;
     RawVectorHeap& operator=(const RawVectorHeap&) = delete;
@@ -43,12 +44,42 @@ public:
                        uint32_t next_flat_slot, uint32_t allocated_pages);
     void close();  // afterwards next_flat_slot() == allocated_pages() == 0
 
-    // Pops from free_list if possible, else grows the heap by a page as needed.
+    // Grace period for slot reuse. A reader holds a ReadGuard from before it
+    // loads the RID of any vector until after its last read_vector; a slot
+    // freed while such a guard is held is not reused until that guard is
+    // released, so the bytes the reader gets are the vector whose RID it
+    // loaded (or, if the vector was deleted in between, still that vector's
+    // last bytes). Readers that enter after the free do not delay the reuse.
+    //
+    // This holds provided a deleter clears the RID's active bit with a
+    // seq_cst store before it calls free_slot, and readers load RIDs seq_cst:
+    // then a reader registered before the free, or one that loads the RID
+    // after it, sees the RID inactive. Every ReadGuard occupies one of
+    // max_readers registry entries; entering more at once throws.
+    class ReadGuard {
+    public:
+        explicit ReadGuard(const RawVectorHeap& heap);
+        ~ReadGuard();
+        ReadGuard(const ReadGuard&)            = delete;
+        ReadGuard& operator=(const ReadGuard&) = delete;
+
+    private:
+        const RawVectorHeap& _heap;
+        uint32_t _reader;
+    };
+
+    // Pops from free_list.free_slots, refilling it from free_list.deferred
+    // first when it is empty (reclaim_freed_slots), else grows the heap by a
+    // page as needed.
     uint32_t allocate_slot(RawVectorFreeList& free_list);
     void write_vector(uint32_t flat_slot, const void* data);  // sets the occupancy bit
     void read_vector(uint32_t flat_slot, void* out) const;    // throws if the page header is not the slot's page and geometry
     bool is_slot_occupied(uint32_t flat_slot) const;
-    void free_slot(uint32_t flat_slot, RawVectorFreeList& free_list);  // clears the bit
+    // Clears the bit and defers the slot until the readers now registered have left.
+    void free_slot(uint32_t flat_slot, RawVectorFreeList& free_list);
+    // Moves onto free_list.free_slots every deferred slot that no registered
+    // reader can still address; returns how many.
+    size_t reclaim_freed_slots(RawVectorFreeList& free_list);
 
     // Writes `num_pages` complete pages starting at `first_page_id` with one
     // pwrite; each page must already carry its header. Does not touch the
@@ -72,6 +103,16 @@ private:
     std::mutex& bitmap_mutex(uint32_t flat_slot) const {
         return _bitmap_mtx[_layout.page_of(flat_slot) % RAW_VECTOR_BITMAP_LOCK_STRIPES];
     }
+    uint32_t enter_reader() const;  // registers the current epoch; returns the registry entry
+    void leave_reader(uint32_t reader) const;
+    uint64_t oldest_reader_epoch() const;  // UINT64_MAX when no reader is registered
+    size_t reclaim_locked(RawVectorFreeList& free_list);  // caller holds free_list.mtx
+
+    // One cache line per entry, so readers entering and leaving do not
+    // contend on each other's lines. 0 marks a free entry; epochs start at 1.
+    struct alignas(64) ReaderEntry {
+        std::atomic<uint64_t> epoch{0};
+    };
 
     int _fd = -1;
     RawVectorHeapLayout _layout;
@@ -79,6 +120,8 @@ private:
     mutable std::array<std::mutex, RAW_VECTOR_BITMAP_LOCK_STRIPES> _bitmap_mtx;
     std::atomic<uint32_t> _next_flat_slot{0};
     std::atomic<uint32_t> _allocated_pages{0};
+    std::atomic<uint64_t> _epoch{1};  // advanced by every free_slot
+    mutable std::vector<ReaderEntry> _readers;
 };
 
 // Build-time loader for an empty heap: vector k of the load lands in flat

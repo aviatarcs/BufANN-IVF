@@ -1,5 +1,6 @@
 // Tests for RawVectorHeap: layout, on-disk format, allocate/write/read/free/
-// reuse, concurrent bitmap updates, slot-space limit, the fresh-open guard,
+// reuse, the free-slot grace period (deterministically and against racing
+// readers), concurrent bitmap updates, slot-space limit, the fresh-open guard,
 // reopening a closed heap (and refusing a bad one or a wrong geometry),
 // page-header verification on read, and the bulk writer.
 
@@ -11,6 +12,7 @@
 #include <cstring>
 #include <fstream>
 #include <iterator>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -152,6 +154,151 @@ bool test_allocate_write_read_free_reuse() {
     return t.done();
 }
 
+// A slot freed while a ReadGuard is held stays out of circulation until that
+// guard is released; guards entered after the free do not hold it back.
+bool test_free_waits_for_readers_registered_before_it() {
+    TestCase t("freed slots are reused only after the readers that predate the free have left");
+    std::string path = temp_path("ivf_heap_grace");
+    RawVectorHeap heap;
+    heap.open(path, compute_raw_vector_heap_layout(PAGE, ELEM));
+    RawVectorFreeList free_list;
+    std::vector<uint32_t> s(4);
+    for (uint32_t& slot : s) slot = heap.allocate_slot(free_list);
+    uint32_t fresh = 4;  // what allocate_slot returns when it has to grow
+
+    heap.free_slot(s[0], free_list);
+    t.check(free_list.deferred.size() == 1 && free_list.free_slots.empty(), "free_slot did not defer the slot");
+    t.check(heap.allocate_slot(free_list) == s[0], "with no reader, the freed slot was not reused at once");
+    t.check(free_list.deferred.empty(), "reuse left the slot on the deferred list");
+
+    {
+        RawVectorHeap::ReadGuard before(heap);
+        heap.free_slot(s[1], free_list);
+        t.check(heap.reclaim_freed_slots(free_list) == 0, "reclaimed under a reader that predates the free");
+        t.check(heap.allocate_slot(free_list) == fresh++, "reused a slot a registered reader could still read");
+        t.check(free_list.deferred.size() == 1, "the blocked slot left the deferred list");
+    }
+    t.check(heap.allocate_slot(free_list) == s[1], "slot not reused once the reader left");
+
+    // Reader A predates both frees, B only the second: releasing A frees
+    // s[2] but not s[3], which waits for B.
+    auto a = std::make_unique<RawVectorHeap::ReadGuard>(heap);
+    heap.free_slot(s[2], free_list);
+    auto b = std::make_unique<RawVectorHeap::ReadGuard>(heap);
+    heap.free_slot(s[3], free_list);
+    t.check(heap.reclaim_freed_slots(free_list) == 0, "reclaimed under readers that predate both frees");
+    a.reset();
+    t.check(heap.reclaim_freed_slots(free_list) == 1 && free_list.free_slots == std::vector<uint32_t>{s[2]},
+            "a reader that entered after the free of s[2] held it back");
+    t.check(heap.allocate_slot(free_list) == s[2] && heap.allocate_slot(free_list) == fresh++,
+            "s[3] was reused while a reader that predates its free is registered");
+    b.reset();
+    t.check(heap.allocate_slot(free_list) == s[3], "s[3] not reused once its reader left");
+    t.check(free_list.deferred.empty() && free_list.free_slots.empty(), "free list not drained");
+
+    // Every guard takes a registry entry; entries come back when guards leave.
+    RawVectorHeap small(2);
+    small.open(path + "_small", compute_raw_vector_heap_layout(PAGE, ELEM));
+    {
+        RawVectorHeap::ReadGuard one(small);
+        auto two = std::make_unique<RawVectorHeap::ReadGuard>(small);
+        t.expect_throw("a third reader on a two-entry registry", [&] { RawVectorHeap::ReadGuard three(small); });
+        two.reset();
+        RawVectorHeap::ReadGuard three(small);
+    }
+    t.expect_throw("zero registry entries", [] { RawVectorHeap none(0); });
+
+    heap.close();
+    small.close();
+    ::unlink(path.c_str());
+    ::unlink((path + "_small").c_str());
+    return t.done();
+}
+
+// The race the grace period exists for: a search loads a vector's RID, the
+// vector is deleted and its slot handed to another vector, and the search
+// then reads the slot. Each vector's bytes name the vector, so a reader that
+// gets another vector's bytes for the RID it loaded is caught. Removing the
+// guard from the reader makes this fail within a few thousand iterations.
+bool test_reader_never_sees_a_reused_slot() {
+    TestCase t("a reader holding a RID across a free never reads the replacement's bytes");
+    std::string path = temp_path("ivf_heap_race");
+    const uint32_t elem = 16;
+    RawVectorHeap heap;
+    heap.open(path, compute_raw_vector_heap_layout(PAGE, elem));
+    RawVectorFreeList free_list;
+
+    const uint32_t n = 64;
+    std::vector<std::atomic<uint32_t>> rid(n);  // RawVectorRID::packed, stored seq_cst
+    auto bytes_of = [&](uint32_t id, uint32_t gen) {
+        std::vector<char> v(elem, 0);
+        std::memcpy(v.data(), &id, 4);
+        std::memcpy(v.data() + 4, &gen, 4);
+        return v;
+    };
+    for (uint32_t id = 0; id < n; ++id) {
+        uint32_t slot = heap.allocate_slot(free_list);
+        heap.write_vector(slot, bytes_of(id, 0).data());
+        rid[id].store(make_raw_vector_rid(slot, true).packed);
+    }
+    const uint32_t slots_before = heap.next_flat_slot();
+
+    std::atomic<bool> stop{false};
+    std::atomic<uint64_t> mismatches{0}, reads{0};
+    auto reader = [&] {
+        std::vector<char> got(elem);
+        std::vector<uint32_t> snapshot(n);
+        while (!stop.load()) {
+            RawVectorHeap::ReadGuard guard(heap);
+            // Like a search: collect the RIDs first, read the vectors after.
+            for (uint32_t id = 0; id < n; ++id) snapshot[id] = rid[id].load();
+            for (uint32_t id = 0; id < n; ++id) {
+                RawVectorRID r{snapshot[id]};
+                if (!rid_is_active(r)) continue;
+                heap.read_vector(rid_flat_slot(r), got.data());
+                uint32_t stored_id;
+                std::memcpy(&stored_id, got.data(), 4);
+                reads.fetch_add(1);
+                if (stored_id != id) mismatches.fetch_add(1);
+            }
+        }
+    };
+    std::vector<std::thread> readers;
+    for (int i = 0; i < 4; ++i) readers.emplace_back(reader);
+
+    // Round-robin: delete one vector, then re-insert the one deleted just
+    // before it. free_slots is LIFO, so when the grace period allows it the
+    // re-insert lands in the slot just freed -- under a different id, which
+    // is what a reader with the stale RID would then see.
+    const uint32_t iterations = 20000;
+    for (uint32_t it = 0; it <= iterations; ++it) {
+        const uint32_t id = it % n;
+        RawVectorRID old{rid[id].load()};
+        rid[id].store(make_raw_vector_rid(rid_flat_slot(old), false).packed);
+        heap.free_slot(rid_flat_slot(old), free_list);
+        if (it == 0) continue;
+        const uint32_t prev = (it - 1) % n;
+        uint32_t slot = heap.allocate_slot(free_list);
+        heap.write_vector(slot, bytes_of(prev, it).data());
+        rid[prev].store(make_raw_vector_rid(slot, true).packed);
+    }
+    stop.store(true);
+    for (auto& th : readers) th.join();
+
+    const uint32_t grown = heap.next_flat_slot() - slots_before;
+    t.check(mismatches.load() == 0,
+            std::to_string(mismatches.load()) + " of " + std::to_string(reads.load()) +
+                " reads returned another vector's bytes");
+    t.check(reads.load() > 0, "readers never ran");
+    t.check(grown < iterations / 2,
+            "only " + std::to_string(iterations - grown) + " of " + std::to_string(iterations) +
+                " re-inserts reused a slot; the race was barely exercised");
+
+    heap.close();
+    ::unlink(path.c_str());
+    return t.done();
+}
+
 // All 7 slots of a page share one bitmap byte; unsynchronized updates drop bits.
 bool test_concurrent_bitmap_updates() {
     TestCase t("concurrent writes and frees within one page keep every occupancy bit");
@@ -186,7 +333,7 @@ bool test_concurrent_bitmap_updates() {
                                       [&](uint32_t s) { return heap.is_slot_occupied(s); });
 
         heap.close();
-        if (!t.check(all_set && all_clear && free_list.free_slots.size() == slots.size(),
+        if (!t.check(all_set && all_clear && free_list.deferred.size() == slots.size(),
                      "run " + std::to_string(run) + " lost a bitmap update or a freed slot")) {
             break;
         }
@@ -642,6 +789,8 @@ int main() {
     all_pass &= test_layout();
     all_pass &= test_on_disk_format();
     all_pass &= test_allocate_write_read_free_reuse();
+    all_pass &= test_free_waits_for_readers_registered_before_it();
+    all_pass &= test_reader_never_sees_a_reused_slot();
     all_pass &= test_concurrent_bitmap_updates();
     all_pass &= test_rejects_slots_past_the_rid_slot_space();
     all_pass &= test_open_refuses_existing_nonempty_file();
