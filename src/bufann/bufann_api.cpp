@@ -694,8 +694,10 @@ void diskann::inplace::bufann_insert(
         TagType tag,
         const T* coords,
         uint32_t search_L) {
-    if (idx.ivf)
-        throw std::runtime_error("bufann_insert: not supported for an IVF-PQ index yet");
+    if (idx.ivf) {
+        ivf_pq_backend_insert<T>(*idx.ivf, idx.config, tag, coords);  // search_L is a graph parameter
+        return;
+    }
     if (tag == INVALID_TAG) {
         throw std::invalid_argument("bufann_insert: INVALID_TAG is reserved");
     }

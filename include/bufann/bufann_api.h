@@ -171,7 +171,11 @@ uint32_t bufann_snapshot_active_cap(const std::string& index_prefix);
 // coords   - raw vector with config.dim elements. Zero-padded internally
 //            to the aligned dimension.
 // search_L - beam width to use when finding the new node's neighbors.
-//            Pass 0 to use config.L.
+//            Pass 0 to use config.L. Unused by an IVF-PQ index, which
+//            assigns the point to its nearest partition; the point is
+//            searchable on return but lives only in memory and the heap
+//            file until the index file is rewritten, so bufann_load of the
+//            prefix is refused until then.
 template<typename T>
 void bufann_insert(
     BufANNIndex<T>& idx,

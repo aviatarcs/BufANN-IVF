@@ -7,6 +7,7 @@
 #include <atomic>
 #include <cstdint>
 #include <mutex>
+#include <shared_mutex>
 #include <unordered_map>
 #include <vector>
 
@@ -121,9 +122,25 @@ struct DynamicPQCodes {
     std::unordered_map<uint32_t, std::vector<uint8_t>> codes;  // vector_id -> [chunks]
 };
 
+// IVFPQDelta: what mutations change that the index file does not hold, and
+// the lock that orders them against searches. An insert publishes under mtx
+// held exclusively; a search holds it shared while it reads the delta and
+// the RID table (which inserts grow) and releases it before its heap reads.
+// Ids at or past the base count are inserts, with codes in `codes` and
+// posting-list membership in `lists`, until the rebuild folds them into the
+// index (write_ivf_pq_index refuses an index with unfolded inserts).
+struct IVFPQDelta {
+    mutable std::shared_mutex mtx;
+    PostingListDelta lists;
+    DynamicPQCodes codes;
+    RawVectorFreeList free_list;
+};
+
 // IVFPQIndex: everything the combined index file persists, in memory. The
 // raw vectors themselves stay in the heap file; heap_layout, heap_pages and
 // heap_next_slot describe it and are what RawVectorHeap::open_existing needs.
+// assignments and rid_table also cover inserted vectors; lists and pq.codes
+// cover only the base vectors the file was written from.
 struct IVFPQIndex {
     IVFMetadata meta;
     ClusterAssignments assignments;
@@ -134,6 +151,11 @@ struct IVFPQIndex {
     uint32_t heap_pages     = 0;
     uint32_t heap_next_slot = 0;  // RawVectorHeap::next_flat_slot() when the file was written
 };
+
+// Vectors the posting lists and PQ codes cover; ids from here on are inserts.
+inline uint32_t ivf_pq_num_base(const IVFPQIndex& index) {
+    return index.lists.offsets.empty() ? 0 : index.lists.offsets.back();
+}
 
 // IVFPQIndexFileHeader: on-disk header for the combined IVF-PQ index file.
 // Fixed layout, written and read as raw bytes; bump version on any change.

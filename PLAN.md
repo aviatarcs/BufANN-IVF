@@ -38,11 +38,12 @@ completes it, citing the commit subject.
       threads: a reader holding a slot across a free never observes the
       replacement's bytes. (Defer freed heap slots until in-flight readers
       have left)
-- [ ] **Mutation: insert.** Allocate a slot (free list or grow), write raw
+- [x] **Mutation: insert.** Allocate a slot (free list or grow), write raw
       bytes, assign to nearest centroid, encode PQ code into `DynamicPQCodes`,
       append to `PostingListDelta::pending_inserts`, set RID active. Search
       merges pending inserts. Tests: inserted vectors are found at nprobe
-      covering their partition.
+      covering their partition. (Add IVF-PQ insert; the delta is consulted by
+      search and published through bufann_insert)
 - [ ] **Mutation: delete.** Tombstone in `PostingListDelta`, clear RID active
       bit with `store_rid` (seq_cst, which the grace period relies on) before
       freeing the slot through it. Search drops tombstoned ids.
@@ -50,7 +51,10 @@ completes it, citing the commit subject.
       into fresh `PostingLists`/`PQMetadata` off to the side, publish with
       one atomic pointer store in `IVFPQSearchConfig`, reclaim the old
       structures after a grace period. Searches must run throughout; test
-      with a search thread hammering during a rebuild.
+      with a search thread hammering during a rebuild. Then rewrite the
+      index file (with the heap's current page count and cursor) so a
+      prefix with inserts is loadable again; the backend's inserted-tag maps
+      must survive the fold or be persisted with it.
 
 ## Not planned
 
