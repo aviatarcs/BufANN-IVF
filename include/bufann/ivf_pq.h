@@ -61,10 +61,20 @@ struct IVFPQSearchConfig {
 };
 
 // RawVectorRID: bit 31 is the active flag, the low 31 bits a flat heap slot.
+// A RID that searches may read concurrently with a delete or insert is
+// accessed through load_rid/store_rid, whose seq_cst ordering the heap's
+// free-slot grace period relies on (RawVectorHeap::ReadGuard).
 struct RawVectorRID {
     uint32_t packed = 0;
 };
 static_assert(sizeof(RawVectorRID) == 4, "RawVectorRID must pack into 32 bits");
+
+inline RawVectorRID load_rid(const RawVectorRID& rid) {
+    return RawVectorRID{std::atomic_ref<const uint32_t>(rid.packed).load()};
+}
+inline void store_rid(RawVectorRID& rid, RawVectorRID value) {
+    std::atomic_ref<uint32_t>(rid.packed).store(value.packed);
+}
 
 constexpr uint32_t RAW_VECTOR_RID_ACTIVE_BIT = 0x80000000u;
 constexpr uint32_t RAW_VECTOR_RID_SLOT_MASK  = 0x7FFFFFFFu;

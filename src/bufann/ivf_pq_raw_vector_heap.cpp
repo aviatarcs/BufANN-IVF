@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <cstring>
+#include <thread>
 
 #include "bufann/ivf_pq_require.h"
 
@@ -77,20 +78,25 @@ RawVectorHeap::~RawVectorHeap() { close(); }
 // that free's increment, hence after its RID store. The epoch may advance
 // between the load and the CAS; recording the older value only makes the
 // reader block reclaims it did not need to.
+//
+// A full registry means max_readers searches are mid-query; waiting for one
+// to finish is a stall, where throwing would abort a query (and terminate
+// the process from inside ivf_pq_search_batch's OpenMP loop).
 uint32_t RawVectorHeap::enter_reader() const {
     thread_local uint32_t hint = 0;
-    const uint64_t epoch = _epoch.load();
     const uint32_t n = uint32_t(_readers.size());
-    for (uint32_t tries = 0; tries < n; ++tries) {
-        const uint32_t i = (hint + tries) % n;
-        uint64_t expected = 0;
-        if (_readers[i].epoch.compare_exchange_strong(expected, epoch)) {
-            hint = i;
-            return i;
+    for (;;) {
+        const uint64_t epoch = _epoch.load();
+        for (uint32_t tries = 0; tries < n; ++tries) {
+            const uint32_t i = (hint + tries) % n;
+            uint64_t expected = 0;
+            if (_readers[i].epoch.compare_exchange_strong(expected, epoch)) {
+                hint = i;
+                return i;
+            }
         }
+        std::this_thread::yield();
     }
-    IVF_PQ_REQUIRE(false, "raw-vector heap has more than " + std::to_string(n) + " readers registered at once");
-    return 0;
 }
 
 void RawVectorHeap::leave_reader(uint32_t reader) const { _readers[reader].epoch.store(0); }

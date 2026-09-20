@@ -44,7 +44,8 @@ completes it, citing the commit subject.
       merges pending inserts. Tests: inserted vectors are found at nprobe
       covering their partition.
 - [ ] **Mutation: delete.** Tombstone in `PostingListDelta`, clear RID active
-      bit, free the slot through the grace period. Search drops tombstoned ids.
+      bit with `store_rid` (seq_cst, which the grace period relies on) before
+      freeing the slot through it. Search drops tombstoned ids.
 - [ ] **Posting-list rebuild.** Fold `PostingListDelta` and `DynamicPQCodes`
       into fresh `PostingLists`/`PQMetadata` off to the side, publish with
       one atomic pointer store in `IVFPQSearchConfig`, reclaim the old

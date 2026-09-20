@@ -51,11 +51,12 @@ public:
     // loaded (or, if the vector was deleted in between, still that vector's
     // last bytes). Readers that enter after the free do not delay the reuse.
     //
-    // This holds provided a deleter clears the RID's active bit with a
-    // seq_cst store before it calls free_slot, and readers load RIDs seq_cst:
-    // then a reader registered before the free, or one that loads the RID
-    // after it, sees the RID inactive. Every ReadGuard occupies one of
-    // max_readers registry entries; entering more at once throws.
+    // This holds provided a deleter clears the RID's active bit with
+    // store_rid before it calls free_slot and readers use load_rid (both
+    // seq_cst): then a reader registered before the free, or one that loads
+    // the RID after it, sees the RID inactive. Every ReadGuard occupies one
+    // of max_readers registry entries; when all are taken, entering waits
+    // for one to be released.
     class ReadGuard {
     public:
         explicit ReadGuard(const RawVectorHeap& heap);

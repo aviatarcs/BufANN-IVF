@@ -129,7 +129,7 @@ IVFPQSearchResult search_from_centroid_dist(const IVFPQIndex& ix, const RawVecto
     scratch.shortlist.clear();
     scratch.exact_dist.clear();
     for (uint32_t i : scratch.order) {
-        if (rid_is_active(ix.rid_table.rid[scratch.candidates[i]])) {
+        if (rid_is_active(load_rid(ix.rid_table.rid[scratch.candidates[i]]))) {
             scratch.shortlist.push_back(scratch.candidates[i]);
             scratch.exact_dist.push_back(scratch.pq_dist[i]);
         }
@@ -145,7 +145,7 @@ IVFPQSearchResult search_from_centroid_dist(const IVFPQIndex& ix, const RawVecto
     scratch.raw_vector.resize(heap.layout().elem_size);
     const T* raw = reinterpret_cast<const T*>(scratch.raw_vector.data());
     for (size_t i = 0; i < scratch.shortlist.size(); ++i) {
-        heap.read_vector(rid_flat_slot(ix.rid_table.rid[scratch.shortlist[i]]), scratch.raw_vector.data());
+        heap.read_vector(rid_flat_slot(load_rid(ix.rid_table.rid[scratch.shortlist[i]])), scratch.raw_vector.data());
         for (uint32_t d = 0; d < dim; ++d) scratch.vector[d] = float(raw[d]);
         scratch.exact_dist[i] = sq_dist(query, scratch.vector.data(), dim);
     }

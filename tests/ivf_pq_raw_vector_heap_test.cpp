@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstring>
 #include <fstream>
 #include <iterator>
@@ -196,15 +197,23 @@ bool test_free_waits_for_readers_registered_before_it() {
     t.check(heap.allocate_slot(free_list) == s[3], "s[3] not reused once its reader left");
     t.check(free_list.deferred.empty() && free_list.free_slots.empty(), "free list not drained");
 
-    // Every guard takes a registry entry; entries come back when guards leave.
+    // Every guard takes a registry entry; a reader that finds them all taken
+    // waits for one to be released rather than failing.
     RawVectorHeap small(2);
     small.open(path + "_small", compute_raw_vector_heap_layout(PAGE, ELEM));
     {
         RawVectorHeap::ReadGuard one(small);
         auto two = std::make_unique<RawVectorHeap::ReadGuard>(small);
-        t.expect_throw("a third reader on a two-entry registry", [&] { RawVectorHeap::ReadGuard three(small); });
+        std::atomic<bool> entered{false};
+        std::thread third([&] {
+            RawVectorHeap::ReadGuard three(small);
+            entered.store(true);
+        });
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        t.check(!entered.load(), "a third reader entered a two-entry registry");
         two.reset();
-        RawVectorHeap::ReadGuard three(small);
+        third.join();
+        t.check(entered.load(), "the waiting reader did not enter once an entry was released");
     }
     t.expect_throw("zero registry entries", [] { RawVectorHeap none(0); });
 
@@ -229,7 +238,7 @@ bool test_reader_never_sees_a_reused_slot() {
     RawVectorFreeList free_list;
 
     const uint32_t n = 64;
-    std::vector<std::atomic<uint32_t>> rid(n);  // RawVectorRID::packed, stored seq_cst
+    std::vector<RawVectorRID> rid(n);  // accessed only through load_rid/store_rid
     auto bytes_of = [&](uint32_t id, uint32_t gen) {
         std::vector<char> v(elem, 0);
         std::memcpy(v.data(), &id, 4);
@@ -239,7 +248,7 @@ bool test_reader_never_sees_a_reused_slot() {
     for (uint32_t id = 0; id < n; ++id) {
         uint32_t slot = heap.allocate_slot(free_list);
         heap.write_vector(slot, bytes_of(id, 0).data());
-        rid[id].store(make_raw_vector_rid(slot, true).packed);
+        store_rid(rid[id], make_raw_vector_rid(slot, true));
     }
     const uint32_t slots_before = heap.next_flat_slot();
 
@@ -247,13 +256,13 @@ bool test_reader_never_sees_a_reused_slot() {
     std::atomic<uint64_t> mismatches{0}, reads{0};
     auto reader = [&] {
         std::vector<char> got(elem);
-        std::vector<uint32_t> snapshot(n);
+        std::vector<RawVectorRID> snapshot(n);
         while (!stop.load()) {
             RawVectorHeap::ReadGuard guard(heap);
             // Like a search: collect the RIDs first, read the vectors after.
-            for (uint32_t id = 0; id < n; ++id) snapshot[id] = rid[id].load();
+            for (uint32_t id = 0; id < n; ++id) snapshot[id] = load_rid(rid[id]);
             for (uint32_t id = 0; id < n; ++id) {
-                RawVectorRID r{snapshot[id]};
+                const RawVectorRID r = snapshot[id];
                 if (!rid_is_active(r)) continue;
                 heap.read_vector(rid_flat_slot(r), got.data());
                 uint32_t stored_id;
@@ -273,14 +282,14 @@ bool test_reader_never_sees_a_reused_slot() {
     const uint32_t iterations = 20000;
     for (uint32_t it = 0; it <= iterations; ++it) {
         const uint32_t id = it % n;
-        RawVectorRID old{rid[id].load()};
-        rid[id].store(make_raw_vector_rid(rid_flat_slot(old), false).packed);
+        const RawVectorRID old = load_rid(rid[id]);
+        store_rid(rid[id], make_raw_vector_rid(rid_flat_slot(old), false));
         heap.free_slot(rid_flat_slot(old), free_list);
         if (it == 0) continue;
         const uint32_t prev = (it - 1) % n;
         uint32_t slot = heap.allocate_slot(free_list);
         heap.write_vector(slot, bytes_of(prev, it).data());
-        rid[prev].store(make_raw_vector_rid(slot, true).packed);
+        store_rid(rid[prev], make_raw_vector_rid(slot, true));
     }
     stop.store(true);
     for (auto& th : readers) th.join();
