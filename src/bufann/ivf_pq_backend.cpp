@@ -146,9 +146,11 @@ void ivf_pq_backend_insert(IVFPQBackend& backend, const BufANNConfig& config, Ta
         backend.heap.free_slot(slot, backend.delta.free_list);  // never published, so no reader can hold it
         throw;
     }
-    const uint32_t num_base = ivf_pq_num_base(backend.index);
-    backend.inserted_tag.resize(size_t(id) - num_base + 1, INVALID_TAG);
-    backend.inserted_tag[size_t(id) - num_base] = tag;
+    // Ids are reserved in prepare order but published in lock order, so a
+    // smaller id may arrive after a larger one has grown the map.
+    const size_t at = size_t(id) - ivf_pq_num_base(backend.index);
+    if (backend.inserted_tag.size() <= at) backend.inserted_tag.resize(at + 1, INVALID_TAG);
+    backend.inserted_tag[at] = tag;
     backend.inserted_id[tag] = id;
 }
 

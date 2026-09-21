@@ -126,25 +126,35 @@ struct Bench {
         return double(done) / seconds_since(t0);
     }
 
-    double recall() {
+    // Overall recall@k, and the recall of the ground-truth entries that are
+    // inserted vectors on their own (NaN when there are none): inserted
+    // vectors take a different scan path, so this shows whether they are
+    // found as reliably as base vectors.
+    std::pair<double, double> recall() {
         std::vector<std::vector<uint32_t>> gt = brute_force(base, n_total, live, queries, nq, dim, k);
-        std::atomic<size_t> hits{0};
+        const uint32_t n_base = ivf_pq_num_base(idx->ivf->index);
+        std::atomic<size_t> hits{0}, inserted_hits{0}, inserted_gt{0};
 #pragma omp parallel for schedule(dynamic, 16)
         for (int64_t q = 0; q < int64_t(nq); ++q) {
             std::vector<TagType> got = bufann_query<float>(*idx, queries + size_t(q) * dim, k, nprobe);
-            size_t h = 0;
-            for (TagType t : got) h += std::find(gt[q].begin(), gt[q].end(), t) != gt[q].end();
-            hits.fetch_add(h);
+            size_t h = 0, ih = 0, ig = 0;
+            for (uint32_t g : gt[q]) {
+                const bool hit = std::find(got.begin(), got.end(), g) != got.end();
+                h += hit;
+                if (g >= n_base) ig += 1, ih += hit;
+            }
+            hits.fetch_add(h), inserted_hits.fetch_add(ih), inserted_gt.fetch_add(ig);
         }
-        return double(hits.load()) / double(nq * k);
+        return {double(hits.load()) / double(nq * k), double(inserted_hits.load()) / double(inserted_gt.load())};
     }
 
     void report(const std::string& phase) {
         const size_t inserted = idx->ivf->index.rid_table.rid.size() - ivf_pq_num_base(idx->ivf->index);
         size_t live_count = std::count(live.begin(), live.end(), uint8_t(1));
-        const double qps_all = qps(threads), qps_one = qps(1), r = recall();
-        std::printf("%-34s %9zu %9zu %9zu %10.0f %9.0f %9.4f %7.2f\n", phase.c_str(), live_count, inserted,
-                    idx->ivf->delta.lists.tombstones.size(), qps_all, qps_one, r, rss_gb());
+        const double qps_all = qps(threads), qps_one = qps(1);
+        const auto r = recall();
+        std::printf("%-34s %9zu %9zu %9zu %10.0f %9.0f %9.4f %9.4f %7.2f\n", phase.c_str(), live_count, inserted,
+                    idx->ivf->delta.lists.tombstones.size(), qps_all, qps_one, r.first, r.second, rss_gb());
         std::fflush(stdout);
     }
 };
@@ -256,8 +266,8 @@ int main(int argc, char** argv) {
     }
     std::printf("queries %zu, k %u, nprobe %u, threads %u, rerank_m %u\n\n", b.nq, b.k, b.nprobe, b.threads,
                 std::max<uint32_t>(100, 10 * b.k));
-    std::printf("%-34s %9s %9s %9s %10s %9s %9s %7s\n", "phase", "live", "inserted", "tombst", "qps(all)", "qps(1t)",
-                "recall", "rss_gb");
+    std::printf("%-34s %9s %9s %9s %10s %9s %9s %9s %7s\n", "phase", "live", "inserted", "tombst", "qps(all)", "qps(1t)",
+                "recall", "rec(ins)", "rss_gb");
     b.report("base");
 
     // Inserts in steps: the delta grows and the search scans it per id.

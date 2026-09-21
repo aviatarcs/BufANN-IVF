@@ -18,6 +18,7 @@
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace diskann::inplace;
@@ -191,6 +192,30 @@ bool test_build_query_load(const std::string& tag, const std::string& prefix) {
     }
     t.check(insert_mismatches == 0, std::to_string(insert_mismatches) + " queries are not brute force over base + inserts");
     t.check(inserted_returned > 0, "no inserted tag was ever returned");
+    // Concurrent inserts publish in lock order, not id order; every tag must
+    // still resolve to its own vector afterwards.
+    const uint32_t NC = 800, CT = 8;
+    const TagType CONC_TAG = FIRST_TAG + NI;
+    std::vector<T> conc = synthetic<T>(NC, 9, 1.0f);
+    {
+        std::vector<std::thread> threads;
+        for (uint32_t th = 0; th < CT; ++th) {
+            threads.emplace_back([&, th] {
+                for (uint32_t i = th; i < NC; i += CT) bufann_insert<T>(*loaded, CONC_TAG + i, conc.data() + size_t(i) * DIM);
+            });
+        }
+        for (auto& th : threads) th.join();
+    }
+    size_t conc_self = 0;
+    loaded->config.ivf_rerank_m = 0;  // the default; a full re-rank per self-lookup is slow and not needed
+    for (uint32_t i = 0; i < NC; ++i) {
+        std::vector<TagType> got = bufann_query<T>(*loaded, conc.data() + size_t(i) * DIM, 1, NLIST);
+        conc_self += got.size() == 1 && got[0] == CONC_TAG + i;
+    }
+    loaded->config.ivf_rerank_m = N + NI;
+    t.check(conc_self == NC, std::to_string(NC - conc_self) + " concurrently inserted vectors do not resolve to their tag");
+    for (uint32_t i = 0; i < NC; ++i) bufann_delete<T>(*loaded, CONC_TAG + i);
+
     t.expect_throw_any("re-inserting an inserted tag", [&] { bufann_insert<T>(*loaded, FIRST_TAG, extra.data()); });
     t.expect_throw_any("inserting an active base tag", [&] { bufann_insert<T>(*loaded, 0, extra.data()); });
     t.expect_throw_any("inserting INVALID_TAG", [&] { bufann_insert<T>(*loaded, INVALID_TAG, extra.data()); });
