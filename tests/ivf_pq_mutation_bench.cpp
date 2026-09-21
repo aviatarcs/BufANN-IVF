@@ -25,6 +25,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <numeric>
@@ -234,9 +235,14 @@ int main(int argc, char** argv) {
     b.live.assign(n_total, 0);
     std::fill(b.live.begin(), b.live.begin() + n_base, 1);
 
+    // The run mutates the heap file (inserts grow it), after which the index
+    // file no longer describes it and a load is refused; a pristine copy of
+    // the heap taken right after the build is restored on --reuse_index.
     const std::string prefix = work_dir + "/ivf_pq_bench_" + std::to_string(n_base);
     const std::string base_bin = prefix + "_base.bin";
-    if (has_flag(argc, argv, "--reuse_index") && file_exists(prefix + "_ivf_pq_index.bin")) {
+    const std::string heap_path = prefix + "_ivf_raw_vectors.bin", pristine = heap_path + ".pristine";
+    if (has_flag(argc, argv, "--reuse_index") && file_exists(prefix + "_ivf_pq_index.bin") && file_exists(pristine)) {
+        std::filesystem::copy_file(pristine, heap_path, std::filesystem::copy_options::overwrite_existing);
         auto t0 = std::chrono::steady_clock::now();
         b.idx = bufann_load<float>(prefix, cfg);
         std::printf("loaded %s: %zu vectors in %.1f s\n", prefix.c_str(), n_base, seconds_since(t0));
@@ -246,6 +252,7 @@ int main(int argc, char** argv) {
         b.idx = bufann_build<float>(base_bin, prefix, cfg);
         std::printf("built %s: %zu vectors, nlist %u, %u chunks in %.1f s\n", prefix.c_str(), n_base, cfg.ivf_nlist,
                     cfg.ivf_pq_chunks, seconds_since(t0));
+        std::filesystem::copy_file(heap_path, pristine, std::filesystem::copy_options::overwrite_existing);
     }
     std::printf("queries %zu, k %u, nprobe %u, threads %u, rerank_m %u\n\n", b.nq, b.k, b.nprobe, b.threads,
                 std::max<uint32_t>(100, 10 * b.k));
