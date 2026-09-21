@@ -166,18 +166,27 @@ struct Built {
 
 // A private heap copy for a test that frees and refills slots: the tests
 // share one Built, and its base ids must keep addressing their vectors.
+// Copies the shared heap as it is now, or the file `source` as the index
+// file describes it (pristine_heap_path: the heap as built).
 struct HeapCopy {
     std::string path;
     RawVectorHeap heap;
-    HeapCopy(const std::string& prefix, const RawVectorHeap& shared, const std::string& name) : path(prefix + "_" + name + "_heap.bin") {
-        std::filesystem::copy_file(ivf_raw_vectors_path(prefix), path, std::filesystem::copy_options::overwrite_existing);
-        heap.open_existing(path, shared.layout(), shared.next_flat_slot(), shared.allocated_pages());
+    HeapCopy(const std::string& prefix, const std::string& name, const std::string& source,
+             const RawVectorHeapLayout& layout, uint32_t next_slot, uint32_t pages)
+        : path(prefix + "_" + name + "_heap.bin") {
+        std::filesystem::copy_file(source, path, std::filesystem::copy_options::overwrite_existing);
+        heap.open_existing(path, layout, next_slot, pages);
     }
+    HeapCopy(const std::string& prefix, const RawVectorHeap& shared, const std::string& name)
+        : HeapCopy(prefix, name, ivf_raw_vectors_path(prefix), shared.layout(), shared.next_flat_slot(),
+                   shared.allocated_pages()) {}
     ~HeapCopy() {
         heap.close();
         ::unlink(path.c_str());
     }
 };
+
+std::string pristine_heap_path(const std::string& prefix) { return prefix + "_pristine_heap.bin"; }
 
 template<typename T>
 std::unique_ptr<Built> build(const std::string& prefix, const std::vector<T>& base) {
@@ -197,6 +206,8 @@ std::unique_ptr<Built> build(const std::string& prefix, const std::vector<T>& ba
         ix.heap_pages = heap.allocated_pages();
         ix.heap_next_slot = heap.next_flat_slot();
         write_ivf_pq_index(prefix, ix);
+        std::filesystem::copy_file(ivf_raw_vectors_path(prefix), pristine_heap_path(prefix),
+                                   std::filesystem::copy_options::overwrite_existing);
     }
     auto built = std::make_unique<Built>();
     built->index = load_ivf_pq_index(prefix);
@@ -208,7 +219,7 @@ std::unique_ptr<Built> build(const std::string& prefix, const std::vector<T>& ba
 
 void remove_index_files(const std::string& prefix) {
     for (const std::string& f : {ivf_pq_index_path(prefix), ivf_raw_vectors_path(prefix), ivf_pq_pivots_path(prefix),
-                                 ivf_pq_codes_path(prefix)}) {
+                                 ivf_pq_codes_path(prefix), pristine_heap_path(prefix)}) {
         ::unlink(f.c_str());
     }
 }
@@ -610,17 +621,17 @@ bool test_inserts_race_searches(Built& b, const std::vector<float>& queries) {
     return t.done();
 }
 
-// Deletes, then an unpublished insert into a freed slot, close, then reopen
-// the heap under the index as the unchanged file has it (the copy in Built):
-// recovery must retract exactly the deleted vectors -- including the one
-// whose slot was refilled, which the bitmap alone would call live -- and
-// free every slot the file's vectors no longer hold.
+// Deletes on the heap as built, close, then reopen it under the index as
+// the unchanged file has it (the copy in Built): recovery must retract
+// exactly the deleted vectors and free exactly their slots. An insert that
+// refills a freed slot -- which the bitmap alone would call the deleted
+// vector, live -- must make the next load refuse instead.
 bool test_deletes_survive_a_reload(const std::string& prefix, Built& b, const std::vector<float>& base,
                                    const std::vector<float>& queries) {
-    TestCase t("f32: deletes are recovered from the occupancy bitmap when the index is loaded again");
+    TestCase t("f32: deletes are recovered from the heap when the index is loaded again; an insert refuses the load");
     IVFPQIndex ix = b.index;
     IVFPQDelta delta;
-    HeapCopy own(prefix, b.heap, "reload");
+    HeapCopy own(prefix, "reload", pristine_heap_path(prefix), ix.heap_layout, ix.heap_next_slot, ix.heap_pages);
     std::vector<uint8_t> dead(N, 0);
     std::vector<uint32_t> freed;
     for (uint32_t id = 5; id < N; id += 11) {
@@ -628,9 +639,6 @@ bool test_deletes_survive_a_reload(const std::string& prefix, Built& b, const st
         ivf_pq_delete(ix, own.heap, delta, id);
         dead[id] = 1;
     }
-    const uint32_t leaked = ivf_pq_prepare_insert<float>(ix, own.heap, delta, base.data()).slot;
-    t.check(std::count(freed.begin(), freed.end(), leaked) == 1 && own.heap.is_slot_occupied(leaked),
-            "the unpublished insert did not refill a freed slot");
     const uint32_t cursor = own.heap.next_flat_slot(), pages = own.heap.allocated_pages();
     own.heap.close();
 
@@ -648,18 +656,11 @@ bool test_deletes_survive_a_reload(const std::string& prefix, Built& b, const st
                  (recovered.lists.tombstones.count(id) != 0) != bool(dead[id]);
     }
     t.check(wrong == 0, std::to_string(wrong) + " vectors have the wrong RID or tombstone after the reload");
-    // Free: the deleted slots (the refilled one included) and the slots
-    // earlier tests' inserts took in the shared heap this copy came from.
-    std::vector<uint8_t> held(cursor, 0);
-    for (uint32_t id = 0; id < N; ++id) held[rid_flat_slot(b.index.rid_table.rid[id])] = !dead[id];
-    std::vector<uint32_t> expected_free;
-    for (uint32_t slot = 0; slot < cursor; ++slot) {
-        if (!held[slot]) expected_free.push_back(slot);
-    }
     std::vector<uint32_t> free_slots = recovered.free_list.free_slots;
     std::sort(free_slots.begin(), free_slots.end());
-    t.check(free_slots == expected_free && recovered.free_list.deferred.empty(),
-            "the rebuilt free list is not every slot no live listed vector holds");
+    std::sort(freed.begin(), freed.end());
+    t.check(free_slots == freed && recovered.free_list.deferred.empty(),
+            "the rebuilt free list is not exactly the deleted slots");
 
     IVFPQSearchScratch scratch;
     size_t mismatches = 0;
@@ -669,20 +670,25 @@ bool test_deletes_survive_a_reload(const std::string& prefix, Built& b, const st
         mismatches += !same_within_ties(got, brute_force(base, dead, query, K + 1));
     }
     t.check(mismatches == 0, std::to_string(mismatches) + " searches after the reload are not brute force over the live vectors");
-    const uint32_t id = ivf_pq_insert<float>(again, heap, recovered, queries.data());
-    t.check(heap.next_flat_slot() == cursor && !held[rid_flat_slot(again.rid_table.rid[id])],
-            "an insert after the reload did not reuse a recovered slot");
-
-    // A used delta is refused; two listed vectors on one slot resolve by
-    // owner: the one the slot names stays, the other is retracted.
+    // A used delta is refused, and so is a RID table that lists a vector on
+    // another vector's slot: its own slot is then occupied but unlisted.
     t.expect_throw("recovery into a used delta", [&] { ivf_pq_recover_deletes(again, heap, recovered); });
     IVFPQIndex shared = b.index;
     IVFPQDelta empty;
     shared.rid_table.rid[1] = shared.rid_table.rid[2];
-    const size_t shared_retracted = ivf_pq_recover_deletes(shared, heap, empty);
-    t.check(shared_retracted == freed.size() + 1 && !rid_is_active(shared.rid_table.rid[1]) &&
-                rid_is_active(shared.rid_table.rid[2]) && empty.lists.tombstones.count(1) == 1,
-            "a vector listed on another vector's slot was not retracted");
+    t.expect_throw("a vector listed on another vector's slot", [&] { ivf_pq_recover_deletes(shared, heap, empty); });
+
+    // An insert reuses a recovered slot; the file does not list it there,
+    // so the next load is refused rather than losing it.
+    const uint32_t id = ivf_pq_insert<float>(again, heap, recovered, queries.data());
+    t.check(heap.next_flat_slot() == cursor && std::binary_search(freed.begin(), freed.end(), rid_flat_slot(again.rid_table.rid[id])),
+            "an insert after the reload did not reuse a recovered slot");
+    heap.close();
+    heap.open_existing(own.path, again.heap_layout, cursor, pages);
+    IVFPQIndex third = b.index;
+    IVFPQDelta unused;
+    t.expect_throw("load over a heap with an insert the file does not list",
+                   [&] { ivf_pq_recover_deletes(third, heap, unused); });
     heap.close();
     return t.done();
 }

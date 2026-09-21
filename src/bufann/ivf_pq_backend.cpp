@@ -179,11 +179,9 @@ void ivf_pq_backend_delete(IVFPQBackend& backend, TagType tag) {
             throw std::invalid_argument("bufann_delete: tag " + std::to_string(tag) + " is not active");
         }
         slot = as_std_exception([&] { return ivf_pq_retract_delete(backend.index, backend.delta, id); });
-        const uint32_t num_base = ivf_pq_num_base(backend.index);
-        if (id >= num_base) {
-            backend.inserted_tag[id - num_base] = INVALID_TAG;
-            backend.inserted_id.erase(tag);
-        }
+        // inserted_tag keeps the entry: ids are never reused, and a query
+        // that found the vector before this delete still resolves its tag.
+        if (id >= ivf_pq_num_base(backend.index)) backend.inserted_id.erase(tag);
     }
     as_std_exception([&] { backend.heap.free_slot(slot, backend.delta.free_list); });
 }

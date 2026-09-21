@@ -62,10 +62,11 @@ void ivf_pq_delete(IVFPQIndex& ix, RawVectorHeap& heap, IVFPQDelta& delta, uint3
 
 // Reconciles a freshly loaded index with its heap, whose occupancy bits and
 // slot owners record deletes the index file does not: every listed vector
-// whose slot is not occupied under its id is retracted, and every slot
-// below the cursor that no listed vector holds goes on the free list.
-// Returns how many vectors it retracted. The delta must be empty and
-// nothing else may touch the index meanwhile.
+// whose slot is not occupied under its id is retracted, and every
+// unoccupied slot below the cursor goes on the free list. A slot occupied
+// by a vector the file does not list there is an insert since the file was
+// written, and the load is refused. Returns how many vectors it retracted.
+// The delta must be empty and nothing else may touch the index meanwhile.
 size_t ivf_pq_recover_deletes(IVFPQIndex& ix, const RawVectorHeap& heap, IVFPQDelta& delta);
 
 }  // namespace inplace

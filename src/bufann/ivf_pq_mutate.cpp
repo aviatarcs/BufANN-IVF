@@ -168,7 +168,12 @@ size_t ivf_pq_recover_deletes(IVFPQIndex& ix, const RawVectorHeap& heap, IVFPQDe
         }
     }
     for (uint32_t slot = 0; slot < cursor; ++slot) {
-        if (!held[slot]) delta.free_list.free_slots.push_back(slot);
+        if (held[slot]) continue;
+        IVF_PQ_REQUIRE(occupant[slot] == NONE,
+                       "raw-vector slot " + std::to_string(slot) + " holds vector " + std::to_string(occupant[slot]) +
+                           ", which the index file does not list there: an insert since the file was written, so the "
+                           "index cannot be loaded until the file is rewritten");
+        delta.free_list.free_slots.push_back(slot);
     }
     return retracted;
 }

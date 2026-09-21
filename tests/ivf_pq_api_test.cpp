@@ -328,7 +328,10 @@ bool test_deletes_survive_reload(const std::string& tag, const std::string& pref
     bufann_insert<T>(*loaded, 3, queries.data());
     t.check(loaded->ivf->heap.next_flat_slot() == slots && bufann_query<T>(*loaded, queries.data(), 1, NLIST) == std::vector<TagType>{3},
             "re-inserting a deleted tag after the reload grew the heap or is not found");
+    // That insert did not grow the heap, so only the slot's owner tells a
+    // load that the file is behind; the load must be refused, not lose it.
     bufann_free<T>(loaded);
+    t.expect_throw_any("reload after an insert into a freed slot", [&] { bufann_load<T>(prefix, cfg); });
 
     ::unlink(base_bin.c_str());
     for (const std::string& f : {ivf_pq_index_path(prefix), ivf_raw_vectors_path(prefix), ivf_pq_pivots_path(prefix),
