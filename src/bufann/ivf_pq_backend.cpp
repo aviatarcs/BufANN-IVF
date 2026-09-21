@@ -94,16 +94,30 @@ namespace {
 
 // Marks a tag in inserted_id whose insert is between reservation and publish.
 constexpr uint32_t IVF_PQ_PENDING_ID = 0xFFFFFFFFu;
+constexpr uint32_t IVF_PQ_NO_ID      = 0xFFFFFFFFu;
+
+// The id of the active vector under `tag`, or IVF_PQ_NO_ID. Caller holds
+// delta.mtx.
+uint32_t active_id(const IVFPQBackend& backend, TagType tag) {
+    auto inserted = backend.inserted_id.find(tag);
+    uint32_t id;
+    if (inserted != backend.inserted_id.end()) {
+        if (inserted->second == IVF_PQ_PENDING_ID) return IVF_PQ_NO_ID;
+        id = inserted->second;
+    } else if (tag < ivf_pq_num_base(backend.index)) {
+        id = tag;
+    } else {
+        return IVF_PQ_NO_ID;
+    }
+    return rid_is_active(load_rid(backend.index.rid_table.rid[id])) ? id : IVF_PQ_NO_ID;
+}
 
 // Whether `tag` names an active vector or one being inserted. Caller holds
 // delta.mtx.
 bool tag_is_taken(const IVFPQBackend& backend, TagType tag) {
     auto inserted = backend.inserted_id.find(tag);
-    if (inserted != backend.inserted_id.end()) {
-        return inserted->second == IVF_PQ_PENDING_ID ||
-               rid_is_active(load_rid(backend.index.rid_table.rid[inserted->second]));
-    }
-    return tag < ivf_pq_num_base(backend.index) && rid_is_active(load_rid(backend.index.rid_table.rid[tag]));
+    return (inserted != backend.inserted_id.end() && inserted->second == IVF_PQ_PENDING_ID) ||
+           active_id(backend, tag) != IVF_PQ_NO_ID;
 }
 
 }  // namespace
@@ -112,10 +126,9 @@ bool tag_is_taken(const IVFPQBackend& backend, TagType tag) {
 // tag cannot both get in, and the vector and its tag are published in one
 // critical section so a search never returns an id without a tag.
 template<typename T>
-void ivf_pq_backend_insert(IVFPQBackend& backend, const BufANNConfig& config, TagType tag, const T* coords) {
+void ivf_pq_backend_insert(IVFPQBackend& backend, TagType tag, const T* coords) {
     if (tag == INVALID_TAG) throw std::invalid_argument("bufann_insert: INVALID_TAG is reserved");
     if (coords == nullptr) throw std::invalid_argument("bufann_insert: coords is null");
-    (void)config;  // dim is checked against the index by the prepare step
     {
         std::unique_lock<WriterPreferringSharedMutex> lock(backend.delta.mtx);
         if (tag_is_taken(backend, tag)) {
@@ -154,31 +167,22 @@ void ivf_pq_backend_insert(IVFPQBackend& backend, const BufANNConfig& config, Ta
     backend.inserted_id[tag] = id;
 }
 
-// The tag is resolved and the vector retracted in one critical section, so a
-// concurrent insert of the same tag sees it free only once the delete is
-// visible to searches; the slot is freed after the lock is released, as
-// free_slot does heap I/O.
+// Resolving the tag and retracting the vector share one critical section,
+// so a concurrent insert of the tag sees it free only once the delete is
+// visible; the slot is freed outside it, as free_slot does heap I/O.
 void ivf_pq_backend_delete(IVFPQBackend& backend, TagType tag) {
-    auto not_active = [&] { return std::invalid_argument("bufann_delete: tag " + std::to_string(tag) + " is not active"); };
     uint32_t slot;
     {
         std::unique_lock<WriterPreferringSharedMutex> lock(backend.delta.mtx);
-        const uint32_t num_base = ivf_pq_num_base(backend.index);
-        auto inserted = backend.inserted_id.find(tag);
-        uint32_t id;
-        if (inserted != backend.inserted_id.end()) {
-            if (inserted->second == IVF_PQ_PENDING_ID) throw not_active();
-            id = inserted->second;
-        } else if (tag < num_base) {
-            id = tag;
-        } else {
-            throw not_active();
+        const uint32_t id = active_id(backend, tag);
+        if (id == IVF_PQ_NO_ID) {
+            throw std::invalid_argument("bufann_delete: tag " + std::to_string(tag) + " is not active");
         }
-        if (!rid_is_active(load_rid(backend.index.rid_table.rid[id]))) throw not_active();
         slot = as_std_exception([&] { return ivf_pq_retract_delete(backend.index, backend.delta, id); });
-        if (inserted != backend.inserted_id.end()) {
+        const uint32_t num_base = ivf_pq_num_base(backend.index);
+        if (id >= num_base) {
             backend.inserted_tag[id - num_base] = INVALID_TAG;
-            backend.inserted_id.erase(inserted);
+            backend.inserted_id.erase(tag);
         }
     }
     as_std_exception([&] { backend.heap.free_slot(slot, backend.delta.free_list); });
@@ -217,7 +221,7 @@ uint32_t ivf_pq_backend_query(IVFPQBackend& backend, const BufANNConfig& config,
     template std::unique_ptr<IVFPQBackend> ivf_pq_backend_build<T>(const std::string&, const std::string&,      \
                                                                    const BufANNConfig&);                        \
     template std::unique_ptr<IVFPQBackend> ivf_pq_backend_load<T>(const std::string&, const BufANNConfig&);     \
-    template void ivf_pq_backend_insert<T>(IVFPQBackend&, const BufANNConfig&, TagType, const T*);              \
+    template void ivf_pq_backend_insert<T>(IVFPQBackend&, TagType, const T*);                                  \
     template uint32_t ivf_pq_backend_query<T>(IVFPQBackend&, const BufANNConfig&, const T*, uint32_t, TagType*, \
                                               uint32_t, uint32_t, IVFPQSearchScratch&);
 IVF_PQ_INSTANTIATE_BACKEND(float)

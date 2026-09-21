@@ -2,13 +2,11 @@
 // BufANNConfig::index_type == IndexType::IvfPq. bufann_api.cpp dispatches
 // here; the graph paths are untouched.
 //
-// A base vector's tag is its row in the base file (the RID table is the
-// identity at build time); an inserted vector's tag is whatever the caller
-// gave bufann_insert, recorded in the tag maps below. Inserts and deletes
-// live in `delta` and the heap only: they are not in the index file until
-// the posting-list rebuild (PLAN). A reload is refused while inserts are
-// unfolded; deletes it recovers from the heap's occupancy bitmap
-// (ivf_pq_recover_deletes).
+// A base vector's tag is its row in the base file; an inserted vector's tag
+// is whatever bufann_insert was given, kept in the tag maps below. Inserts
+// and deletes live in `delta` and the heap until the posting-list rebuild:
+// a reload is refused while inserts are unfolded, and recovers deletes from
+// the heap (ivf_pq_recover_deletes).
 
 #pragma once
 
@@ -53,16 +51,15 @@ std::unique_ptr<IVFPQBackend> ivf_pq_backend_build(const std::string& data_bin, 
 template<typename T>
 std::unique_ptr<IVFPQBackend> ivf_pq_backend_load(const std::string& index_prefix, const BufANNConfig& config);
 
-// Inserts `coords` (config.dim elements) under `tag`, which must not be the
-// tag of an active vector. Throws std::invalid_argument on a bad tag,
+// Inserts `coords` (the index's dim elements) under `tag`, which must not be
+// the tag of an active vector. Throws std::invalid_argument on a bad tag,
 // std::runtime_error on an internal failure.
 template<typename T>
-void ivf_pq_backend_insert(IVFPQBackend& backend, const BufANNConfig& config, TagType tag, const T* coords);
+void ivf_pq_backend_insert(IVFPQBackend& backend, TagType tag, const T* coords);
 
 // Deletes the vector under `tag`. Throws std::invalid_argument when the tag
-// is not active (never inserted, already deleted, or still being inserted
-// by a concurrent bufann_insert), std::runtime_error on an internal
-// failure. The tag may be inserted again afterwards.
+// is not active (unknown, deleted, or mid-insert on another thread),
+// std::runtime_error on an internal failure.
 void ivf_pq_backend_delete(IVFPQBackend& backend, TagType tag);
 
 // Top-k search. `nprobe` 0 means config.ivf_nprobe; `rerank_m` 0 means

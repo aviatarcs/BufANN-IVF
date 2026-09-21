@@ -164,9 +164,8 @@ struct Built {
     IVFPQDelta delta;
 };
 
-// A private copy of the built heap for a test that frees and refills slots:
-// the tests share `Built` and each starts from a copy of its index, whose
-// base ids would otherwise address slots an earlier test refilled.
+// A private heap copy for a test that frees and refills slots: the tests
+// share one Built, and its base ids must keep addressing their vectors.
 struct HeapCopy {
     std::string path;
     RawVectorHeap heap;
@@ -396,12 +395,11 @@ bool test_inserted_vectors_are_found(const std::string& tag, Built& b, const std
     return t.done();
 }
 
-// Deletes every 7th base vector and every 3rd insert, then checks what
-// ivf_pq_delete left behind (RID, heap bit, delta), that no search returns a
-// deleted id, that full-probe searches are brute force / the PQ reference
-// over the live vectors, that a query whose whole PQ shortlist was deleted
-// still gets k live answers, and that freed slots are reused by inserts only
-// once no reader can still address them.
+// Deletes every 7th base vector and every 3rd insert, then checks what the
+// delete left behind, that searches are brute force / the PQ reference over
+// the live vectors, that a query whose whole PQ shortlist was deleted still
+// gets k live answers, and that freed slots are reused only once no reader
+// can still address them.
 template<typename T>
 bool test_deleted_vectors_are_gone(const std::string& tag, const std::string& prefix, Built& b,
                                    const std::vector<T>& base, const std::vector<T>& extra,
@@ -426,8 +424,8 @@ bool test_deleted_vectors_are_gone(const std::string& tag, const std::string& pr
         }
     }
     const uint32_t slots_before = heap.next_flat_slot();
-    // Registered before the first free, so every slot freed below stays out
-    // of reach of inserts until it is released (checked at the end).
+    // Registered before the first free, so every freed slot stays out of
+    // reach of inserts until it is released (checked at the end).
     std::optional<RawVectorHeap::ReadGuard> reader;
     reader.emplace(heap);
     for (uint32_t id : deleted) ivf_pq_delete(ix, heap, delta, id);
@@ -465,7 +463,7 @@ bool test_deleted_vectors_are_gone(const std::string& tag, const std::string& pr
             "a delete changed the vector count or the heap cursor");
 
     // A search for a deleted vector returns the nearest live one instead
-    // (every 4th of them: the full re-rank makes each query cost N heap reads).
+    // (a sample: the full re-rank costs N heap reads per query).
     IVFPQSearchScratch scratch;
     size_t came_back = 0, not_nearest_live = 0;
     for (size_t i = 0; i < deleted.size(); i += 4) {
@@ -501,9 +499,9 @@ bool test_deleted_vectors_are_gone(const std::string& tag, const std::string& pr
     }
     t.check(batch_mismatches == 0, std::to_string(batch_mismatches) + " batched results are not brute force over the live vectors");
 
-    // Delete a query's entire PQ shortlist (its 100 nearest by PQ distance):
-    // the search must still fill k from the live vectors behind them, which
-    // it cannot if deleted candidates are only dropped after selection.
+    // Delete a query's entire PQ shortlist: the search must still fill k from
+    // the live vectors behind it, which dropping deleted candidates only
+    // after selection cannot.
     const uint32_t M = 100;
     const float* crowded = queries.data();
     IVFPQSearchResult nearest = ivf_pq_search<T>(ix, heap, crowded, M, NLIST, 0, scratch, &delta);
@@ -612,13 +610,11 @@ bool test_inserts_race_searches(Built& b, const std::vector<float>& queries) {
     return t.done();
 }
 
-// Deletes, then an insert that takes a freed slot and is never published
-// (the file knows neither a published nor a crashed insert), close, then
-// reopen the heap under the index as loaded from the unchanged file (the
-// copy in Built): ivf_pq_recover_deletes must retract exactly the deleted
-// vectors -- including the one whose slot the insert refilled, which the
-// bitmap alone would call live -- and put every slot the file's vectors no
-// longer hold on the free list.
+// Deletes, then an unpublished insert into a freed slot, close, then reopen
+// the heap under the index as the unchanged file has it (the copy in Built):
+// recovery must retract exactly the deleted vectors -- including the one
+// whose slot was refilled, which the bitmap alone would call live -- and
+// free every slot the file's vectors no longer hold.
 bool test_deletes_survive_a_reload(const std::string& prefix, Built& b, const std::vector<float>& base,
                                    const std::vector<float>& queries) {
     TestCase t("f32: deletes are recovered from the occupancy bitmap when the index is loaded again");
@@ -652,9 +648,8 @@ bool test_deletes_survive_a_reload(const std::string& prefix, Built& b, const st
                  (recovered.lists.tombstones.count(id) != 0) != bool(dead[id]);
     }
     t.check(wrong == 0, std::to_string(wrong) + " vectors have the wrong RID or tombstone after the reload");
-    // Free: the deleted slots (the refilled one included) and every slot the
-    // file does not know, here those earlier tests' inserts took in the
-    // shared heap this copy was made from.
+    // Free: the deleted slots (the refilled one included) and the slots
+    // earlier tests' inserts took in the shared heap this copy came from.
     std::vector<uint8_t> held(cursor, 0);
     for (uint32_t id = 0; id < N; ++id) held[rid_flat_slot(b.index.rid_table.rid[id])] = !dead[id];
     std::vector<uint32_t> expected_free;
@@ -692,12 +687,11 @@ bool test_deletes_survive_a_reload(const std::string& prefix, Built& b, const st
     return t.done();
 }
 
-// One thread deletes base vectors and inserts fresh ones (which refill the
-// freed slots once reclaimable) while four search with a re-rank. Every
-// returned distance must be the exact distance to the returned id's vector:
-// a slot refilled under a search's re-rank would show as the replacement's
-// distance under the old id. A vector whose delete returned before a search
-// began must not be returned by it.
+// One thread deletes base vectors and inserts fresh ones into the freed
+// slots while four search with a re-rank. Every returned distance must be
+// the exact distance to the returned id's vector (a slot refilled under a
+// re-rank would show the replacement's distance), and a vector whose delete
+// returned before a search began must not be returned by it.
 bool test_churn_races_searches(const std::string& prefix, Built& b, const std::vector<float>& base,
                                const std::vector<float>& queries) {
     TestCase t("f32: deletes and slot-refilling inserts concurrent with searches never surface a deleted id or stale bytes");
@@ -779,10 +773,8 @@ bool test_churn_races_searches(const std::string& prefix, Built& b, const std::v
     return t.done();
 }
 
-// Eight threads take the delta's lock shared back to back, each holding it
-// for a spell of work like a search's delta scan; a writer must still get
-// in promptly every time. (glibc's reader-preferring std::shared_mutex
-// never lets it in here.)
+// Eight threads take the delta's lock shared back to back; a writer must
+// still get in promptly every time (a reader-preferring lock never lets it).
 bool test_writers_get_in_under_constant_readers() {
     TestCase t("a writer gets the delta lock under eight back-to-back readers");
     IVFPQDelta delta;
@@ -800,8 +792,8 @@ bool test_writers_get_in_under_constant_readers() {
             }
         });
     }
-    // The writer runs on its own thread so a starved lock() is a failure
-    // here, not a hang: the main thread gives each acquisition a deadline.
+    // The writer runs on its own thread so a starved lock() fails the test
+    // instead of hanging it.
     std::atomic<int> acquired{0};
     double worst_ms = 0.0;
     bool starved = false;
@@ -864,9 +856,7 @@ bool test_guards(const std::string& prefix, Built& b, const std::vector<float>& 
     IVFPQSearchResult after = ivf_pq_search<float>(ix, b.heap, extra.data(), 1, NLIST, 10, scratch, &delta);
     t.check(id == N && after.ids.size() == 1 && after.ids[0] == N, "the published insert was not found");
 
-    // A re-rank reads the slot its RID names and requires the slot to hold
-    // that vector, so a RID pointing at another vector's slot is an error,
-    // not a wrong distance.
+    // A re-rank requires the slot to hold the vector its RID names.
     ix.rid_table.rid[0] = ix.rid_table.rid[1];
     t.expect_throw("re-rank through a RID on another vector's slot",
                    [&] { ivf_pq_search<float>(ix, b.heap, extra.data(), 1, NLIST, N + 1, scratch, &delta); });

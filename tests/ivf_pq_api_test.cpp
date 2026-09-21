@@ -192,8 +192,8 @@ bool test_build_query_load(const std::string& tag, const std::string& prefix) {
     }
     t.check(insert_mismatches == 0, std::to_string(insert_mismatches) + " queries are not brute force over base + inserts");
     t.check(inserted_returned > 0, "no inserted tag was ever returned");
-    // Concurrent inserts publish in lock order, not id order; every tag must
-    // still resolve to its own vector afterwards.
+    // Concurrent inserts publish out of id order; every tag must still
+    // resolve to its own vector.
     const uint32_t NC = 800, CT = 8;
     const TagType CONC_TAG = FIRST_TAG + NI;
     std::vector<T> conc = synthetic<T>(NC, 9, 1.0f);
@@ -222,10 +222,9 @@ bool test_build_query_load(const std::string& tag, const std::string& prefix) {
     t.check(bufann_query<T>(*loaded, extra.data(), 1, NLIST) == std::vector<TagType>{FIRST_TAG},
             "a rejected insert disturbed the index");
 
-    // Deletes by tag: every 5th base tag through bufann_delete and every
-    // 4th inserted tag through bufann_delete_batch. A deleted tag is never
-    // returned, searches are brute force over the live vectors, and the tag
-    // is free to insert again (with a new vector, found under the old tag).
+    // Deletes by tag, single and batched: a deleted tag is never returned,
+    // searches are brute force over the live vectors, and the tag is free to
+    // insert again.
     std::vector<TagType> gone_base, gone_inserted;
     for (TagType tag = 0; tag < N; tag += 5) gone_base.push_back(tag);
     for (uint32_t i = 0; i < NI; i += 4) gone_inserted.push_back(FIRST_TAG + i);
@@ -268,9 +267,8 @@ bool test_build_query_load(const std::string& tag, const std::string& prefix) {
     t.check(bufann_query<T>(*loaded, row_of(gone_base[1]), 1, NLIST)[0] != gone_base[1],
             "a rejected delete disturbed the index");
 
-    // A deleted tag is reusable, base or inserted: the query for the new
-    // vector returns it. The new vectors are two live inserts, deleted first
-    // so the query is not a tie between the old and the new tag.
+    // A deleted tag, base or inserted, resolves to the vector re-inserted
+    // under it (two live inserts, deleted first so the query cannot tie).
     const T* moved_a = extra.data() + size_t(NI - 1) * DIM;
     const T* moved_b = extra.data() + size_t(NI - 2) * DIM;
     bufann_delete<T>(*loaded, FIRST_TAG + NI - 1);
@@ -295,8 +293,7 @@ bool test_build_query_load(const std::string& tag, const std::string& prefix) {
     return t.done();
 }
 
-// Build, delete tags, free, load: the deletes must hold, and the tags be
-// free to insert again into the slots they gave up.
+// Build, delete, free, load: the deletes hold and their slots are reused.
 template<typename T>
 bool test_deletes_survive_reload(const std::string& tag, const std::string& prefix) {
     TestCase t(tag + ": bufann_load recovers deletes from the heap's occupancy bitmap");

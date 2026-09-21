@@ -105,8 +105,6 @@ uint32_t ivf_pq_retract_delete(IVFPQIndex& ix, IVFPQDelta& delta, uint32_t id) {
     IVF_PQ_REQUIRE(id < ix.rid_table.rid.size(), "vector " + std::to_string(id) + " does not exist");
     const RawVectorRID rid = load_rid(ix.rid_table.rid[id]);
     IVF_PQ_REQUIRE(rid_is_active(rid), "vector " + std::to_string(id) + " is not active");
-    // Cleared first: from here on no search picks the slot up, and the
-    // heap's grace period covers any that already did.
     store_rid(ix.rid_table.rid[id], make_raw_vector_rid(rid_flat_slot(rid), false));
 
     if (id < ivf_pq_num_base(ix)) {
@@ -138,29 +136,31 @@ size_t ivf_pq_recover_deletes(IVFPQIndex& ix, const RawVectorHeap& heap, IVFPQDe
                        delta.free_list.free_slots.empty(),
                    "ivf_pq_recover_deletes needs a freshly loaded index and an empty delta");
     const RawVectorHeapLayout& layout = heap.layout();
-    const uint32_t pages = heap.allocated_pages();
     const uint32_t cursor = heap.next_flat_slot();
-    std::vector<uint8_t> occupied(size_t(pages) * layout.bitmap_bytes);
-    std::vector<uint32_t> owner(size_t(pages) * layout.slots_per_page);
-    for (uint32_t p = 0; p < pages; ++p) {
-        heap.read_page_directory(p, occupied.data() + size_t(p) * layout.bitmap_bytes,
-                                 owner.data() + size_t(p) * layout.slots_per_page);
+
+    // occupant[slot]: the owner id of an occupied slot, NONE otherwise.
+    const uint32_t NONE = 0xFFFFFFFFu;
+    std::vector<uint32_t> occupant(cursor, NONE);
+    std::vector<uint8_t> bitmap(layout.bitmap_bytes);
+    std::vector<uint32_t> owners(layout.slots_per_page);
+    for (uint32_t p = 0; p < heap.allocated_pages(); ++p) {
+        heap.read_page_directory(p, bitmap.data(), owners.data());
+        for (uint32_t i = 0; i < layout.slots_per_page; ++i) {
+            const uint32_t slot = p * layout.slots_per_page + i;
+            if (slot >= cursor) break;
+            if (bitmap[i / 8] & layout.bitmap_mask(i)) occupant[slot] = owners[i];
+        }
     }
-    auto holds = [&](uint32_t flat, uint32_t id) {
-        const bool bit = (occupied[size_t(layout.page_of(flat)) * layout.bitmap_bytes + layout.index_in_page(flat) / 8] &
-                          layout.bitmap_mask(layout.index_in_page(flat))) != 0;
-        return bit && owner[flat] == id;
-    };
 
     size_t retracted = 0;
-    std::vector<uint8_t> addressed(cursor, 0);
+    std::vector<uint8_t> held(cursor, 0);
     for (uint32_t id = 0; id < ix.rid_table.rid.size(); ++id) {
         const RawVectorRID rid = ix.rid_table.rid[id];
         const uint32_t slot = rid_flat_slot(rid);
         IVF_PQ_REQUIRE(slot < cursor, "RID of vector " + std::to_string(id) + " lies at or past the heap's slot cursor");
         if (!rid_is_active(rid)) continue;
-        if (holds(slot, id)) {
-            addressed[slot] = 1;
+        if (occupant[slot] == id) {
+            held[slot] = 1;
         } else {
             ix.rid_table.rid[id] = make_raw_vector_rid(slot, false);
             delta.lists.tombstones.insert(id);
@@ -168,7 +168,7 @@ size_t ivf_pq_recover_deletes(IVFPQIndex& ix, const RawVectorHeap& heap, IVFPQDe
         }
     }
     for (uint32_t slot = 0; slot < cursor; ++slot) {
-        if (!addressed[slot]) delta.free_list.free_slots.push_back(slot);
+        if (!held[slot]) delta.free_list.free_slots.push_back(slot);
     }
     return retracted;
 }

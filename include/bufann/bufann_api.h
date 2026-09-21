@@ -171,11 +171,10 @@ uint32_t bufann_snapshot_active_cap(const std::string& index_prefix);
 // coords   - raw vector with config.dim elements. Zero-padded internally
 //            to the aligned dimension.
 // search_L - beam width to use when finding the new node's neighbors.
-//            Pass 0 to use config.L. Unused by an IVF-PQ index, which
-//            assigns the point to its nearest partition; the point is
-//            searchable on return but lives only in memory and the heap
-//            file until the index file is rewritten, so bufann_load of the
-//            prefix is refused until then.
+//            Pass 0 to use config.L. Unused by an IVF-PQ index, where the
+//            point is searchable on return but is not in the index file
+//            until the rebuild rewrites it, so bufann_load of the prefix
+//            is refused until then.
 template<typename T>
 void bufann_insert(
     BufANNIndex<T>& idx,
@@ -188,11 +187,9 @@ void bufann_insert(
 // that set so the tag is invisible before graph repair runs.
 //
 // On an IVF-PQ index the delete is immediate: the vector is invisible to
-// searches on return, its heap slot is reusable once in-flight searches
-// finish, and the tag may be inserted again. A tag that is not active
-// throws std::invalid_argument. A delete is durable once its clear of the
-// slot's occupancy bit reaches the heap file: bufann_load recovers deletes
-// from the bitmap, since the index file is not rewritten until the rebuild.
+// searches on return and the tag may be inserted again; a tag that is not
+// active throws std::invalid_argument. The delete survives a bufann_load
+// through the heap file's occupancy bits.
 template<typename T>
 void bufann_delete(
     BufANNIndex<T>& idx,

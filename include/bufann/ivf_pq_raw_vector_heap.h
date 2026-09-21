@@ -1,10 +1,9 @@
 // IVF-PQ raw-vector heap: fixed-size slots in fixed-size pages, addressed by
 // flat slot index (see RawVectorRID). Plain pread/pwrite, no buffer pool.
 // open() creates a fresh heap; open_existing() resumes one from the geometry
-// and allocation cursor the index file recorded. Nothing else is persisted:
-// the free list is rebuilt on load from the page directories (occupancy
-// bitmap and slot owners, see ivf_pq_recover_deletes), and the heap file is
-// only meaningful together with the index file that describes it.
+// and allocation cursor the index file recorded; the free list is rebuilt
+// on load from the page directories (ivf_pq_recover_deletes). The heap file
+// is only meaningful together with the index file that describes it.
 
 #pragma once
 
@@ -46,18 +45,12 @@ public:
     void close();  // afterwards next_flat_slot() == allocated_pages() == 0
 
     // Grace period for slot reuse. A reader holds a ReadGuard from before it
-    // loads the RID of any vector until after its last read_vector; a slot
-    // freed while such a guard is held is not reused until that guard is
-    // released, so the bytes the reader gets are the vector whose RID it
-    // loaded (or, if the vector was deleted in between, still that vector's
-    // last bytes). Readers that enter after the free do not delay the reuse.
-    //
-    // This holds provided a deleter clears the RID's active bit with
-    // store_rid before it calls free_slot and readers use load_rid (both
-    // seq_cst): then a reader registered before the free, or one that loads
-    // the RID after it, sees the RID inactive. Every ReadGuard occupies one
-    // of max_readers registry entries; when all are taken, entering waits
-    // for one to be released.
+    // loads any RID until after its last read_vector; a slot freed while the
+    // guard is held is not reused until it is released, so the reader gets
+    // the bytes of the vector whose RID it loaded. Readers entering after
+    // the free do not delay the reuse. Requires the deleter to clear the RID
+    // (store_rid) before free_slot and readers to use load_rid, both seq_cst.
+    // A guard takes one of max_readers registry entries, waiting for a free one.
     class ReadGuard {
     public:
         explicit ReadGuard(const RawVectorHeap& heap);
@@ -77,11 +70,10 @@ public:
     // Records `owner` (the vector's id) and the bytes, then sets the occupancy bit.
     void write_vector(uint32_t flat_slot, uint32_t owner, const void* data);
     // Returns the slot's owner; throws if the page header is not the slot's
-    // page and geometry. Callers that know which vector they expect compare.
+    // page and geometry.
     uint32_t read_vector(uint32_t flat_slot, void* out) const;
     bool is_slot_occupied(uint32_t flat_slot) const;
-    // The page's occupancy bitmap (layout().bitmap_bytes bytes, bit i for
-    // slot i of the page, LSB first) and owner ids (slots_per_page of them)
+    // The page's occupancy bitmap (bitmap_bytes) and owner ids (slots_per_page)
     // in one read; verifies the page header.
     void read_page_directory(uint32_t page_id, uint8_t* bitmap, uint32_t* owners) const;
     // Clears the bit and defers the slot until the readers now registered have left.

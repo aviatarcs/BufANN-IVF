@@ -64,9 +64,9 @@ struct IVFPQSearchConfig {
 };
 
 // RawVectorRID: bit 31 is the active flag, the low 31 bits a flat heap slot.
-// A RID that searches may read concurrently with a delete or insert is
-// accessed through load_rid/store_rid, whose seq_cst ordering the heap's
-// free-slot grace period relies on (RawVectorHeap::ReadGuard).
+// RIDs that searches read concurrently with mutations go through
+// load_rid/store_rid; their seq_cst ordering is what RawVectorHeap::ReadGuard
+// relies on.
 struct RawVectorRID {
     uint32_t packed = 0;
 };
@@ -96,11 +96,10 @@ struct RawVectorRIDTable {
     std::vector<RawVectorRID> rid;
 };
 
-// Slots released by deletes, reused by inserts -- but not before every
-// search that may still address a slot has finished (RawVectorHeap::ReadGuard).
-// free_slot appends to `deferred` with the epoch of the free; allocate_slot
-// moves the entries no in-flight reader can still see onto `free_slots` and
-// pops from there. Both vectors are guarded by mtx.
+// Slots released by deletes. free_slot appends to `deferred` with the heap
+// epoch of the free; allocate_slot moves the entries no in-flight reader can
+// still address onto `free_slots` (see RawVectorHeap::ReadGuard) and pops
+// from there. Both vectors are guarded by mtx.
 struct RawVectorFreeList {
     struct Deferred {
         uint64_t epoch;      // RawVectorHeap epoch at the free
@@ -111,10 +110,9 @@ struct RawVectorFreeList {
     std::vector<uint32_t> free_slots;  // reusable now
 };
 
-// PostingListDelta: pending mutations not yet folded into PostingLists.
-// A deleted base vector stays in its posting list until the rebuild, so it
-// is tombstoned and searches skip it; a deleted inserted vector is simply
-// removed from pending_inserts, so tombstones never holds an inserted id.
+// PostingListDelta: pending mutations not yet folded into PostingLists. A
+// deleted base vector stays in its posting list until the rebuild, so it is
+// tombstoned; a deleted insert just leaves pending_inserts.
 struct PostingListDelta {
     std::unordered_map<uint32_t, std::vector<uint32_t>> pending_inserts;  // cluster_id -> vector_ids
     tsl::robin_set<uint32_t> tombstones;                                  // deleted base vector_ids
@@ -128,12 +126,10 @@ struct DynamicPQCodes {
 };
 
 // The delta's lock. std::shared_mutex is glibc's reader-preferring rwlock,
-// under which a writer waits for a moment with no reader at all; with a few
-// threads searching back to back that moment never comes and every insert
-// and delete stalls for good (seen: 8 searchers on SIFT1M starved 4
-// inserters indefinitely). This one makes new readers wait once a writer is
-// waiting, so a mutation gets in after the searches already inside leave.
-// Meets the SharedLockable requirements of std::shared_lock/unique_lock.
+// under which a writer waits for a moment with no reader at all; a few
+// threads searching back to back never leave one, and mutations stall for
+// good. This one holds new readers back while a writer waits. For the same
+// reason a thread must not take it shared twice without releasing.
 class WriterPreferringSharedMutex {
 public:
     WriterPreferringSharedMutex() {
@@ -148,26 +144,21 @@ public:
     WriterPreferringSharedMutex& operator=(const WriterPreferringSharedMutex&) = delete;
 
     void lock() { pthread_rwlock_wrlock(&_lock); }
-    bool try_lock() { return pthread_rwlock_trywrlock(&_lock) == 0; }
     void unlock() { pthread_rwlock_unlock(&_lock); }
     void lock_shared() { pthread_rwlock_rdlock(&_lock); }
-    bool try_lock_shared() { return pthread_rwlock_tryrdlock(&_lock) == 0; }
     void unlock_shared() { pthread_rwlock_unlock(&_lock); }
 
 private:
     pthread_rwlock_t _lock;
 };
 
-// IVFPQDelta: what mutations change that the index file does not hold, and
-// the lock that orders them against searches. An insert publishes and a
-// delete retracts under mtx held exclusively; a search holds it shared while
-// it reads the delta and the RID table (which inserts grow) and releases it
-// before its heap reads. Ids at or past the base count are inserts, with
-// codes in `codes` and posting-list membership in `lists`, until the rebuild
-// folds them into the index (write_ivf_pq_index refuses an index with
-// unfolded inserts). Deletes are likewise in memory and the heap's
-// occupancy bitmap only; the index file still lists the vector, and a load
-// retracts it again from the bitmap (ivf_pq_recover_deletes).
+// IVFPQDelta: what mutations change that the index file does not hold.
+// Mutations take mtx exclusively; a search holds it shared while it reads
+// the delta and the RID table (which inserts grow), never across heap I/O.
+// Ids at or past the base count are inserts, with codes in `codes` and list
+// membership in `lists`, until the rebuild folds them in (write_ivf_pq_index
+// refuses an index with unfolded inserts). Deletes reach the file only as
+// the heap's occupancy bits; a load recovers them (ivf_pq_recover_deletes).
 struct IVFPQDelta {
     mutable WriterPreferringSharedMutex mtx;
     PostingListDelta lists;

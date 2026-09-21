@@ -26,12 +26,9 @@ static_assert(sizeof(RawVectorPageHeader) == RAW_VECTOR_PAGE_HEADER_BYTES, "page
 
 // Page layout: [RawVectorPageHeader][occupancy bitmap, 1 bit per slot, LSB
 // first][owner ids, u32 per slot][slot 0..N-1][pad]. page_size and elem_size
-// determine the rest, and are what every page header records. A slot's owner
-// is the id of the vector written to it, so a slot can be checked against
-// the RID that led to it: on every read, and when a load reconciles the
-// index file's RID table with the heap (ivf_pq_recover_deletes), where an
-// occupied slot whose owner is another vector means the listed one was
-// deleted and the slot reused.
+// determine the rest, and are what every page header records. The owner is
+// the id of the vector in the slot, checked on every read and used by a
+// load to tell a listed vector from one deleted and overwritten since.
 constexpr uint32_t RAW_VECTOR_OWNER_BYTES = 4;
 
 struct RawVectorHeapLayout {
