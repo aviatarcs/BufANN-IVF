@@ -260,6 +260,14 @@ bool test_build_query_load(const std::string& tag, const std::string& prefix) {
         delete_mismatches += !ok;
     }
     t.check(delete_mismatches == 0, std::to_string(delete_mismatches) + " queries are not brute force over the live vectors");
+    {
+        const TagType batch[] = {11, 21, gone_base[0], 31};  // gone_base[0] is already deleted
+        t.expect_throw_any("delete_batch with a deleted tag in it", [&] { bufann_delete_batch<T>(*loaded, batch, 4); });
+        t.expect_throw_any("tag before the bad one was deleted", [&] { bufann_delete<T>(*loaded, 11); });
+        t.expect_throw_any("tag before the bad one was deleted", [&] { bufann_delete<T>(*loaded, 21); });
+        bufann_delete<T>(*loaded, 31);  // the one after it was not
+        dead[11] = dead[21] = dead[31] = 1;
+    }
     t.expect_throw_any("deleting a deleted base tag", [&] { bufann_delete<T>(*loaded, gone_base[0]); });
     t.expect_throw_any("deleting a deleted inserted tag", [&] { bufann_delete<T>(*loaded, gone_inserted[0]); });
     t.expect_throw_any("deleting a tag never inserted", [&] { bufann_delete<T>(*loaded, FIRST_TAG + NI); });
@@ -341,6 +349,102 @@ bool test_deletes_survive_reload(const std::string& tag, const std::string& pref
     return t.done();
 }
 
+// Four threads insert, delete and re-insert vectors under a shared pool of
+// tags while four query: no result may be INVALID_TAG or a tag outside the
+// pool, and afterwards every tag's state must match what its last mutation
+// left: live tags are their own nearest neighbour, dead ones refuse a delete.
+template<typename T>
+bool test_tag_churn_under_queries(const std::string& tag_name, const std::string& prefix) {
+    TestCase t(tag_name + ": concurrent inserts, deletes and queries by tag never surface a bad tag");
+    const std::string base_bin = prefix + "_base.bin";
+    std::vector<T> base = synthetic<T>(N, 1, 1.0f), queries = synthetic<T>(NQ, 2, 1.0f);
+    diskann::save_bin<T>(base_bin, base.data(), N, DIM);
+    BufANNIndex<T>* idx = bufann_build<T>(base_bin, prefix, ivf_config<T>());
+
+    // Pool: base tags [0, POOL) and new tags [FIRST, FIRST + POOL); each
+    // mutator owns a disjoint slice of both, so the oracle needs no lock.
+    const uint32_t POOL = 2000, MUTATORS = 4, ROUNDS = 6;
+    const TagType FIRST = 5000000;
+    std::vector<T> fresh = synthetic<T>(POOL, 8, 1.0f);
+    std::vector<uint8_t> live_base(POOL, 1), live_new(POOL, 0);
+    std::atomic<bool> stop{false};
+    std::atomic<size_t> failures{0}, searches{0};
+    auto mutator = [&](uint32_t m) {
+        std::mt19937 gen(m);
+        try {
+            for (uint32_t round = 0; round < ROUNDS; ++round) {
+                for (uint32_t i = m; i < POOL; i += MUTATORS) {
+                    // Toggle a base tag or a new tag; a new tag gets its own vector.
+                    if (gen() % 2 == 0) {
+                        if (live_base[i]) bufann_delete<T>(*idx, i);
+                        else bufann_insert<T>(*idx, i, base.data() + size_t(i) * DIM);
+                        live_base[i] = !live_base[i];
+                    } else {
+                        if (live_new[i]) bufann_delete<T>(*idx, FIRST + i);
+                        else bufann_insert<T>(*idx, FIRST + i, fresh.data() + size_t(i) * DIM);
+                        live_new[i] = !live_new[i];
+                    }
+                }
+            }
+        } catch (const std::exception& e) {
+            std::cout << "  mutator: " << e.what() << std::endl;
+            failures.fetch_add(1);
+        }
+    };
+    auto searcher = [&](uint32_t s) {
+        std::mt19937 gen(100 + s);
+        while (!stop.load()) {
+            try {
+                std::vector<TagType> got = bufann_query<T>(*idx, queries.data() + size_t(gen() % NQ) * DIM, K, 4);
+                bool ok = got.size() <= K;
+                for (TagType g : got) ok = ok && g != INVALID_TAG && (g < N || (g >= FIRST && g < FIRST + POOL));
+                if (!ok) failures.fetch_add(1);
+                searches.fetch_add(1);
+            } catch (...) {
+                failures.fetch_add(1);
+            }
+        }
+    };
+    std::vector<std::thread> threads;
+    for (uint32_t s = 0; s < 4; ++s) threads.emplace_back(searcher, s);
+    std::vector<std::thread> mutators;
+    for (uint32_t m = 0; m < MUTATORS; ++m) mutators.emplace_back(mutator, m);
+    for (auto& th : mutators) th.join();
+    stop.store(true);
+    for (auto& th : threads) th.join();
+    t.check(failures.load() == 0, std::to_string(failures.load()) + " mutations or queries failed");
+    t.check(searches.load() > 0, "no query ran during the churn");
+
+    size_t wrong = 0;
+    for (uint32_t i = 0; i < POOL; ++i) {
+        for (int which = 0; which < 2; ++which) {
+            const TagType tag = which == 0 ? i : FIRST + i;
+            const T* vec = which == 0 ? base.data() + size_t(i) * DIM : fresh.data() + size_t(i) * DIM;
+            const bool live = which == 0 ? live_base[i] : live_new[i];
+            if (live) {
+                std::vector<TagType> got = bufann_query<T>(*idx, vec, 1, NLIST);
+                wrong += !(got.size() == 1 && got[0] == tag);
+            } else {
+                try {
+                    bufann_delete<T>(*idx, tag);
+                    ++wrong;
+                } catch (const std::invalid_argument&) {
+                }
+            }
+        }
+    }
+    t.check(wrong == 0, std::to_string(wrong) + " tags do not match the state their last mutation left");
+    std::cout << "  " << searches.load() << " queries ran alongside " << ROUNDS * POOL << " mutations" << std::endl;
+
+    bufann_free<T>(idx);
+    ::unlink(base_bin.c_str());
+    for (const std::string& f : {ivf_pq_index_path(prefix), ivf_raw_vectors_path(prefix), ivf_pq_pivots_path(prefix),
+                                 ivf_pq_codes_path(prefix)}) {
+        ::unlink(f.c_str());
+    }
+    return t.done();
+}
+
 bool test_config_validation(const std::string& prefix) {
     TestCase t("IVF-PQ config validation and type mismatch on load");
     const std::string base_bin = prefix + "_base.bin";
@@ -386,6 +490,7 @@ int main() {
         all_pass &= test_build_query_load<float>("float", prefix + "_f32");
         all_pass &= test_build_query_load<uint8_t>("uint8", prefix + "_u8");
         all_pass &= test_deletes_survive_reload<float>("float", prefix + "_reload");
+        all_pass &= test_tag_churn_under_queries<float>("float", prefix + "_churn");
         all_pass &= test_config_validation(prefix + "_cfg");
     } catch (const std::exception& e) {
         std::cout << "  FAIL: " << e.what() << std::endl;

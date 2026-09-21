@@ -740,14 +740,21 @@ bool test_churn_races_searches(const std::string& prefix, Built& b, const std::v
             }
         }
     };
+    // Searcher 0 runs the batched path (one OpenMP loop per batch of 16).
     auto searcher = [&](uint32_t s) {
         IVFPQSearchScratch scratch;
         std::mt19937 gen(s);
         while (!stop.load()) {
-            const float* q = queries.data() + size_t(gen() % NQ) * DIM;
             const uint32_t before = seq.load();
+            const uint32_t nb = s == 0 ? 16 : 1;
+            const float* qs = queries.data() + size_t(gen() % (NQ - nb)) * DIM;
             try {
-                IVFPQSearchResult r = ivf_pq_search<float>(ix, heap, q, K, 4, 50, scratch, &delta);
+                std::vector<IVFPQSearchResult> rs =
+                    s == 0 ? ivf_pq_search_batch<float>(ix, heap, qs, nb, K, 4, 50, IVF_PQ_SEARCH_GEMM_ROWS, &delta)
+                           : std::vector<IVFPQSearchResult>{ivf_pq_search<float>(ix, heap, qs, K, 4, 50, scratch, &delta)};
+                for (uint32_t qi = 0; qi < nb; ++qi) {
+                const float* q = qs + size_t(qi) * DIM;
+                const IVFPQSearchResult& r = rs[qi];
                 bool ok = r.ids.size() <= K && std::is_sorted(r.dists.begin(), r.dists.end());
                 for (size_t i = 0; ok && i < r.ids.size(); ++i) {
                     const uint32_t id = r.ids[i];
@@ -758,13 +765,14 @@ bool test_churn_races_searches(const std::string& prefix, Built& b, const std::v
                 }
                 if (!ok) failures.fetch_add(1);
                 searches.fetch_add(1);
+                }
             } catch (...) {
                 failures.fetch_add(1);
             }
         }
     };
     std::vector<std::thread> threads;
-    for (uint32_t s = 0; s < 4; ++s) threads.emplace_back(searcher, 200 + s);
+    for (uint32_t s = 0; s < 4; ++s) threads.emplace_back(searcher, s);
     std::thread c(churner);
     c.join();
     stop.store(true);
@@ -776,6 +784,43 @@ bool test_churn_races_searches(const std::string& prefix, Built& b, const std::v
     t.check(refills.load() > 0, "no insert refilled a freed slot; the grace period was not exercised");
     std::cout << "  " << searches.load() << " searches ran alongside " << churn << " deletes and inserts, " << refills.load()
               << " of which refilled a freed slot" << std::endl;
+    return t.done();
+}
+
+// Deletes every base vector and inserts as many fresh ones, twice over: the
+// heap must not grow, every slot must be reused, and searches over an index
+// that lives entirely in the delta must be brute force over the inserts.
+bool test_full_turnover(const std::string& prefix, Built& b, const std::vector<float>& queries) {
+    TestCase t("f32: replacing every base vector reuses every slot and searches the delta alone");
+    IVFPQIndex ix = b.index;
+    IVFPQDelta delta;
+    HeapCopy own(prefix, "turnover", pristine_heap_path(prefix), ix.heap_layout, ix.heap_next_slot, ix.heap_pages);
+    const uint32_t cursor = own.heap.next_flat_slot();
+    std::vector<float> fresh = draw<float>(2 * N, 21);
+    IVFPQSearchScratch scratch;
+    for (uint32_t round = 0; round < 2; ++round) {
+        for (uint32_t id = round * N; id < (round + 1) * N; ++id) ivf_pq_delete(ix, own.heap, delta, id);
+        for (uint32_t i = 0; i < N; ++i) ivf_pq_insert<float>(ix, own.heap, delta, fresh.data() + size_t(round * N + i) * DIM);
+        if (!t.check(own.heap.next_flat_slot() == cursor, "round " + std::to_string(round) + " grew the heap")) break;
+
+        // Live: ids [(round+1)N, (round+2)N) = fresh rows [round N, (round+1) N).
+        std::vector<uint8_t> dead(ix.rid_table.rid.size(), 1);
+        std::fill(dead.begin() + (round + 1) * N, dead.end(), 0);
+        std::vector<float> all(size_t(ix.rid_table.rid.size()) * DIM, 0.0f);
+        std::copy_n(fresh.data() + size_t(round * N) * DIM, size_t(N) * DIM, all.begin() + size_t((round + 1) * N) * DIM);
+        size_t mismatches = 0;
+        for (uint32_t q = 0; q < NQ; ++q) {
+            const float* query = queries.data() + size_t(q) * DIM;
+            IVFPQSearchResult got = ivf_pq_search<float>(ix, own.heap, query, K, NLIST, N, scratch, &delta);
+            mismatches += !same_within_ties(got, brute_force(all, dead, query, K + 1));
+            IVFPQSearchResult got_pq = ivf_pq_search<float>(ix, own.heap, query, K, NLIST, 0, scratch, &delta);
+            mismatches += !same_within_ties(got_pq, pq_reference(ix, delta, dead, query, K + 1));
+        }
+        t.check(mismatches == 0, "round " + std::to_string(round) + ": " + std::to_string(mismatches) +
+                                     " searches are not brute force / the PQ reference over the inserts");
+    }
+    t.check(delta.lists.tombstones.size() == N && delta.codes.codes.size() == N,
+            "the delta does not hold exactly the base tombstones and the live inserts' codes");
     return t.done();
 }
 
@@ -900,6 +945,7 @@ int main() {
         all_pass &= test_deletes_survive_a_reload(prefix_f, *f, base_f, queries);
         all_pass &= test_inserts_race_searches(*f, queries);
         all_pass &= test_churn_races_searches(prefix_f, *f, base_f, queries);
+        all_pass &= test_full_turnover(prefix_f, *f, queries);
         all_pass &= test_writers_get_in_under_constant_readers();
         all_pass &= test_guards(prefix_f, *f, extra_f);
 

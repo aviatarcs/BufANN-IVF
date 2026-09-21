@@ -691,6 +691,11 @@ bool test_read_rejects_misplaced_page() {
         }
     }
     t.check(wrong == 0, std::to_string(wrong) + " slots were accepted from a bad page or rejected elsewhere");
+    std::vector<uint8_t> bitmap(layout.bitmap_bytes);
+    std::vector<uint32_t> owners(layout.slots_per_page);
+    heap.read_page_directory(0, bitmap.data(), owners.data());
+    t.check(owners[1] == 1 && (bitmap[0] & 0b10) != 0, "page 0's directory does not name slot 1's owner as occupied");
+    t.expect_throw("page directory of a misplaced page", [&] { heap.read_page_directory(2, bitmap.data(), owners.data()); });
 
     std::vector<char> before = read_whole_file(path);
     std::vector<char> page(PAGE, 0);
