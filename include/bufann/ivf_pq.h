@@ -133,8 +133,8 @@ struct DynamicPQCodes {
 // codes in `codes` and posting-list membership in `lists`, until the rebuild
 // folds them into the index (write_ivf_pq_index refuses an index with
 // unfolded inserts). Deletes are likewise in memory and the heap's
-// occupancy bitmap only: the index file still lists the vector, so a reload
-// of the prefix brings it back until the rebuild rewrites the file.
+// occupancy bitmap only; the index file still lists the vector, and a load
+// retracts it again from the bitmap (ivf_pq_recover_deletes).
 struct IVFPQDelta {
     mutable std::shared_mutex mtx;
     PostingListDelta lists;
@@ -167,9 +167,10 @@ inline uint32_t ivf_pq_num_base(const IVFPQIndex& index) {
 // Fixed layout, written and read as raw bytes; bump version on any change.
 // Version 2 added raw_vector_next_slot and the RawVectorPageHeader; version 3
 // grew that page header from 8 to 16 bytes to record page_size and elem_size,
-// which moves every slot in the heap file.
+// which moves every slot in the heap file; version 4 added the per-page
+// owner-id array between the bitmap and the slots, which moves them again.
 constexpr uint32_t IVF_PQ_INDEX_MAGIC   = 0x51465649;  // "IVFQ" little-endian
-constexpr uint32_t IVF_PQ_INDEX_VERSION = 3;
+constexpr uint32_t IVF_PQ_INDEX_VERSION = 4;
 
 struct IVFPQIndexFileHeader {
     uint32_t magic   = 0;

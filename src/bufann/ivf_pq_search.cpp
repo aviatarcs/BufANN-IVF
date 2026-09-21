@@ -186,7 +186,10 @@ IVFPQSearchResult search_from_centroid_dist(const IVFPQIndex& ix, const RawVecto
     scratch.raw_vector.resize(heap.layout().elem_size);
     const T* raw = reinterpret_cast<const T*>(scratch.raw_vector.data());
     for (size_t i = 0; i < scratch.shortlist.size(); ++i) {
-        heap.read_vector(scratch.shortlist_slot[i], scratch.raw_vector.data());
+        const uint32_t owner = heap.read_vector(scratch.shortlist_slot[i], scratch.raw_vector.data());
+        IVF_PQ_REQUIRE(owner == scratch.shortlist[i], "raw-vector slot " + std::to_string(scratch.shortlist_slot[i]) +
+                                                          " holds vector " + std::to_string(owner) + ", not " +
+                                                          std::to_string(scratch.shortlist[i]));
         for (uint32_t d = 0; d < dim; ++d) scratch.vector[d] = float(raw[d]);
         scratch.exact_dist[i] = sq_dist(query, scratch.vector.data(), dim);
     }

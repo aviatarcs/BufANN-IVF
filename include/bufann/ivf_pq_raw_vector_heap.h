@@ -1,9 +1,10 @@
 // IVF-PQ raw-vector heap: fixed-size slots in fixed-size pages, addressed by
 // flat slot index (see RawVectorRID). Plain pread/pwrite, no buffer pool.
 // open() creates a fresh heap; open_existing() resumes one from the geometry
-// and allocation cursor the index file recorded. Nothing else is persisted
-// (in particular not the free list), so the heap file is only meaningful
-// together with the index file that describes it.
+// and allocation cursor the index file recorded. Nothing else is persisted:
+// the free list is rebuilt on load from the page directories (occupancy
+// bitmap and slot owners, see ivf_pq_recover_deletes), and the heap file is
+// only meaningful together with the index file that describes it.
 
 #pragma once
 
@@ -73,9 +74,16 @@ public:
     // first when it is empty (reclaim_freed_slots), else grows the heap by a
     // page as needed.
     uint32_t allocate_slot(RawVectorFreeList& free_list);
-    void write_vector(uint32_t flat_slot, const void* data);  // sets the occupancy bit
-    void read_vector(uint32_t flat_slot, void* out) const;    // throws if the page header is not the slot's page and geometry
+    // Records `owner` (the vector's id) and the bytes, then sets the occupancy bit.
+    void write_vector(uint32_t flat_slot, uint32_t owner, const void* data);
+    // Returns the slot's owner; throws if the page header is not the slot's
+    // page and geometry. Callers that know which vector they expect compare.
+    uint32_t read_vector(uint32_t flat_slot, void* out) const;
     bool is_slot_occupied(uint32_t flat_slot) const;
+    // The page's occupancy bitmap (layout().bitmap_bytes bytes, bit i for
+    // slot i of the page, LSB first) and owner ids (slots_per_page of them)
+    // in one read; verifies the page header.
+    void read_page_directory(uint32_t page_id, uint8_t* bitmap, uint32_t* owners) const;
     // Clears the bit and defers the slot until the readers now registered have left.
     void free_slot(uint32_t flat_slot, RawVectorFreeList& free_list);
     // Moves onto free_list.free_slots every deferred slot that no registered
@@ -133,7 +141,7 @@ class RawVectorHeapBulkWriter {
 public:
     RawVectorHeapBulkWriter(RawVectorHeap& heap, uint32_t pages_per_flush);
 
-    uint32_t append(const void* data);  // returns the flat slot
+    uint32_t append(uint32_t owner, const void* data);  // returns the flat slot
     void finish();
 
 private:

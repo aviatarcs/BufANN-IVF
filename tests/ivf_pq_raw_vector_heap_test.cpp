@@ -24,7 +24,7 @@ using namespace diskann::inplace;
 namespace {
 
 const uint32_t PAGE = 4096;
-const uint32_t ELEM = 512;  // dim=128 fp32: 7 slots per page, 1 bitmap byte
+const uint32_t ELEM = 512;  // dim=128 fp32: 7 slots per page, 1 bitmap byte, 28 owner bytes
 
 std::vector<char> pattern(uint32_t i, uint32_t elem_size = ELEM) {
     return std::vector<char>(elem_size, static_cast<char>(i % 251 + 1));
@@ -38,28 +38,30 @@ std::vector<char> read_whole_file(const std::string& path) {
 bool test_layout() {
     TestCase t("layout matches the design-doc example and is maximal for every geometry");
     RawVectorHeapLayout l = compute_raw_vector_heap_layout(PAGE, ELEM);
-    t.check(l.slots_per_page == 7 && l.bitmap_bytes == 1 && l.slots_offset == 17,
-            "expected 7 slots, 1 bitmap byte, slots at offset 17");
+    t.check(l.slots_per_page == 7 && l.bitmap_bytes == 1 && l.owners_offset == 17 && l.slots_offset == 45,
+            "expected 7 slots, 1 bitmap byte, owners at offset 17, slots at offset 45");
 
     // Whatever the geometry, the page holds the slots and one more would not fit.
     for (uint32_t page : {64u, 512u, 4096u, 16384u}) {
-        for (uint32_t elem = 1; elem + RAW_VECTOR_PAGE_HEADER_BYTES + 1 <= page; elem += 7) {
+        for (uint32_t elem = 1; elem + RAW_VECTOR_PAGE_HEADER_BYTES + 1 + RAW_VECTOR_OWNER_BYTES <= page; elem += 7) {
             RawVectorHeapLayout g = compute_raw_vector_heap_layout(page, elem);
             auto bytes = [&](uint32_t slots) {
-                return uint64_t(RAW_VECTOR_PAGE_HEADER_BYTES) + (slots + 7) / 8 + uint64_t(slots) * elem;
+                return uint64_t(RAW_VECTOR_PAGE_HEADER_BYTES) + (slots + 7) / 8 +
+                       uint64_t(slots) * (RAW_VECTOR_OWNER_BYTES + elem);
             };
             if (!t.check(g.slots_per_page > 0 && bytes(g.slots_per_page) <= page &&
                              bytes(g.slots_per_page + 1) > page &&
                              g.bitmap_bytes == (g.slots_per_page + 7) / 8 &&
-                             g.slots_offset == RAW_VECTOR_PAGE_HEADER_BYTES + g.bitmap_bytes,
+                             g.owners_offset == RAW_VECTOR_PAGE_HEADER_BYTES + g.bitmap_bytes &&
+                             g.slots_offset == g.owners_offset + g.slots_per_page * RAW_VECTOR_OWNER_BYTES,
                          "page " + std::to_string(page) + " elem " + std::to_string(elem) +
                              " gave " + std::to_string(g.slots_per_page) + " slots")) {
                 break;
             }
         }
     }
-    t.expect_throw("one slot + header + bitmap byte exceeds the page",
-                   [] { compute_raw_vector_heap_layout(PAGE, PAGE - RAW_VECTOR_PAGE_HEADER_BYTES); });
+    t.expect_throw("one slot + header + bitmap byte + owner exceeds the page",
+                   [] { compute_raw_vector_heap_layout(PAGE, PAGE - RAW_VECTOR_PAGE_HEADER_BYTES - RAW_VECTOR_OWNER_BYTES); });
     t.expect_throw("elem_size == 0", [] { compute_raw_vector_heap_layout(PAGE, 0); });
     return t.done();
 }
@@ -81,8 +83,9 @@ bool page_header_is(const std::vector<char>& f, uint32_t page_id) {
 }
 
 // Pins the on-disk format: page header = magic + page id + page_size +
-// elem_size, bitmap bit i (LSB first) for slot i, slot i at
-// slots_offset + i * elem_size, second page at page_size.
+// elem_size, bitmap bit i (LSB first) for slot i, owner of slot i as a u32
+// at owners_offset + 4 * i, slot i at slots_offset + i * elem_size, second
+// page at page_size.
 bool test_on_disk_format() {
     TestCase t("on-disk page format: header, LSB-first bitmap, slot placement");
     std::string path = temp_path("ivf_heap_format");
@@ -90,9 +93,9 @@ bool test_on_disk_format() {
     heap.open(path, compute_raw_vector_heap_layout(PAGE, ELEM));
     RawVectorFreeList free_list;
     for (uint32_t i = 0; i < 8; ++i) heap.allocate_slot(free_list);  // pages 0 and 1
-    heap.write_vector(0, pattern(10).data());
-    heap.write_vector(2, pattern(12).data());
-    heap.write_vector(7, pattern(17).data());  // page 1, index 0
+    heap.write_vector(0, 10, pattern(10).data());
+    heap.write_vector(2, 12, pattern(12).data());
+    heap.write_vector(7, 17, pattern(17).data());  // page 1, index 0
     heap.close();
 
     std::vector<char> f = read_whole_file(path);
@@ -102,18 +105,25 @@ bool test_on_disk_format() {
     };
     t.check(f.size() == 2 * PAGE, "file is not exactly two pages");
     t.check(page_header_is(f, 0), "page 0 header is not magic + id 0 + geometry");
+    auto owner_is = [&](size_t offset, uint32_t id) {
+        uint32_t got;
+        std::memcpy(&got, f.data() + offset, 4);
+        return offset + 4 <= f.size() && got == id;
+    };
     t.check(uint8_t(f[16]) == 0b00000101, "page 0 bitmap is not bits 0 and 2");
-    t.check(slot_is(17, 10), "slot 0 not at offset 17");
-    t.check(slot_is(17 + 2 * ELEM, 12), "slot 2 not at offset 17 + 2 * elem_size");
+    t.check(owner_is(17, 10) && owner_is(17 + 2 * 4, 12), "owners of slots 0 and 2 not at offsets 17 and 25");
+    t.check(slot_is(45, 10), "slot 0 not at offset 45");
+    t.check(slot_is(45 + 2 * ELEM, 12), "slot 2 not at offset 45 + 2 * elem_size");
     t.check(page_header_is(f, 1), "page 1 header is not magic + id 1 + geometry");
     t.check(uint8_t(f[PAGE + 16]) == 0b00000001, "page 1 bitmap is not bit 0");
-    t.check(slot_is(PAGE + 17, 17), "slot 7 not at page 1 offset 17");
+    t.check(owner_is(PAGE + 17, 17), "owner of slot 7 not at page 1 offset 17");
+    t.check(slot_is(PAGE + 45, 17), "slot 7 not at page 1 offset 45");
     ::unlink(path.c_str());
     return t.done();
 }
 
 bool test_allocate_write_read_free_reuse() {
-    TestCase t("allocate/write/read/free/reuse across multiple pages");
+    TestCase t("allocate/write/read/free/reuse across multiple pages, owners and the page directory");
     std::string path = temp_path("ivf_heap_basic");
     RawVectorHeap heap;
     heap.open(path, compute_raw_vector_heap_layout(PAGE, ELEM));
@@ -123,13 +133,13 @@ bool test_allocate_write_read_free_reuse() {
     std::vector<uint32_t> slots(n);
     for (uint32_t i = 0; i < n; ++i) {
         slots[i] = heap.allocate_slot(free_list);
-        heap.write_vector(slots[i], pattern(i).data());
+        heap.write_vector(slots[i], i, pattern(i).data());
     }
     std::vector<char> got(ELEM);
     for (uint32_t i = 0; i < n; ++i) {
-        heap.read_vector(slots[i], got.data());
-        t.check(got == pattern(i) && heap.is_slot_occupied(slots[i]),
-                "vector " + std::to_string(i) + " did not read back");
+        const uint32_t owner = heap.read_vector(slots[i], got.data());
+        t.check(got == pattern(i) && owner == i && heap.is_slot_occupied(slots[i]),
+                "vector " + std::to_string(i) + " did not read back under its owner");
     }
 
     // Free every other slot; reallocation must hand back exactly those.
@@ -146,9 +156,30 @@ bool test_allocate_write_read_free_reuse() {
     std::sort(reused.begin(), reused.end());
     t.check(reused == freed, "reallocation did not reuse the freed slots");
 
-    heap.write_vector(reused[0], pattern(999).data());
-    heap.read_vector(reused[0], got.data());
-    t.check(got == pattern(999), "reused slot did not round-trip after refill");
+    heap.write_vector(reused[0], 999, pattern(999).data());
+    t.check(heap.read_vector(reused[0], got.data()) == 999 && got == pattern(999),
+            "reused slot did not round-trip after refill under its new owner");
+
+    // The page directory is the bitmap and the owners as read back per slot;
+    // freed slots keep their last owner, only the bit says they are free.
+    const RawVectorHeapLayout& layout = heap.layout();
+    std::vector<uint8_t> bitmap(layout.bitmap_bytes);
+    std::vector<uint32_t> owners(layout.slots_per_page);
+    size_t directory_wrong = 0;
+    for (uint32_t page = 0; page < heap.allocated_pages(); ++page) {
+        heap.read_page_directory(page, bitmap.data(), owners.data());
+        for (uint32_t i = 0; i < layout.slots_per_page; ++i) {
+            const uint32_t flat = page * layout.slots_per_page + i;
+            if (flat >= heap.next_flat_slot()) break;
+            const bool bit = (bitmap[i / 8] & layout.bitmap_mask(i)) != 0;
+            const uint32_t owner = heap.read_vector(flat, got.data());
+            const bool freed_now = std::find(freed.begin(), freed.end(), flat) != freed.end() && flat != reused[0];
+            directory_wrong += bit != !freed_now || owners[i] != owner;
+        }
+    }
+    t.check(directory_wrong == 0, std::to_string(directory_wrong) + " slots disagree between the page directory and per-slot reads");
+    t.expect_throw("page directory past the allocated pages",
+                   [&] { heap.read_page_directory(heap.allocated_pages(), bitmap.data(), owners.data()); });
 
     heap.close();
     ::unlink(path.c_str());
@@ -247,7 +278,7 @@ bool test_reader_never_sees_a_reused_slot() {
     };
     for (uint32_t id = 0; id < n; ++id) {
         uint32_t slot = heap.allocate_slot(free_list);
-        heap.write_vector(slot, bytes_of(id, 0).data());
+        heap.write_vector(slot, id, bytes_of(id, 0).data());
         store_rid(rid[id], make_raw_vector_rid(slot, true));
     }
     const uint32_t slots_before = heap.next_flat_slot();
@@ -288,7 +319,7 @@ bool test_reader_never_sees_a_reused_slot() {
         if (it == 0) continue;
         const uint32_t prev = (it - 1) % n;
         uint32_t slot = heap.allocate_slot(free_list);
-        heap.write_vector(slot, bytes_of(prev, it).data());
+        heap.write_vector(slot, prev, bytes_of(prev, it).data());
         store_rid(rid[prev], make_raw_vector_rid(slot, true));
     }
     stop.store(true);
@@ -327,7 +358,7 @@ bool test_concurrent_bitmap_updates() {
 
         std::vector<std::thread> threads;
         for (uint32_t s : slots) {
-            threads.emplace_back([&, s] { heap.write_vector(s, buf.data()); });
+            threads.emplace_back([&, s] { heap.write_vector(s, s, buf.data()); });
         }
         for (auto& th : threads) th.join();
         bool all_set = std::all_of(slots.begin(), slots.end(),
@@ -355,7 +386,7 @@ bool test_rejects_slots_past_the_rid_slot_space() {
     TestCase t("allocate_slot hands out the last addressable slot, then refuses");
     std::string path = temp_path("ivf_heap_full");
     RawVectorHeap heap;
-    heap.open(path, compute_raw_vector_heap_layout(PAGE, PAGE - RAW_VECTOR_PAGE_HEADER_BYTES - 1));  // 1 slot per page
+    heap.open(path, compute_raw_vector_heap_layout(PAGE, PAGE - RAW_VECTOR_PAGE_HEADER_BYTES - 1 - RAW_VECTOR_OWNER_BYTES));  // 1 slot per page
     RawVectorFreeList free_list;
 
     // Page count already past the cursor, so neither call extends the file.
@@ -376,7 +407,7 @@ bool test_open_refuses_existing_nonempty_file() {
     RawVectorHeap heap;
     heap.open(path, layout);
     RawVectorFreeList free_list;
-    heap.write_vector(heap.allocate_slot(free_list), pattern(1).data());
+    heap.write_vector(heap.allocate_slot(free_list), 1, pattern(1).data());
     heap.close();
 
     RawVectorHeap again;
@@ -399,7 +430,7 @@ void write_closed_heap(const std::string& path, const RawVectorHeapLayout& layou
     heap.open(path, layout);
     RawVectorFreeList free_list;
     for (uint32_t i = 0; i < n; ++i) {
-        heap.write_vector(heap.allocate_slot(free_list), pattern(i).data());
+        heap.write_vector(heap.allocate_slot(free_list), i, pattern(i).data());
     }
     heap.close();
 }
@@ -414,7 +445,7 @@ bool test_reopen_resumes_the_heap() {
         RawVectorHeap heap;
         heap.open(path, layout);
         RawVectorHeapBulkWriter writer(heap, 2);
-        for (uint32_t i = 0; i < n; ++i) writer.append(pattern(i).data());
+        for (uint32_t i = 0; i < n; ++i) writer.append(i, pattern(i).data());
         writer.finish();
     }
     std::vector<char> before = read_whole_file(path);
@@ -437,7 +468,7 @@ bool test_reopen_resumes_the_heap() {
     const uint32_t m = 6 * spp + 1;
     for (uint32_t i = n; i < m; ++i) {
         if (heap.allocate_slot(free_list) != i) t.check(false, "allocation after reopen skipped slot " + std::to_string(i));
-        heap.write_vector(i, pattern(i).data());
+        heap.write_vector(i, i, pattern(i).data());
     }
     t.check(heap.allocated_pages() == 7, "growth after reopen did not add exactly one page");
     heap.close();
@@ -686,7 +717,7 @@ void check_bulk_load(TestCase& t, const std::string& tag, uint32_t n, uint32_t p
     {
         RawVectorHeapBulkWriter writer(bulk, pages_per_flush);
         for (uint32_t i = 0; i < n; ++i) {
-            if (writer.append(pattern(i).data()) != i) fail("vector " + std::to_string(i) + " not in slot i");
+            if (writer.append(i, pattern(i).data()) != i) fail("vector " + std::to_string(i) + " not in slot i");
         }
         writer.finish();
     }
@@ -695,7 +726,7 @@ void check_bulk_load(TestCase& t, const std::string& tag, uint32_t n, uint32_t p
     per_slot.open(slot_path, layout);
     RawVectorFreeList unused;
     for (uint32_t i = 0; i < n; ++i) {
-        per_slot.write_vector(per_slot.allocate_slot(unused), pattern(i).data());
+        per_slot.write_vector(per_slot.allocate_slot(unused), i, pattern(i).data());
     }
 
     if (bulk.next_flat_slot() != per_slot.next_flat_slot() ||
@@ -714,7 +745,7 @@ void check_bulk_load(TestCase& t, const std::string& tag, uint32_t n, uint32_t p
         RawVectorFreeList free_list;
         uint32_t next = bulk.allocate_slot(free_list);
         if (next != n) fail("allocate_slot after load returned " + std::to_string(next));
-        bulk.write_vector(next, pattern(999).data());
+        bulk.write_vector(next, 999, pattern(999).data());
         std::vector<char> got(ELEM);
         bulk.read_vector(n - 1, got.data());
         if (got != pattern(n - 1)) fail("post-load write clobbered the last bulk slot");
@@ -750,10 +781,10 @@ bool test_bulk_writer_rejects_misuse() {
     t.expect_throw("pages_per_flush == 0", [&] { RawVectorHeapBulkWriter w(heap, 0); });
 
     RawVectorHeapBulkWriter writer(heap, 2);
-    writer.append(pattern(0).data());
+    writer.append(0, pattern(0).data());
     writer.finish();
     writer.finish();  // idempotent
-    t.expect_throw("append after finish", [&] { writer.append(pattern(1).data()); });
+    t.expect_throw("append after finish", [&] { writer.append(1, pattern(1).data()); });
     t.check(heap.next_flat_slot() == 1, "cursor moved by a rejected append");
     t.expect_throw("bulk writer on a non-empty heap", [&] { RawVectorHeapBulkWriter w(heap, 2); });
 
@@ -777,11 +808,11 @@ bool test_rejects_bad_layout_and_out_of_range_slots() {
     for (int i = 0; i < 3; ++i) last = heap.allocate_slot(free_list);  // page 0 only
     std::vector<char> buf(ELEM);
     uint32_t past = 7;  // first slot of page 1, which does not exist
-    t.expect_throw("write past allocated pages", [&] { heap.write_vector(past, buf.data()); });
+    t.expect_throw("write past allocated pages", [&] { heap.write_vector(past, past, buf.data()); });
     t.expect_throw("read past allocated pages", [&] { heap.read_vector(past, buf.data()); });
     t.expect_throw("occupancy past allocated pages", [&] { heap.is_slot_occupied(past); });
     t.expect_throw("free past allocated pages", [&] { heap.free_slot(past, free_list); });
-    heap.write_vector(last, buf.data());  // slots within page 0 still work
+    heap.write_vector(last, last, buf.data());  // slots within page 0 still work
     t.check(heap.is_slot_occupied(last) && heap.allocated_pages() == 1, "in-range slot rejected");
 
     t.expect_throw("cursor past the pages", [&] { heap.restore_slot_cursor(8, 1); });

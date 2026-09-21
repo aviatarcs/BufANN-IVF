@@ -6,8 +6,9 @@
 // identity at build time); an inserted vector's tag is whatever the caller
 // gave bufann_insert, recorded in the tag maps below. Inserts and deletes
 // live in `delta` and the heap only: they are not in the index file until
-// the posting-list rebuild (PLAN), so a reload drops the inserts and
-// brings the deleted base vectors back.
+// the posting-list rebuild (PLAN). A reload is refused while inserts are
+// unfolded; deletes it recovers from the heap's occupancy bitmap
+// (ivf_pq_recover_deletes).
 
 #pragma once
 

@@ -222,7 +222,7 @@ void assign_ivf_clusters(const std::string& data_bin, const IVFMetadata& meta,
         std::copy_n(block_closest.data(), cur, assignments.cluster_id.begin() + start);
 
         for (size_t i = 0; i < cur; ++i) {
-            uint32_t slot = writer.append(block.data() + i * dim);
+            uint32_t slot = writer.append(uint32_t(start + i), block.data() + i * dim);
             rid_table.rid[start + i] = make_raw_vector_rid(slot, true);
         }
     }

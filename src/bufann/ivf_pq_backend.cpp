@@ -85,6 +85,7 @@ std::unique_ptr<IVFPQBackend> ivf_pq_backend_load(const std::string& index_prefi
                                  "-byte elements, not the " + std::to_string(sizeof(T)) + "-byte T requested");
     }
     backend->heap.open_existing(ivf_raw_vectors_path(index_prefix), ix.heap_layout, ix.heap_next_slot, ix.heap_pages);
+    ivf_pq_recover_deletes(backend->index, backend->heap, backend->delta);
     return backend;
     });
 }

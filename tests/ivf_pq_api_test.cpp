@@ -270,6 +270,52 @@ bool test_build_query_load(const std::string& tag, const std::string& prefix) {
     return t.done();
 }
 
+// Build, delete tags, free, load: the deletes must hold, and the tags be
+// free to insert again into the slots they gave up.
+template<typename T>
+bool test_deletes_survive_reload(const std::string& tag, const std::string& prefix) {
+    TestCase t(tag + ": bufann_load recovers deletes from the heap's occupancy bitmap");
+    const std::string base_bin = prefix + "_base.bin";
+    std::vector<T> base = synthetic<T>(N, 1, 1.0f), queries = synthetic<T>(NQ, 2, 1.0f);
+    diskann::save_bin<T>(base_bin, base.data(), N, DIM);
+    BufANNConfig cfg = ivf_config<T>();
+    cfg.ivf_rerank_m = N;
+
+    BufANNIndex<T>* idx = bufann_build<T>(base_bin, prefix, cfg);
+    std::vector<uint8_t> dead(N, 0);
+    for (TagType tag = 3; tag < N; tag += 9) bufann_delete<T>(*idx, tag), dead[tag] = 1;
+    const uint32_t slots = idx->ivf->heap.next_flat_slot();
+    bufann_free<T>(idx);
+
+    BufANNIndex<T>* loaded = bufann_load<T>(prefix, cfg);
+    size_t mismatches = 0;
+    for (uint32_t q = 0; q < NQ; ++q) {
+        const T* query = queries.data() + size_t(q) * DIM;
+        std::vector<TagType> got = bufann_query<T>(*loaded, query, K, NLIST);
+        std::vector<TagType> truth = brute_force<T>(base, query, K, dead);
+        bool ok = got.size() == K;
+        for (uint32_t i = 0; ok && i < K; ++i) {
+            const float want = sq_dist(base.data() + size_t(truth[i]) * DIM, query);
+            const float have = sq_dist(base.data() + size_t(got[i]) * DIM, query);
+            ok = !dead[got[i]] && std::fabs(have - want) <= 1e-5f * std::max(have, want);
+        }
+        mismatches += !ok;
+    }
+    t.check(mismatches == 0, std::to_string(mismatches) + " queries after the reload are not brute force over the live vectors");
+    t.expect_throw_any("deleting a tag deleted before the reload", [&] { bufann_delete<T>(*loaded, 3); });
+    bufann_insert<T>(*loaded, 3, queries.data());
+    t.check(loaded->ivf->heap.next_flat_slot() == slots && bufann_query<T>(*loaded, queries.data(), 1, NLIST) == std::vector<TagType>{3},
+            "re-inserting a deleted tag after the reload grew the heap or is not found");
+    bufann_free<T>(loaded);
+
+    ::unlink(base_bin.c_str());
+    for (const std::string& f : {ivf_pq_index_path(prefix), ivf_raw_vectors_path(prefix), ivf_pq_pivots_path(prefix),
+                                 ivf_pq_codes_path(prefix)}) {
+        ::unlink(f.c_str());
+    }
+    return t.done();
+}
+
 bool test_config_validation(const std::string& prefix) {
     TestCase t("IVF-PQ config validation and type mismatch on load");
     const std::string base_bin = prefix + "_base.bin";
@@ -314,6 +360,7 @@ int main() {
     try {
         all_pass &= test_build_query_load<float>("float", prefix + "_f32");
         all_pass &= test_build_query_load<uint8_t>("uint8", prefix + "_u8");
+        all_pass &= test_deletes_survive_reload<float>("float", prefix + "_reload");
         all_pass &= test_config_validation(prefix + "_cfg");
     } catch (const std::exception& e) {
         std::cout << "  FAIL: " << e.what() << std::endl;

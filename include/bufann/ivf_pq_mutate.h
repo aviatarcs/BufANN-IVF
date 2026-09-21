@@ -27,21 +27,23 @@ void ivf_pq_encode(const PQMetadata& pq, const float* x, uint8_t* code);
 // backend's tag maps) in the same critical section as the vector.
 //
 // prepare: partition and code of the vector (ix.meta.dim elements of T; the
-// heap's elem_size must be dim * sizeof(T)), and its raw bytes written to a
-// slot from the free list or the end of the heap. Nothing addresses the
-// slot yet, so this takes no lock and may run concurrently with searches.
+// heap's elem_size must be dim * sizeof(T)), the next unused id (ids are
+// never reused), and its raw bytes written under that id to a slot from
+// the free list or the end of the heap. The id is reserved under delta.mtx
+// with an inactive RID, which no search consults since the id is in no
+// list yet; the heap write happens unlocked. A prepare that fails after
+// the reservation leaves the id inactive for good.
 struct IVFPQPreparedInsert {
+    uint32_t id      = 0;
     uint32_t cluster = 0;
     uint32_t slot    = 0;
     std::vector<uint8_t> code;  // [chunks]
 };
 template<typename T>
-IVFPQPreparedInsert ivf_pq_prepare_insert(const IVFPQIndex& ix, RawVectorHeap& heap, IVFPQDelta& delta,
-                                          const T* vec);
+IVFPQPreparedInsert ivf_pq_prepare_insert(IVFPQIndex& ix, RawVectorHeap& heap, IVFPQDelta& delta, const T* vec);
 
-// publish: gives the vector the next unused id (ids are never reused) and
-// makes it visible to searches: assignment, active RID, delta membership
-// and code, all at once. The caller holds delta.mtx exclusively.
+// publish: makes the vector visible to searches: active RID, delta
+// membership and code, all at once. The caller holds delta.mtx exclusively.
 uint32_t ivf_pq_publish_insert(IVFPQIndex& ix, IVFPQDelta& delta, IVFPQPreparedInsert&& prepared);
 
 // Both steps; searches see the vector once the call returns.
@@ -61,6 +63,17 @@ uint32_t ivf_pq_retract_delete(IVFPQIndex& ix, IVFPQDelta& delta, uint32_t id);
 
 // Both steps; the slot is on the free list's deferred entries on return.
 void ivf_pq_delete(IVFPQIndex& ix, RawVectorHeap& heap, IVFPQDelta& delta, uint32_t id);
+
+// Deletes outlive the index file through the heap: free_slot clears the
+// slot's occupancy bit synchronously, and a reused slot carries its new
+// owner's id, while the file goes on listing the vector as active. Called on
+// a freshly loaded index and heap with an empty delta: every listed vector
+// whose slot is not occupied by it is retracted (RID inactive, tombstoned),
+// and every slot below the heap's cursor that no listed vector holds -- a
+// freed one, or one an insert wrote that the file does not know -- goes on
+// the free list. Returns how many vectors it retracted. Not for use while
+// anything else touches the index.
+size_t ivf_pq_recover_deletes(IVFPQIndex& ix, const RawVectorHeap& heap, IVFPQDelta& delta);
 
 }  // namespace inplace
 }  // namespace diskann

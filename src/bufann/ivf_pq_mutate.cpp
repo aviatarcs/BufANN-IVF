@@ -50,8 +50,7 @@ void ivf_pq_encode(const PQMetadata& pq, const float* x, uint8_t* code) {
 }
 
 template<typename T>
-IVFPQPreparedInsert ivf_pq_prepare_insert(const IVFPQIndex& ix, RawVectorHeap& heap, IVFPQDelta& delta,
-                                          const T* vec) {
+IVFPQPreparedInsert ivf_pq_prepare_insert(IVFPQIndex& ix, RawVectorHeap& heap, IVFPQDelta& delta, const T* vec) {
     IVF_PQ_REQUIRE(vec != nullptr, "vector is null");
     const uint32_t dim = ix.meta.dim;
     IVF_PQ_REQUIRE(heap.layout().elem_size == dim * sizeof(T),
@@ -67,7 +66,16 @@ IVFPQPreparedInsert ivf_pq_prepare_insert(const IVFPQIndex& ix, RawVectorHeap& h
 
     p.slot = heap.allocate_slot(delta.free_list);
     try {
-        heap.write_vector(p.slot, vec);
+        {
+            std::unique_lock<std::shared_mutex> lock(delta.mtx);
+            IVF_PQ_REQUIRE(ix.rid_table.rid.size() == ix.assignments.cluster_id.size(),
+                           "RID table and cluster assignments disagree on the vector count");
+            IVF_PQ_REQUIRE(ix.rid_table.rid.size() < 0xFFFFFFFFu, "no unused vector id is left");
+            p.id = uint32_t(ix.rid_table.rid.size());
+            ix.assignments.cluster_id.push_back(p.cluster);
+            ix.rid_table.rid.push_back(make_raw_vector_rid(p.slot, false));
+        }
+        heap.write_vector(p.slot, p.id, vec);
     } catch (...) {
         heap.free_slot(p.slot, delta.free_list);  // never published, so no reader can hold it
         throw;
@@ -76,16 +84,14 @@ IVFPQPreparedInsert ivf_pq_prepare_insert(const IVFPQIndex& ix, RawVectorHeap& h
 }
 
 uint32_t ivf_pq_publish_insert(IVFPQIndex& ix, IVFPQDelta& delta, IVFPQPreparedInsert&& p) {
-    IVF_PQ_REQUIRE(p.code.size() == ix.pq.chunks && p.cluster < ix.meta.nlist, "prepared insert does not fit the index");
-    IVF_PQ_REQUIRE(ix.rid_table.rid.size() == ix.assignments.cluster_id.size(),
-                   "RID table and cluster assignments disagree on the vector count");
-    IVF_PQ_REQUIRE(ix.rid_table.rid.size() < 0xFFFFFFFFu, "no unused vector id is left");
-    const uint32_t id = uint32_t(ix.rid_table.rid.size());
-    ix.assignments.cluster_id.push_back(p.cluster);
-    ix.rid_table.rid.push_back(make_raw_vector_rid(p.slot, true));
-    delta.codes.codes.emplace(id, std::move(p.code));
-    delta.lists.pending_inserts[p.cluster].push_back(id);
-    return id;
+    IVF_PQ_REQUIRE(p.code.size() == ix.pq.chunks && p.cluster < ix.meta.nlist && p.id < ix.rid_table.rid.size() &&
+                       p.id < ix.assignments.cluster_id.size() && ix.assignments.cluster_id[p.id] == p.cluster &&
+                       load_rid(ix.rid_table.rid[p.id]).packed == make_raw_vector_rid(p.slot, false).packed,
+                   "prepared insert does not fit the index, or was not prepared by ivf_pq_prepare_insert");
+    delta.codes.codes.emplace(p.id, std::move(p.code));
+    delta.lists.pending_inserts[p.cluster].push_back(p.id);
+    store_rid(ix.rid_table.rid[p.id], make_raw_vector_rid(p.slot, true));
+    return p.id;
 }
 
 template<typename T>
@@ -126,9 +132,49 @@ void ivf_pq_delete(IVFPQIndex& ix, RawVectorHeap& heap, IVFPQDelta& delta, uint3
     heap.free_slot(slot, delta.free_list);
 }
 
+size_t ivf_pq_recover_deletes(IVFPQIndex& ix, const RawVectorHeap& heap, IVFPQDelta& delta) {
+    IVF_PQ_REQUIRE(ix.rid_table.rid.size() == ivf_pq_num_base(ix) && delta.lists.tombstones.empty() &&
+                       delta.lists.pending_inserts.empty() && delta.free_list.deferred.empty() &&
+                       delta.free_list.free_slots.empty(),
+                   "ivf_pq_recover_deletes needs a freshly loaded index and an empty delta");
+    const RawVectorHeapLayout& layout = heap.layout();
+    const uint32_t pages = heap.allocated_pages();
+    const uint32_t cursor = heap.next_flat_slot();
+    std::vector<uint8_t> occupied(size_t(pages) * layout.bitmap_bytes);
+    std::vector<uint32_t> owner(size_t(pages) * layout.slots_per_page);
+    for (uint32_t p = 0; p < pages; ++p) {
+        heap.read_page_directory(p, occupied.data() + size_t(p) * layout.bitmap_bytes,
+                                 owner.data() + size_t(p) * layout.slots_per_page);
+    }
+    auto holds = [&](uint32_t flat, uint32_t id) {
+        const bool bit = (occupied[size_t(layout.page_of(flat)) * layout.bitmap_bytes + layout.index_in_page(flat) / 8] &
+                          layout.bitmap_mask(layout.index_in_page(flat))) != 0;
+        return bit && owner[flat] == id;
+    };
+
+    size_t retracted = 0;
+    std::vector<uint8_t> addressed(cursor, 0);
+    for (uint32_t id = 0; id < ix.rid_table.rid.size(); ++id) {
+        const RawVectorRID rid = ix.rid_table.rid[id];
+        const uint32_t slot = rid_flat_slot(rid);
+        IVF_PQ_REQUIRE(slot < cursor, "RID of vector " + std::to_string(id) + " lies at or past the heap's slot cursor");
+        if (!rid_is_active(rid)) continue;
+        if (holds(slot, id)) {
+            addressed[slot] = 1;
+        } else {
+            ix.rid_table.rid[id] = make_raw_vector_rid(slot, false);
+            delta.lists.tombstones.insert(id);
+            ++retracted;
+        }
+    }
+    for (uint32_t slot = 0; slot < cursor; ++slot) {
+        if (!addressed[slot]) delta.free_list.free_slots.push_back(slot);
+    }
+    return retracted;
+}
+
 #define IVF_PQ_INSTANTIATE_INSERT(T)                                                                          \
-    template IVFPQPreparedInsert ivf_pq_prepare_insert<T>(const IVFPQIndex&, RawVectorHeap&, IVFPQDelta&,    \
-                                                          const T*);                                          \
+    template IVFPQPreparedInsert ivf_pq_prepare_insert<T>(IVFPQIndex&, RawVectorHeap&, IVFPQDelta&, const T*); \
     template uint32_t ivf_pq_insert<T>(IVFPQIndex&, RawVectorHeap&, IVFPQDelta&, const T*);
 IVF_PQ_INSTANTIATE_INSERT(float)
 IVF_PQ_INSTANTIATE_INSERT(uint8_t)

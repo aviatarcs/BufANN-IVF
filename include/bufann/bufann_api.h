@@ -190,9 +190,9 @@ void bufann_insert(
 // On an IVF-PQ index the delete is immediate: the vector is invisible to
 // searches on return, its heap slot is reusable once in-flight searches
 // finish, and the tag may be inserted again. A tag that is not active
-// throws std::invalid_argument. Like inserts, deletes live in memory and
-// the heap file only until the index file is rewritten, so a bufann_load
-// of the prefix brings deleted base vectors back until then.
+// throws std::invalid_argument. A delete is durable once its clear of the
+// slot's occupancy bit reaches the heap file: bufann_load recovers deletes
+// from the bitmap, since the index file is not rewritten until the rebuild.
 template<typename T>
 void bufann_delete(
     BufANNIndex<T>& idx,

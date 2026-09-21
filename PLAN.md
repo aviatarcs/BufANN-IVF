@@ -55,9 +55,8 @@ completes it, citing the commit subject.
       structures after a grace period. Searches must run throughout; test
       with a search thread hammering during a rebuild. Then rewrite the
       index file (with the heap's current page count and cursor) so a
-      prefix with inserts is loadable again and one with deletes stops
-      resurrecting them on load (the file's RID table still marks deleted
-      base vectors active; only the heap's occupancy bit says otherwise);
+      prefix with inserts is loadable again (deletes already survive a
+      load through the heap's occupancy bitmap, `ivf_pq_recover_deletes`);
       the backend's inserted-tag maps must survive the fold or be persisted
       with it.
 

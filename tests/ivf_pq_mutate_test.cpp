@@ -611,6 +611,86 @@ bool test_inserts_race_searches(Built& b, const std::vector<float>& queries) {
     return t.done();
 }
 
+// Deletes, then an insert that takes a freed slot and is never published
+// (the file knows neither a published nor a crashed insert), close, then
+// reopen the heap under the index as loaded from the unchanged file (the
+// copy in Built): ivf_pq_recover_deletes must retract exactly the deleted
+// vectors -- including the one whose slot the insert refilled, which the
+// bitmap alone would call live -- and put every slot the file's vectors no
+// longer hold on the free list.
+bool test_deletes_survive_a_reload(const std::string& prefix, Built& b, const std::vector<float>& base,
+                                   const std::vector<float>& queries) {
+    TestCase t("f32: deletes are recovered from the occupancy bitmap when the index is loaded again");
+    IVFPQIndex ix = b.index;
+    IVFPQDelta delta;
+    HeapCopy own(prefix, b.heap, "reload");
+    std::vector<uint8_t> dead(N, 0);
+    std::vector<uint32_t> freed;
+    for (uint32_t id = 5; id < N; id += 11) {
+        freed.push_back(rid_flat_slot(ix.rid_table.rid[id]));
+        ivf_pq_delete(ix, own.heap, delta, id);
+        dead[id] = 1;
+    }
+    const uint32_t leaked = ivf_pq_prepare_insert<float>(ix, own.heap, delta, base.data()).slot;
+    t.check(std::count(freed.begin(), freed.end(), leaked) == 1 && own.heap.is_slot_occupied(leaked),
+            "the unpublished insert did not refill a freed slot");
+    const uint32_t cursor = own.heap.next_flat_slot(), pages = own.heap.allocated_pages();
+    own.heap.close();
+
+    IVFPQIndex again = b.index;
+    IVFPQDelta recovered;
+    RawVectorHeap heap;
+    heap.open_existing(own.path, again.heap_layout, cursor, pages);
+    const size_t retracted = ivf_pq_recover_deletes(again, heap, recovered);
+    t.check(retracted == freed.size(), "recovered " + std::to_string(retracted) + " deletes, not " +
+                                           std::to_string(freed.size()));
+    size_t wrong = 0;
+    for (uint32_t id = 0; id < N; ++id) {
+        const RawVectorRID before = b.index.rid_table.rid[id], after = again.rid_table.rid[id];
+        wrong += rid_is_active(after) == bool(dead[id]) || rid_flat_slot(after) != rid_flat_slot(before) ||
+                 (recovered.lists.tombstones.count(id) != 0) != bool(dead[id]);
+    }
+    t.check(wrong == 0, std::to_string(wrong) + " vectors have the wrong RID or tombstone after the reload");
+    // Free: the deleted slots (the refilled one included) and every slot the
+    // file does not know, here those earlier tests' inserts took in the
+    // shared heap this copy was made from.
+    std::vector<uint8_t> held(cursor, 0);
+    for (uint32_t id = 0; id < N; ++id) held[rid_flat_slot(b.index.rid_table.rid[id])] = !dead[id];
+    std::vector<uint32_t> expected_free;
+    for (uint32_t slot = 0; slot < cursor; ++slot) {
+        if (!held[slot]) expected_free.push_back(slot);
+    }
+    std::vector<uint32_t> free_slots = recovered.free_list.free_slots;
+    std::sort(free_slots.begin(), free_slots.end());
+    t.check(free_slots == expected_free && recovered.free_list.deferred.empty(),
+            "the rebuilt free list is not every slot no live listed vector holds");
+
+    IVFPQSearchScratch scratch;
+    size_t mismatches = 0;
+    for (uint32_t q = 0; q < NQ; ++q) {
+        const float* query = queries.data() + size_t(q) * DIM;
+        IVFPQSearchResult got = ivf_pq_search<float>(again, heap, query, K, NLIST, N, scratch, &recovered);
+        mismatches += !same_within_ties(got, brute_force(base, dead, query, K + 1));
+    }
+    t.check(mismatches == 0, std::to_string(mismatches) + " searches after the reload are not brute force over the live vectors");
+    const uint32_t id = ivf_pq_insert<float>(again, heap, recovered, queries.data());
+    t.check(heap.next_flat_slot() == cursor && !held[rid_flat_slot(again.rid_table.rid[id])],
+            "an insert after the reload did not reuse a recovered slot");
+
+    // A used delta is refused; two listed vectors on one slot resolve by
+    // owner: the one the slot names stays, the other is retracted.
+    t.expect_throw("recovery into a used delta", [&] { ivf_pq_recover_deletes(again, heap, recovered); });
+    IVFPQIndex shared = b.index;
+    IVFPQDelta empty;
+    shared.rid_table.rid[1] = shared.rid_table.rid[2];
+    const size_t shared_retracted = ivf_pq_recover_deletes(shared, heap, empty);
+    t.check(shared_retracted == freed.size() + 1 && !rid_is_active(shared.rid_table.rid[1]) &&
+                rid_is_active(shared.rid_table.rid[2]) && empty.lists.tombstones.count(1) == 1,
+            "a vector listed on another vector's slot was not retracted");
+    heap.close();
+    return t.done();
+}
+
 // One thread deletes base vectors and inserts fresh ones (which refill the
 // freed slots once reclaimable) while four search with a re-rank. Every
 // returned distance must be the exact distance to the returned id's vector:
@@ -699,7 +779,7 @@ bool test_churn_races_searches(const std::string& prefix, Built& b, const std::v
 }
 
 bool test_guards(const std::string& prefix, Built& b, const std::vector<float>& extra) {
-    TestCase t("mutation guards: null vector, wrong element type, prepared insert that does not fit, bad deletes");
+    TestCase t("mutation guards: null vector, wrong element type, prepared insert that does not fit, RID on another slot, bad deletes");
     IVFPQIndex ix = b.index;
     IVFPQDelta delta;
     const uint32_t slots_before = b.heap.next_flat_slot();
@@ -733,6 +813,14 @@ bool test_guards(const std::string& prefix, Built& b, const std::vector<float>& 
     IVFPQSearchResult after = ivf_pq_search<float>(ix, b.heap, extra.data(), 1, NLIST, 10, scratch, &delta);
     t.check(id == N && after.ids.size() == 1 && after.ids[0] == N, "the published insert was not found");
 
+    // A re-rank reads the slot its RID names and requires the slot to hold
+    // that vector, so a RID pointing at another vector's slot is an error,
+    // not a wrong distance.
+    ix.rid_table.rid[0] = ix.rid_table.rid[1];
+    t.expect_throw("re-rank through a RID on another vector's slot",
+                   [&] { ivf_pq_search<float>(ix, b.heap, extra.data(), 1, NLIST, N + 1, scratch, &delta); });
+    ix.rid_table.rid[0] = b.index.rid_table.rid[0];
+
     HeapCopy own(prefix, b.heap, "guards");
     t.expect_throw("delete of an id past the table", [&] { ivf_pq_delete(ix, own.heap, delta, N + 1); });
     ivf_pq_delete(ix, own.heap, delta, 3);
@@ -762,6 +850,7 @@ int main() {
         all_pass &= test_inserted_vectors_are_found<uint8_t>("u8", *u, base_u, extra_u, queries);
         all_pass &= test_deleted_vectors_are_gone<float>("f32", prefix_f, *f, base_f, extra_f, queries);
         all_pass &= test_deleted_vectors_are_gone<uint8_t>("u8", prefix_u, *u, base_u, extra_u, queries);
+        all_pass &= test_deletes_survive_a_reload(prefix_f, *f, base_f, queries);
         all_pass &= test_inserts_race_searches(*f, queries);
         all_pass &= test_churn_races_searches(prefix_f, *f, base_f, queries);
         all_pass &= test_guards(prefix_f, *f, extra_f);
