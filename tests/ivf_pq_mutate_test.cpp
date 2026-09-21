@@ -42,92 +42,6 @@ const uint32_t CHUNKS = 4;
 const uint32_t K = 10;
 const uint32_t TRAIN_SEED = 7;
 const float TIE_ULPS = 8.0f;
-const float DIST_REL_TOL = 1e-5f;
-
-bool close(float a, float b) { return std::fabs(a - b) <= DIST_REL_TOL * std::max(std::fabs(a), std::fabs(b)); }
-
-template<typename T>
-T clamp_to(float v) {
-    float lo = float(std::numeric_limits<T>::lowest()), hi = float(std::numeric_limits<T>::max());
-    return T(std::round(std::min(hi, std::max(lo, v))));
-}
-template<>
-float clamp_to<float>(float v) { return v; }
-
-// The search test's fixture: 16 Gaussian blobs in [40, 215].
-template<typename T>
-std::vector<T> draw(uint32_t count, uint32_t seed) {
-    std::mt19937 gen(seed);
-    std::mt19937 center_gen(99);
-    std::uniform_real_distribution<float> spread(40.0f, 215.0f);
-    std::vector<float> centers(size_t(BLOBS) * DIM);
-    for (float& v : centers) v = spread(center_gen);
-    std::normal_distribution<float> noise(0.0f, 6.0f);
-    std::vector<T> out(size_t(count) * DIM);
-    for (uint32_t i = 0; i < count; ++i) {
-        const float* c = centers.data() + size_t(gen() % BLOBS) * DIM;
-        for (uint32_t d = 0; d < DIM; ++d) out[size_t(i) * DIM + d] = clamp_to<T>(c[d] + noise(gen));
-    }
-    return out;
-}
-
-template<typename T>
-std::vector<float> to_float(const T* v, size_t n) {
-    return std::vector<float>(v, v + n);
-}
-
-float sq_dist(const float* a, const float* b, uint32_t dim) {
-    float s = 0.0f;
-    for (uint32_t d = 0; d < dim; ++d) s += (a[d] - b[d]) * (a[d] - b[d]);
-    return s;
-}
-
-float l2sq(const float* a, uint32_t dim) {
-    float s = 0.0f;
-    for (uint32_t d = 0; d < dim; ++d) s += a[d] * a[d];
-    return s;
-}
-
-std::vector<uint32_t> top_k(const std::vector<float>& values, uint32_t k) {
-    std::vector<uint32_t> order(values.size());
-    std::iota(order.begin(), order.end(), 0u);
-    k = std::min<uint32_t>(k, uint32_t(order.size()));
-    std::partial_sort(order.begin(), order.begin() + k, order.end(),
-                      [&](uint32_t a, uint32_t b) { return values[a] < values[b]; });
-    order.resize(k);
-    return order;
-}
-
-// Same distances position by position, and same id wherever the distance is
-// not shared with a neighbouring position. `want` may carry one entry more
-// than `got`: the runner-up, which only serves the tie test of the last
-// position (uint8 data has integer distances, so ties there are common).
-bool same_within_ties(const IVFPQSearchResult& got, const IVFPQSearchResult& want) {
-    if (want.ids.size() != got.ids.size() && want.ids.size() != got.ids.size() + 1) return false;
-    for (size_t i = 0; i < got.ids.size(); ++i) {
-        if (!close(got.dists[i], want.dists[i])) return false;
-        bool tied = (i > 0 && close(want.dists[i], want.dists[i - 1])) ||
-                    (i + 1 < want.ids.size() && close(want.dists[i], want.dists[i + 1]));
-        if (!tied && got.ids[i] != want.ids[i]) return false;
-    }
-    return true;
-}
-
-// Exact top-k over the rows of `all` (row i is vector id i) not marked dead.
-IVFPQSearchResult brute_force(const std::vector<float>& all, const std::vector<uint8_t>& dead, const float* query,
-                              uint32_t k) {
-    const size_t n = all.size() / DIM;
-    std::vector<float> exact(n, std::numeric_limits<float>::infinity());
-    for (uint32_t i = 0; i < n; ++i) {
-        if (!dead[i]) exact[i] = sq_dist(query, all.data() + size_t(i) * DIM, DIM);
-    }
-    IVFPQSearchResult want;
-    for (uint32_t i : top_k(exact, k)) {
-        if (dead[i]) break;
-        want.ids.push_back(i), want.dists.push_back(exact[i]);
-    }
-    return want;
-}
 
 // PQ-only top-k over the live vectors, from the base code table and the
 // delta's codes.
@@ -145,7 +59,7 @@ IVFPQSearchResult pq_reference(const IVFPQIndex& ix, const IVFPQDelta& delta, co
     std::vector<float> approx(n, std::numeric_limits<float>::infinity());
     for (uint32_t i = 0; i < n; ++i) {
         if (dead[i]) continue;
-        const uint8_t* c = i < N ? pq.codes.data() + size_t(i) * CHUNKS : delta.codes.codes.at(i).data();
+        const uint8_t* c = i < ivf_pq_num_base(ix) ? pq.codes.data() + size_t(i) * CHUNKS : delta.codes.codes.at(i).data();
         float d = 0.0f;
         for (uint32_t k = 0; k < CHUNKS; ++k) d += table[size_t(k) * pq.k + c[k]];
         approx[i] = d;
@@ -157,12 +71,6 @@ IVFPQSearchResult pq_reference(const IVFPQIndex& ix, const IVFPQDelta& delta, co
     }
     return want;
 }
-
-struct Built {
-    IVFPQIndex index;
-    RawVectorHeap heap;
-    IVFPQDelta delta;
-};
 
 // A private heap copy for a test that frees and refills slots: the tests
 // share one Built, and its base ids must keep addressing their vectors.
@@ -187,42 +95,6 @@ struct HeapCopy {
 };
 
 std::string pristine_heap_path(const std::string& prefix) { return prefix + "_pristine_heap.bin"; }
-
-template<typename T>
-std::unique_ptr<Built> build(const std::string& prefix, const std::vector<T>& base) {
-    const std::string base_bin = prefix + "_base.bin";
-    diskann::save_bin<T>(base_bin, const_cast<T*>(base.data()), N, DIM);
-    {
-        IVFPQIndex ix;
-        ix.meta = train_ivf_centroids<T>(base_bin, NLIST, 0.0, NUM_K_MEANS_ITERS, TRAIN_SEED);
-        ix.heap_layout = compute_raw_vector_heap_layout(4096, DIM * sizeof(T));
-        RawVectorHeap heap;
-        heap.open(ivf_raw_vectors_path(prefix), ix.heap_layout);
-        assign_ivf_clusters<T>(base_bin, ix.meta, heap, ix.assignments, ix.rid_table);
-        ix.lists = build_ivf_posting_lists(ix.assignments, NLIST);
-        train_ivf_pq_pivots<T>(base_bin, prefix, CHUNKS, 1.0, NUM_K_MEANS_ITERS, TRAIN_SEED);
-        encode_ivf_pq_codes<T>(base_bin, prefix, CHUNKS);
-        ix.pq = load_ivf_pq(prefix);
-        ix.heap_pages = heap.allocated_pages();
-        ix.heap_next_slot = heap.next_flat_slot();
-        write_ivf_pq_index(prefix, ix);
-        std::filesystem::copy_file(ivf_raw_vectors_path(prefix), pristine_heap_path(prefix),
-                                   std::filesystem::copy_options::overwrite_existing);
-    }
-    auto built = std::make_unique<Built>();
-    built->index = load_ivf_pq_index(prefix);
-    built->heap.open_existing(ivf_raw_vectors_path(prefix), built->index.heap_layout, built->index.heap_next_slot,
-                              built->index.heap_pages);
-    ::unlink(base_bin.c_str());
-    return built;
-}
-
-void remove_index_files(const std::string& prefix) {
-    for (const std::string& f : {ivf_pq_index_path(prefix), ivf_raw_vectors_path(prefix), ivf_pq_pivots_path(prefix),
-                                 ivf_pq_codes_path(prefix), pristine_heap_path(prefix)}) {
-        ::unlink(f.c_str());
-    }
-}
 
 // Whether two squared distances are within the float rounding of the
 // ||x||^2 + ||c||^2 - 2x.c expansion the build's encoders use.
@@ -370,7 +242,7 @@ bool test_inserted_vectors_are_found(const std::string& tag, Built& b, const std
     size_t inserted_in_topk = 0;
     for (uint32_t q = 0; q < NQ; ++q) {
         const float* query = queries.data() + size_t(q) * DIM;
-        IVFPQSearchResult want = brute_force(all, none_dead, query, K + 1);
+        IVFPQSearchResult want = brute_force(all, DIM, none_dead, query, K + 1);
         IVFPQSearchResult got = ivf_pq_search<T>(ix, b.heap, query, K, NLIST, N + NI, scratch, &delta);
         if (!t.check(same_within_ties(got, want),
                      "query " + std::to_string(q) + ": full probe over base + inserts is not the exact top-k")) {
@@ -482,7 +354,7 @@ bool test_deleted_vectors_are_gone(const std::string& tag, const std::string& pr
         const float* x = all.data() + size_t(id) * DIM;
         IVFPQSearchResult r = ivf_pq_search<T>(ix, heap, x, 1, NLIST, N + NI, scratch, &delta);
         came_back += r.ids.size() != 1 || dead[r.ids[0]];
-        not_nearest_live += !same_within_ties(r, brute_force(all, dead, x, 2));
+        not_nearest_live += !same_within_ties(r, brute_force(all, DIM, dead, x, 2));
     }
     t.check(came_back == 0, std::to_string(came_back) + " searches for a deleted vector returned it (or nothing)");
     t.check(not_nearest_live == 0, std::to_string(not_nearest_live) + " searches did not return the nearest live vector");
@@ -492,7 +364,7 @@ bool test_deleted_vectors_are_gone(const std::string& tag, const std::string& pr
     for (uint32_t q = 0; q < NQ; ++q) {
         const float* query = queries.data() + size_t(q) * DIM;
         IVFPQSearchResult got = ivf_pq_search<T>(ix, heap, query, K, NLIST, N + NI, scratch, &delta);
-        if (!t.check(same_within_ties(got, brute_force(all, dead, query, K + 1)),
+        if (!t.check(same_within_ties(got, brute_force(all, DIM, dead, query, K + 1)),
                      "query " + std::to_string(q) + ": full probe over the live vectors is not the exact top-k")) {
             return t.done();
         }
@@ -506,7 +378,7 @@ bool test_deleted_vectors_are_gone(const std::string& tag, const std::string& pr
         ivf_pq_search_batch<T>(ix, heap, queries.data(), NQ, K, NLIST, N + NI, IVF_PQ_SEARCH_GEMM_ROWS, &delta);
     size_t batch_mismatches = 0;
     for (uint32_t q = 0; q < NQ; ++q) {
-        batch_mismatches += !same_within_ties(batch[q], brute_force(all, dead, queries.data() + size_t(q) * DIM, K + 1));
+        batch_mismatches += !same_within_ties(batch[q], brute_force(all, DIM, dead, queries.data() + size_t(q) * DIM, K + 1));
     }
     t.check(batch_mismatches == 0, std::to_string(batch_mismatches) + " batched results are not brute force over the live vectors");
 
@@ -533,7 +405,7 @@ bool test_deleted_vectors_are_gone(const std::string& tag, const std::string& pr
     std::vector<uint32_t> all_freed = deleted_slot;
     for (uint32_t id : nearest.ids) all_freed.push_back(rid_flat_slot(ix.rid_table.rid[id]));
     const uint32_t freed = uint32_t(all_freed.size());
-    std::vector<T> fresh = draw<T>(freed + 1, 17);
+    std::vector<T> fresh = draw_blobs<T>(freed + 1, 17, DIM, BLOBS);
     const uint32_t held_id = ivf_pq_insert<T>(ix, heap, delta, fresh.data() + size_t(freed) * DIM);
     t.check(held_id == N + NI && heap.next_flat_slot() == slots_before + 1 &&
                 std::count(all_freed.begin(), all_freed.end(), rid_flat_slot(ix.rid_table.rid[held_id])) == 0,
@@ -571,7 +443,7 @@ bool test_inserts_race_searches(Built& b, const std::vector<float>& queries) {
     IVFPQIndex ix = b.index;
     IVFPQDelta delta;
     const uint32_t per_thread = 500;
-    std::vector<float> extra = draw<float>(2 * per_thread, 11);
+    std::vector<float> extra = draw_blobs<float>(2 * per_thread, 11, DIM, BLOBS);
     std::atomic<bool> stop{false};
     std::atomic<size_t> failures{0}, searches{0};
 
@@ -667,7 +539,7 @@ bool test_deletes_survive_a_reload(const std::string& prefix, Built& b, const st
     for (uint32_t q = 0; q < NQ; ++q) {
         const float* query = queries.data() + size_t(q) * DIM;
         IVFPQSearchResult got = ivf_pq_search<float>(again, heap, query, K, NLIST, N, scratch, &recovered);
-        mismatches += !same_within_ties(got, brute_force(base, dead, query, K + 1));
+        mismatches += !same_within_ties(got, brute_force(base, DIM, dead, query, K + 1));
     }
     t.check(mismatches == 0, std::to_string(mismatches) + " searches after the reload are not brute force over the live vectors");
     // A used delta is refused, and so is a RID table that lists a vector on
@@ -708,7 +580,7 @@ bool test_churn_races_searches(const std::string& prefix, Built& b, const std::v
     const uint32_t churn = 1500;
     std::vector<float> all = base;
     all.resize(size_t(N + churn) * DIM);
-    const std::vector<float> fresh = draw<float>(churn, 13);
+    const std::vector<float> fresh = draw_blobs<float>(churn, 13, DIM, BLOBS);
     // deleted_seq[id] is the delete's position in the churn thread's order,
     // 0 for a live vector; seq counts the deletes that have returned.
     std::vector<std::atomic<uint32_t>> deleted_seq(N + churn);
@@ -796,7 +668,7 @@ bool test_full_turnover(const std::string& prefix, Built& b, const std::vector<f
     IVFPQDelta delta;
     HeapCopy own(prefix, "turnover", pristine_heap_path(prefix), ix.heap_layout, ix.heap_next_slot, ix.heap_pages);
     const uint32_t cursor = own.heap.next_flat_slot();
-    std::vector<float> fresh = draw<float>(2 * N, 21);
+    std::vector<float> fresh = draw_blobs<float>(2 * N, 21, DIM, BLOBS);
     IVFPQSearchScratch scratch;
     for (uint32_t round = 0; round < 2; ++round) {
         for (uint32_t id = round * N; id < (round + 1) * N; ++id) ivf_pq_delete(ix, own.heap, delta, id);
@@ -812,7 +684,7 @@ bool test_full_turnover(const std::string& prefix, Built& b, const std::vector<f
         for (uint32_t q = 0; q < NQ; ++q) {
             const float* query = queries.data() + size_t(q) * DIM;
             IVFPQSearchResult got = ivf_pq_search<float>(ix, own.heap, query, K, NLIST, N, scratch, &delta);
-            mismatches += !same_within_ties(got, brute_force(all, dead, query, K + 1));
+            mismatches += !same_within_ties(got, brute_force(all, DIM, dead, query, K + 1));
             IVFPQSearchResult got_pq = ivf_pq_search<float>(ix, own.heap, query, K, NLIST, 0, scratch, &delta);
             mismatches += !same_within_ties(got_pq, pq_reference(ix, delta, dead, query, K + 1));
         }
@@ -930,11 +802,15 @@ int main() {
     const std::string prefix_u = temp_path("ivf_pq_mutate_u8");
     bool all_pass = true;
     try {
-        std::vector<float> base_f = draw<float>(N, 1), extra_f = draw<float>(NI, 3);
-        std::vector<uint8_t> base_u = draw<uint8_t>(N, 1), extra_u = draw<uint8_t>(NI, 3);
-        std::vector<float> queries = draw<float>(NQ, 2);
-        std::unique_ptr<Built> f = build<float>(prefix_f, base_f);
-        std::unique_ptr<Built> u = build<uint8_t>(prefix_u, base_u);
+        std::vector<float> base_f = draw_blobs<float>(N, 1, DIM, BLOBS), extra_f = draw_blobs<float>(NI, 3, DIM, BLOBS);
+        std::vector<uint8_t> base_u = draw_blobs<uint8_t>(N, 1, DIM, BLOBS), extra_u = draw_blobs<uint8_t>(NI, 3, DIM, BLOBS);
+        std::vector<float> queries = draw_blobs<float>(NQ, 2, DIM, BLOBS);
+        std::unique_ptr<Built> f = build_index<float>(prefix_f, base_f, N, DIM, NLIST, CHUNKS, TRAIN_SEED);
+        std::unique_ptr<Built> u = build_index<uint8_t>(prefix_u, base_u, N, DIM, NLIST, CHUNKS, TRAIN_SEED);
+        for (const std::string& prefix : {prefix_f, prefix_u}) {
+            std::filesystem::copy_file(ivf_raw_vectors_path(prefix), pristine_heap_path(prefix),
+                                       std::filesystem::copy_options::overwrite_existing);
+        }
 
         all_pass &= test_partition_and_code_match_the_build<float>("f32", *f, base_f);
         all_pass &= test_partition_and_code_match_the_build<uint8_t>("u8", *u, base_u);
@@ -955,7 +831,9 @@ int main() {
         std::cout << "  FAIL: " << e.message() << std::endl;
         all_pass = false;
     }
-    remove_index_files(prefix_f);
-    remove_index_files(prefix_u);
+    for (const std::string& prefix : {prefix_f, prefix_u}) {
+        remove_index_files(prefix);
+        ::unlink(pristine_heap_path(prefix).c_str());
+    }
     return all_pass ? 0 : 1;
 }

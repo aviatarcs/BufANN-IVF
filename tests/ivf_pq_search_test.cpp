@@ -33,107 +33,6 @@ const uint32_t K = 10;
 const uint32_t RERANK_M = 50;
 const uint32_t TRAIN_SEED = 7;
 const float TIE_ULPS = 8.0f;
-// The build is -Ofast, so a squared distance summed in another translation
-// unit can differ by reassociation; well under this, far above nothing.
-const float DIST_REL_TOL = 1e-5f;
-
-bool close(float a, float b) { return std::fabs(a - b) <= DIST_REL_TOL * std::max(std::fabs(a), std::fabs(b)); }
-
-bool close(const std::vector<float>& a, const std::vector<float>& b) {
-    return a.size() == b.size() && std::equal(a.begin(), a.end(), b.begin(), [](float x, float y) { return close(x, y); });
-}
-
-template<typename T>
-T clamp_to(float v) {
-    float lo = float(std::numeric_limits<T>::lowest()), hi = float(std::numeric_limits<T>::max());
-    return T(std::round(std::min(hi, std::max(lo, v))));
-}
-template<>
-float clamp_to<float>(float v) { return v; }
-
-// Base and queries from the same 16 Gaussian blobs, centred in [40, 215] so
-// the uint8 version needs no clamping in practice.
-template<typename T>
-std::vector<T> draw(uint32_t count, uint32_t seed) {
-    std::mt19937 gen(seed);
-    std::mt19937 center_gen(99);
-    std::uniform_real_distribution<float> spread(40.0f, 215.0f);
-    std::vector<float> centers(size_t(BLOBS) * DIM);
-    for (float& v : centers) v = spread(center_gen);
-    std::normal_distribution<float> noise(0.0f, 6.0f);
-    std::vector<T> out(size_t(count) * DIM);
-    for (uint32_t i = 0; i < count; ++i) {
-        const float* c = centers.data() + size_t(gen() % BLOBS) * DIM;
-        for (uint32_t d = 0; d < DIM; ++d) out[size_t(i) * DIM + d] = clamp_to<T>(c[d] + noise(gen));
-    }
-    return out;
-}
-
-template<typename T>
-std::vector<float> to_float(const std::vector<T>& v) {
-    return std::vector<float>(v.begin(), v.end());
-}
-
-float sq_dist(const float* a, const float* b, uint32_t dim) {
-    float s = 0.0f;
-    for (uint32_t d = 0; d < dim; ++d) s += (a[d] - b[d]) * (a[d] - b[d]);
-    return s;
-}
-
-float l2sq(const float* a, uint32_t dim) {
-    float s = 0.0f;
-    for (uint32_t d = 0; d < dim; ++d) s += a[d] * a[d];
-    return s;
-}
-
-std::vector<uint32_t> top_k(const std::vector<float>& values, uint32_t k) {
-    std::vector<uint32_t> order(values.size());
-    std::iota(order.begin(), order.end(), 0u);
-    k = std::min<uint32_t>(k, uint32_t(order.size()));
-    std::partial_sort(order.begin(), order.begin() + k, order.end(),
-                      [&](uint32_t a, uint32_t b) { return values[a] < values[b]; });
-    order.resize(k);
-    return order;
-}
-
-struct Built {
-    IVFPQIndex index;
-    RawVectorHeap heap;
-};
-
-template<typename T>
-std::unique_ptr<Built> build(const std::string& prefix, const std::vector<T>& base) {
-    const std::string base_bin = prefix + "_base.bin";
-    diskann::save_bin<T>(base_bin, const_cast<T*>(base.data()), N, DIM);
-    {
-        IVFPQIndex ix;
-        ix.meta = train_ivf_centroids<T>(base_bin, NLIST, 0.0, NUM_K_MEANS_ITERS, TRAIN_SEED);
-        ix.heap_layout = compute_raw_vector_heap_layout(4096, DIM * sizeof(T));
-        RawVectorHeap heap;
-        heap.open(ivf_raw_vectors_path(prefix), ix.heap_layout);
-        assign_ivf_clusters<T>(base_bin, ix.meta, heap, ix.assignments, ix.rid_table);
-        ix.lists = build_ivf_posting_lists(ix.assignments, NLIST);
-        train_ivf_pq_pivots<T>(base_bin, prefix, CHUNKS, 1.0, NUM_K_MEANS_ITERS, TRAIN_SEED);
-        encode_ivf_pq_codes<T>(base_bin, prefix, CHUNKS);
-        ix.pq = load_ivf_pq(prefix);
-        ix.heap_pages = heap.allocated_pages();
-        ix.heap_next_slot = heap.next_flat_slot();
-        write_ivf_pq_index(prefix, ix);
-    }
-    auto built = std::make_unique<Built>();
-    built->index = load_ivf_pq_index(prefix);
-    built->heap.open_existing(ivf_raw_vectors_path(prefix), built->index.heap_layout, built->index.heap_next_slot,
-                              built->index.heap_pages);
-    ::unlink(base_bin.c_str());
-    return built;
-}
-
-void remove_index_files(const std::string& prefix) {
-    for (const std::string& f : {ivf_pq_index_path(prefix), ivf_raw_vectors_path(prefix), ivf_pq_pivots_path(prefix),
-                                 ivf_pq_codes_path(prefix)}) {
-        ::unlink(f.c_str());
-    }
-}
 
 // The reference search, written without the GEMM expansion. rerank_m == 0
 // ranks by PQ distance, as in ivf_pq_search.
@@ -178,7 +77,7 @@ IVFPQSearchResult reference_search(const IVFPQIndex& ix, const RawVectorHeap& he
     for (uint32_t i : top_k(pq_dist, rerank_m)) {
         heap.read_vector(rid_flat_slot(ix.rid_table.rid[candidates[i]]), raw.data());
         shortlist.push_back(candidates[i]);
-        exact.push_back(sq_dist(q, to_float(raw).data(), DIM));
+        exact.push_back(sq_dist(q, to_float(raw.data(), DIM).data(), DIM));
     }
     for (uint32_t i : top_k(exact, k)) {
         result.ids.push_back(shortlist[i]);
@@ -203,18 +102,6 @@ bool probe_boundary_is_tied(const IVFPQIndex& ix, const float* q, uint32_t nprob
     float tol = TIE_ULPS * std::numeric_limits<float>::epsilon() *
                 (l2sq(q, DIM) + std::max(norms[last_in], norms[first_out]));
     return centroid_dist[first_out] - centroid_dist[last_in] <= tol;
-}
-
-// Same distances position by position, and same id wherever the distance is
-// not shared with a neighbouring position.
-bool same_within_ties(const IVFPQSearchResult& got, const IVFPQSearchResult& want) {
-    if (got.ids.size() != want.ids.size() || !close(got.dists, want.dists)) return false;
-    for (size_t i = 0; i < got.ids.size(); ++i) {
-        bool tied = (i > 0 && close(want.dists[i], want.dists[i - 1])) ||
-                    (i + 1 < want.ids.size() && close(want.dists[i], want.dists[i + 1]));
-        if (!tied && got.ids[i] != want.ids[i]) return false;
-    }
-    return true;
 }
 
 template<typename T>
@@ -286,7 +173,7 @@ template<typename T>
 bool test_exact_distances_and_full_probe(const std::string& tag, const Built& b, const std::vector<T>& base,
                                          const std::vector<float>& queries) {
     TestCase t(tag + ": re-ranked distances are brute force; nprobe = nlist with a full re-rank is exact top-k");
-    const std::vector<float> basef = to_float(base);
+    const std::vector<float> basef = to_float(base.data(), base.size());
     IVFPQSearchScratch scratch;
     std::vector<float> all(N);
     for (uint32_t q = 0; q < NQ; ++q) {
@@ -418,11 +305,11 @@ int main() {
     const std::string prefix_u = temp_path("ivf_pq_search_u8");
     bool all_pass = true;
     try {
-        std::vector<float> base_f = draw<float>(N, 1);
-        std::vector<uint8_t> base_u = draw<uint8_t>(N, 1);
-        std::vector<float> queries = draw<float>(NQ, 2);
-        std::unique_ptr<Built> f = build<float>(prefix_f, base_f);
-        std::unique_ptr<Built> u = build<uint8_t>(prefix_u, base_u);
+        std::vector<float> base_f = draw_blobs<float>(N, 1, DIM, BLOBS);
+        std::vector<uint8_t> base_u = draw_blobs<uint8_t>(N, 1, DIM, BLOBS);
+        std::vector<float> queries = draw_blobs<float>(NQ, 2, DIM, BLOBS);
+        std::unique_ptr<Built> f = build_index<float>(prefix_f, base_f, N, DIM, NLIST, CHUNKS, TRAIN_SEED);
+        std::unique_ptr<Built> u = build_index<uint8_t>(prefix_u, base_u, N, DIM, NLIST, CHUNKS, TRAIN_SEED);
 
         all_pass &= test_matches_reference<float>("f32", *f, queries);
         all_pass &= test_matches_reference<uint8_t>("u8", *u, queries);

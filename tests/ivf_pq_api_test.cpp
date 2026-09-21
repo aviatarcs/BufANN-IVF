@@ -27,14 +27,6 @@ namespace {
 
 const uint32_t N = 20000, NQ = 100, DIM = 32, NLIST = 32, CHUNKS = 8, K = 10;
 
-template<typename T>
-T clamp_to(float v) {
-    float lo = float(std::numeric_limits<T>::lowest()), hi = float(std::numeric_limits<T>::max());
-    return T(std::round(std::min(hi, std::max(lo, v))));
-}
-template<>
-float clamp_to<float>(float v) { return v; }
-
 // 8 intrinsic dimensions embedded in DIM (see the recall test for why).
 template<typename T>
 std::vector<T> synthetic(size_t count, uint32_t seed, float scale) {
@@ -70,28 +62,25 @@ BufANNConfig ivf_config() {
     return c;
 }
 
-template<typename T>
-float sq_dist(const T* a, const T* q) {
-    float s = 0.0f;
-    for (uint32_t j = 0; j < DIM; ++j) s += (float(a[j]) - float(q[j])) * (float(a[j]) - float(q[j]));
-    return s;
+// Whether the tags `got` are an exact top-k over the rows of `all` not
+// marked dead, compared by distance so ties do not matter; `row_of` maps a
+// tag to its row.
+template<typename RowOf>
+bool is_exact_topk(const std::vector<TagType>& got, const std::vector<float>& all, const std::vector<uint8_t>& dead,
+                   const float* query, uint32_t k, RowOf row_of) {
+    const IVFPQSearchResult want = brute_force(all, DIM, dead, query, k);
+    if (got.size() != k || want.ids.size() != k) return false;
+    for (uint32_t i = 0; i < k; ++i) {
+        const uint32_t row = row_of(got[i]);
+        if (dead[row] || std::count(got.begin(), got.end(), got[i]) != 1) return false;
+        if (!close(sq_dist(query, all.data() + size_t(row) * DIM, DIM), want.dists[i])) return false;
+    }
+    return true;
 }
 
-// Rows of `base` (any count) nearest to q, as row indices, skipping the
-// rows marked in `dead`.
-template<typename T>
-std::vector<TagType> brute_force(const std::vector<T>& base, const T* q, uint32_t k,
-                                 const std::vector<uint8_t>& dead = {}) {
-    const uint32_t n = uint32_t(base.size() / DIM);
-    std::vector<float> d(n);
-    for (uint32_t i = 0; i < n; ++i) {
-        d[i] = i < dead.size() && dead[i] ? std::numeric_limits<float>::infinity() : sq_dist(base.data() + size_t(i) * DIM, q);
-    }
-    std::vector<TagType> order(n);
-    std::iota(order.begin(), order.end(), 0u);
-    std::partial_sort(order.begin(), order.begin() + k, order.end(), [&](TagType a, TagType b) { return d[a] < d[b]; });
-    order.resize(k);
-    return order;
+// Ids of the k rows of `all` nearest to `query`.
+std::vector<uint32_t> nearest_rows(const std::vector<float>& all, const float* query, uint32_t k) {
+    return brute_force(all, DIM, std::vector<uint8_t>(all.size() / DIM, 0), query, k).ids;
 }
 
 template<typename T>
@@ -107,17 +96,17 @@ bool test_build_query_load(const std::string& tag, const std::string& prefix) {
 
     // The API result equals a direct ivf_pq_search with the same parameters
     // (nprobe from config, rerank_m = max(100, 10k)), and is a strong top-k.
+    const std::vector<float> basef = to_float(base.data(), base.size()), queriesf = to_float(queries.data(), queries.size());
     size_t api_hits = 0, mismatches = 0;
     IVFPQSearchScratch scratch;
-    std::vector<float> qf(DIM);
     for (uint32_t q = 0; q < NQ; ++q) {
         const T* query = queries.data() + size_t(q) * DIM;
+        const float* qf = queriesf.data() + size_t(q) * DIM;
         std::vector<TagType> got = bufann_query<T>(*idx, query, K);
-        for (uint32_t d = 0; d < DIM; ++d) qf[d] = float(query[d]);
-        IVFPQSearchResult direct = ivf_pq_search<T>(idx->ivf->index, idx->ivf->heap, qf.data(), K, cfg.ivf_nprobe,
+        IVFPQSearchResult direct = ivf_pq_search<T>(idx->ivf->index, idx->ivf->heap, qf, K, cfg.ivf_nprobe,
                                                     std::max<uint32_t>(100, 10 * K), scratch);
         mismatches += !(got.size() == direct.ids.size() && std::equal(got.begin(), got.end(), direct.ids.begin()));
-        std::vector<TagType> truth = brute_force<T>(base, query, K);
+        std::vector<uint32_t> truth = nearest_rows(basef, qf, K);
         for (TagType id : got) api_hits += std::find(truth.begin(), truth.end(), id) != truth.end();
     }
     t.check(mismatches == 0, std::to_string(mismatches) + " queries differ from a direct ivf_pq_search");
@@ -130,7 +119,7 @@ bool test_build_query_load(const std::string& tag, const std::string& prefix) {
     for (uint32_t q = 0; q < NQ; ++q) {
         const T* query = queries.data() + size_t(q) * DIM;
         std::vector<TagType> got = bufann_query<T>(*idx, query, K, NLIST);
-        std::vector<TagType> truth = brute_force<T>(base, query, K);
+        std::vector<uint32_t> truth = nearest_rows(basef, queriesf.data() + size_t(q) * DIM, K);
         for (TagType id : got) full_hits += std::find(truth.begin(), truth.end(), id) != truth.end();
     }
     t.check(full_hits >= api_hits, "nprobe = nlist via search_L did not reach the default's recall");
@@ -149,9 +138,8 @@ bool test_build_query_load(const std::string& tag, const std::string& prefix) {
     for (uint32_t q = 0; q < NQ; ++q) {
         const T* query = queries.data() + size_t(q) * DIM;
         std::vector<TagType> a = bufann_query<T>(*loaded, query, K);
-        for (uint32_t d = 0; d < DIM; ++d) qf[d] = float(query[d]);
-        IVFPQSearchResult direct = ivf_pq_search<T>(loaded->ivf->index, loaded->ivf->heap, qf.data(), K,
-                                                    cfg.ivf_nprobe, std::max<uint32_t>(100, 10 * K), scratch);
+        IVFPQSearchResult direct = ivf_pq_search<T>(loaded->ivf->index, loaded->ivf->heap, queriesf.data() + size_t(q) * DIM,
+                                                    K, cfg.ivf_nprobe, std::max<uint32_t>(100, 10 * K), scratch);
         reload_mismatches += !(a.size() == direct.ids.size() && std::equal(a.begin(), a.end(), direct.ids.begin()));
     }
     t.check(reload_mismatches == 0, "reloaded index answers differently");
@@ -169,26 +157,22 @@ bool test_build_query_load(const std::string& tag, const std::string& prefix) {
         self_hits += got.size() == 1 && got[0] == FIRST_TAG + i;
     }
     t.check(self_hits == NI, std::to_string(NI - self_hits) + " inserted vectors are not their own nearest neighbour");
-    std::vector<T> combined = base;
-    combined.insert(combined.end(), extra.begin(), extra.end());
+    // Rows: base rows, then the inserts; a tag's row is the identity for
+    // base tags and N + (tag - FIRST_TAG) for inserted ones.
+    std::vector<float> combined = basef;
+    const std::vector<float> extraf = to_float(extra.data(), extra.size());
+    combined.insert(combined.end(), extraf.begin(), extraf.end());
+    auto row_index = [&](TagType tag) { return tag >= FIRST_TAG ? N + (tag - FIRST_TAG) : tag; };
     auto row_of = [&](TagType tag) -> const T* {
         return tag >= FIRST_TAG ? extra.data() + size_t(tag - FIRST_TAG) * DIM : base.data() + size_t(tag) * DIM;
     };
+    std::vector<uint8_t> dead(N + NI, 0);
     loaded->config.ivf_rerank_m = N + NI;  // exact: every candidate is re-ranked
     size_t insert_mismatches = 0, inserted_returned = 0;
     for (uint32_t q = 0; q < NQ; ++q) {
-        const T* query = queries.data() + size_t(q) * DIM;
-        std::vector<TagType> got = bufann_query<T>(*loaded, query, K, NLIST);
-        std::vector<TagType> truth = brute_force<T>(combined, query, K);
-        bool ok = got.size() == K;
-        for (uint32_t i = 0; ok && i < K; ++i) {
-            const float want = sq_dist(combined.data() + size_t(truth[i]) * DIM, query);
-            const float have = sq_dist(row_of(got[i]), query);
-            ok = std::fabs(have - want) <= 1e-5f * std::max(have, want) &&
-                 std::count(got.begin(), got.end(), got[i]) == 1;
-            inserted_returned += got[i] >= FIRST_TAG;
-        }
-        insert_mismatches += !ok;
+        std::vector<TagType> got = bufann_query<T>(*loaded, queries.data() + size_t(q) * DIM, K, NLIST);
+        insert_mismatches += !is_exact_topk(got, combined, dead, queriesf.data() + size_t(q) * DIM, K, row_index);
+        for (TagType g : got) inserted_returned += g >= FIRST_TAG;
     }
     t.check(insert_mismatches == 0, std::to_string(insert_mismatches) + " queries are not brute force over base + inserts");
     t.check(inserted_returned > 0, "no inserted tag was ever returned");
@@ -230,10 +214,8 @@ bool test_build_query_load(const std::string& tag, const std::string& prefix) {
     for (uint32_t i = 0; i < NI; i += 4) gone_inserted.push_back(FIRST_TAG + i);
     for (TagType tag : gone_base) bufann_delete<T>(*loaded, tag);
     bufann_delete_batch<T>(*loaded, gone_inserted.data(), gone_inserted.size());
-    std::vector<uint8_t> dead(N + NI, 0);
     for (TagType tag : gone_base) dead[tag] = 1;
     for (TagType tag : gone_inserted) dead[N + (tag - FIRST_TAG)] = 1;
-    auto row_index = [&](TagType tag) { return tag >= FIRST_TAG ? N + (tag - FIRST_TAG) : tag; };
     size_t returned_deleted = 0, delete_mismatches = 0;
     loaded->config.ivf_rerank_m = 0;  // the default: a full re-rank per query is slow, and not needed here
     for (size_t i = 0; i < gone_base.size(); i += 10) {
@@ -247,17 +229,8 @@ bool test_build_query_load(const std::string& tag, const std::string& prefix) {
     t.check(returned_deleted == 0, std::to_string(returned_deleted) + " deleted tags were returned (or nothing was)");
     loaded->config.ivf_rerank_m = N + NI;
     for (uint32_t q = 0; q < NQ; ++q) {
-        const T* query = queries.data() + size_t(q) * DIM;
-        std::vector<TagType> got = bufann_query<T>(*loaded, query, K, NLIST);
-        std::vector<TagType> truth = brute_force<T>(combined, query, K, dead);
-        bool ok = got.size() == K;
-        for (uint32_t i = 0; ok && i < K; ++i) {
-            const float want = sq_dist(combined.data() + size_t(truth[i]) * DIM, query);
-            const float have = sq_dist(row_of(got[i]), query);
-            ok = !dead[row_index(got[i])] && std::fabs(have - want) <= 1e-5f * std::max(have, want) &&
-                 std::count(got.begin(), got.end(), got[i]) == 1;
-        }
-        delete_mismatches += !ok;
+        std::vector<TagType> got = bufann_query<T>(*loaded, queries.data() + size_t(q) * DIM, K, NLIST);
+        delete_mismatches += !is_exact_topk(got, combined, dead, queriesf.data() + size_t(q) * DIM, K, row_index);
     }
     t.check(delete_mismatches == 0, std::to_string(delete_mismatches) + " queries are not brute force over the live vectors");
     {
@@ -294,10 +267,7 @@ bool test_build_query_load(const std::string& tag, const std::string& prefix) {
     t.expect_throw_any("reload after inserts", [&] { bufann_load<T>(prefix, cfg); });
 
     ::unlink(base_bin.c_str());
-    for (const std::string& f : {ivf_pq_index_path(prefix), ivf_raw_vectors_path(prefix), ivf_pq_pivots_path(prefix),
-                                 ivf_pq_codes_path(prefix)}) {
-        ::unlink(f.c_str());
-    }
+    remove_index_files(prefix);
     return t.done();
 }
 
@@ -318,18 +288,11 @@ bool test_deletes_survive_reload(const std::string& tag, const std::string& pref
     bufann_free<T>(idx);
 
     BufANNIndex<T>* loaded = bufann_load<T>(prefix, cfg);
+    const std::vector<float> basef = to_float(base.data(), base.size()), queriesf = to_float(queries.data(), queries.size());
     size_t mismatches = 0;
     for (uint32_t q = 0; q < NQ; ++q) {
-        const T* query = queries.data() + size_t(q) * DIM;
-        std::vector<TagType> got = bufann_query<T>(*loaded, query, K, NLIST);
-        std::vector<TagType> truth = brute_force<T>(base, query, K, dead);
-        bool ok = got.size() == K;
-        for (uint32_t i = 0; ok && i < K; ++i) {
-            const float want = sq_dist(base.data() + size_t(truth[i]) * DIM, query);
-            const float have = sq_dist(base.data() + size_t(got[i]) * DIM, query);
-            ok = !dead[got[i]] && std::fabs(have - want) <= 1e-5f * std::max(have, want);
-        }
-        mismatches += !ok;
+        std::vector<TagType> got = bufann_query<T>(*loaded, queries.data() + size_t(q) * DIM, K, NLIST);
+        mismatches += !is_exact_topk(got, basef, dead, queriesf.data() + size_t(q) * DIM, K, [](TagType tag) { return tag; });
     }
     t.check(mismatches == 0, std::to_string(mismatches) + " queries after the reload are not brute force over the live vectors");
     t.expect_throw_any("deleting a tag deleted before the reload", [&] { bufann_delete<T>(*loaded, 3); });
@@ -342,10 +305,7 @@ bool test_deletes_survive_reload(const std::string& tag, const std::string& pref
     t.expect_throw_any("reload after an insert into a freed slot", [&] { bufann_load<T>(prefix, cfg); });
 
     ::unlink(base_bin.c_str());
-    for (const std::string& f : {ivf_pq_index_path(prefix), ivf_raw_vectors_path(prefix), ivf_pq_pivots_path(prefix),
-                                 ivf_pq_codes_path(prefix)}) {
-        ::unlink(f.c_str());
-    }
+    remove_index_files(prefix);
     return t.done();
 }
 
@@ -438,10 +398,7 @@ bool test_tag_churn_under_queries(const std::string& tag_name, const std::string
 
     bufann_free<T>(idx);
     ::unlink(base_bin.c_str());
-    for (const std::string& f : {ivf_pq_index_path(prefix), ivf_raw_vectors_path(prefix), ivf_pq_pivots_path(prefix),
-                                 ivf_pq_codes_path(prefix)}) {
-        ::unlink(f.c_str());
-    }
+    remove_index_files(prefix);
     return t.done();
 }
 
@@ -474,10 +431,7 @@ bool test_config_validation(const std::string& prefix) {
     t.expect_throw_any("load from a prefix with no index", [&] { bufann_load<float>(prefix + "_nope", ivf_config<float>()); });
 
     ::unlink(base_bin.c_str());
-    for (const std::string& f : {ivf_pq_index_path(prefix), ivf_raw_vectors_path(prefix), ivf_pq_pivots_path(prefix),
-                                 ivf_pq_codes_path(prefix)}) {
-        ::unlink(f.c_str());
-    }
+    remove_index_files(prefix);
     return t.done();
 }
 
