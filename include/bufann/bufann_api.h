@@ -186,6 +186,13 @@ void bufann_insert(
 // Logically delete a node by external tag. Foreground delete records the tag in
 // an exact deleted-tag set and returns immediately; query result emission filters
 // that set so the tag is invisible before graph repair runs.
+//
+// On an IVF-PQ index the delete is immediate: the vector is invisible to
+// searches on return, its heap slot is reusable once in-flight searches
+// finish, and the tag may be inserted again. A tag that is not active
+// throws std::invalid_argument. Like inserts, deletes live in memory and
+// the heap file only until the index file is rewritten, so a bufann_load
+// of the prefix brings deleted base vectors back until then.
 template<typename T>
 void bufann_delete(
     BufANNIndex<T>& idx,
@@ -193,6 +200,8 @@ void bufann_delete(
 
 // Micro-batched logical delete: records every tag in `tags` in the deleted-tag
 // set. Tag-to-internal-ID resolution and graph repair happen in maintenance.
+// On an IVF-PQ index it is bufann_delete per tag, stopping at the first
+// tag that throws.
 template<typename T>
 void bufann_delete_batch(
     BufANNIndex<T>& idx,

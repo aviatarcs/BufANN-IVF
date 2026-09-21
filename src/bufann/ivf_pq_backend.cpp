@@ -151,6 +151,36 @@ void ivf_pq_backend_insert(IVFPQBackend& backend, const BufANNConfig& config, Ta
     backend.inserted_id[tag] = id;
 }
 
+// The tag is resolved and the vector retracted in one critical section, so a
+// concurrent insert of the same tag sees it free only once the delete is
+// visible to searches; the slot is freed after the lock is released, as
+// free_slot does heap I/O.
+void ivf_pq_backend_delete(IVFPQBackend& backend, TagType tag) {
+    auto not_active = [&] { return std::invalid_argument("bufann_delete: tag " + std::to_string(tag) + " is not active"); };
+    uint32_t slot;
+    {
+        std::unique_lock<std::shared_mutex> lock(backend.delta.mtx);
+        const uint32_t num_base = ivf_pq_num_base(backend.index);
+        auto inserted = backend.inserted_id.find(tag);
+        uint32_t id;
+        if (inserted != backend.inserted_id.end()) {
+            if (inserted->second == IVF_PQ_PENDING_ID) throw not_active();
+            id = inserted->second;
+        } else if (tag < num_base) {
+            id = tag;
+        } else {
+            throw not_active();
+        }
+        if (!rid_is_active(load_rid(backend.index.rid_table.rid[id]))) throw not_active();
+        slot = as_std_exception([&] { return ivf_pq_retract_delete(backend.index, backend.delta, id); });
+        if (inserted != backend.inserted_id.end()) {
+            backend.inserted_tag[id - num_base] = INVALID_TAG;
+            backend.inserted_id.erase(inserted);
+        }
+    }
+    as_std_exception([&] { backend.heap.free_slot(slot, backend.delta.free_list); });
+}
+
 template<typename T>
 uint32_t ivf_pq_backend_query(IVFPQBackend& backend, const BufANNConfig& config, const T* query, uint32_t topK,
                               TagType* out_tags, uint32_t nprobe, uint32_t rerank_m, IVFPQSearchScratch& scratch) {

@@ -133,6 +133,21 @@ IVFPQSearchResult search_from_centroid_dist(const IVFPQIndex& ix, const RawVecto
     if (delta != nullptr) delta_lock = std::shared_lock<std::shared_mutex>(delta->mtx);
     IVF_PQ_REQUIRE(ix.rid_table.rid.size() >= ivf_pq_num_base(ix), "RID table does not cover every base vector");
     if (delta != nullptr) {
+        // Deleted base vectors stay in the posting lists until the rebuild;
+        // dropped before selection so they cannot crowd live vectors out of
+        // the shortlist. Deleted inserts have already left the delta.
+        const tsl::robin_set<uint32_t>& tombstones = delta->lists.tombstones;
+        if (!tombstones.empty()) {
+            size_t live = 0;
+            for (size_t i = 0; i < scratch.candidates.size(); ++i) {
+                if (tombstones.count(scratch.candidates[i]) != 0) continue;
+                scratch.candidates[live] = scratch.candidates[i];
+                scratch.pq_dist[live] = scratch.pq_dist[i];
+                ++live;
+            }
+            scratch.candidates.resize(live);
+            scratch.pq_dist.resize(live);
+        }
         for (uint32_t part : scratch.probe_order) {
             auto pending = delta->lists.pending_inserts.find(part);
             if (pending == delta->lists.pending_inserts.end()) continue;
@@ -145,8 +160,8 @@ IVFPQSearchResult search_from_centroid_dist(const IVFPQIndex& ix, const RawVecto
         }
     }
 
-    // Inactive RIDs (deleted vectors) are dropped here rather than in the
-    // scan, which would cost a random RID-table read per candidate.
+    // Deleted vectors were dropped above; the active check honours a RID
+    // cleared by other means (an index searched without its delta).
     select_smallest(scratch.pq_dist, rerank_m == 0 ? k : rerank_m, scratch.order);
     scratch.shortlist.clear();
     scratch.shortlist_slot.clear();

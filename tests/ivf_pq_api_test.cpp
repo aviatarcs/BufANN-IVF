@@ -1,7 +1,8 @@
 // IVF-PQ through the public BufANN API: bufann_build with
 // IndexType::IvfPq, bufann_query / bufann_query_into, bufann_load,
-// bufann_insert with caller tags, the search_L-as-nprobe convention, config
-// validation, and the graph-only operations refusing an IVF-PQ index.
+// bufann_insert / bufann_delete with caller tags, the search_L-as-nprobe
+// convention, config validation, and the graph-only operations refusing an
+// IVF-PQ index.
 
 #include "bufann/bufann_api.h"
 #include "bufann/ivf_pq_build.h"
@@ -75,12 +76,16 @@ float sq_dist(const T* a, const T* q) {
     return s;
 }
 
-// Rows of `base` (any count) nearest to q, as row indices.
+// Rows of `base` (any count) nearest to q, as row indices, skipping the
+// rows marked in `dead`.
 template<typename T>
-std::vector<TagType> brute_force(const std::vector<T>& base, const T* q, uint32_t k) {
+std::vector<TagType> brute_force(const std::vector<T>& base, const T* q, uint32_t k,
+                                 const std::vector<uint8_t>& dead = {}) {
     const uint32_t n = uint32_t(base.size() / DIM);
     std::vector<float> d(n);
-    for (uint32_t i = 0; i < n; ++i) d[i] = sq_dist(base.data() + size_t(i) * DIM, q);
+    for (uint32_t i = 0; i < n; ++i) {
+        d[i] = i < dead.size() && dead[i] ? std::numeric_limits<float>::infinity() : sq_dist(base.data() + size_t(i) * DIM, q);
+    }
     std::vector<TagType> order(n);
     std::iota(order.begin(), order.end(), 0u);
     std::partial_sort(order.begin(), order.begin() + k, order.end(), [&](TagType a, TagType b) { return d[a] < d[b]; });
@@ -131,7 +136,6 @@ bool test_build_query_load(const std::string& tag, const std::string& prefix) {
     t.check(bufann_query_into<T>(*idx, queries.data(), K, nullptr) == K, "query_into with nullptr did not return K");
 
     // Graph-only operations refuse the index; flushes are no-ops.
-    t.expect_throw_any("bufann_delete", [&] { bufann_delete<T>(*idx, 0); });
     t.expect_throw_any("bufann_cleanup_deleted_edges", [&] { bufann_cleanup_deleted_edges<T>(*idx); });
     bufann_flush_dirty<T>(*idx);
     t.check(bufann_flush_dirty_budget<T>(*idx, 0) == 0, "flush budget on IVF-PQ should flush nothing");
@@ -192,6 +196,66 @@ bool test_build_query_load(const std::string& tag, const std::string& prefix) {
     t.expect_throw_any("inserting INVALID_TAG", [&] { bufann_insert<T>(*loaded, INVALID_TAG, extra.data()); });
     t.check(bufann_query<T>(*loaded, extra.data(), 1, NLIST) == std::vector<TagType>{FIRST_TAG},
             "a rejected insert disturbed the index");
+
+    // Deletes by tag: every 5th base tag through bufann_delete and every
+    // 4th inserted tag through bufann_delete_batch. A deleted tag is never
+    // returned, searches are brute force over the live vectors, and the tag
+    // is free to insert again (with a new vector, found under the old tag).
+    std::vector<TagType> gone_base, gone_inserted;
+    for (TagType tag = 0; tag < N; tag += 5) gone_base.push_back(tag);
+    for (uint32_t i = 0; i < NI; i += 4) gone_inserted.push_back(FIRST_TAG + i);
+    for (TagType tag : gone_base) bufann_delete<T>(*loaded, tag);
+    bufann_delete_batch<T>(*loaded, gone_inserted.data(), gone_inserted.size());
+    std::vector<uint8_t> dead(N + NI, 0);
+    for (TagType tag : gone_base) dead[tag] = 1;
+    for (TagType tag : gone_inserted) dead[N + (tag - FIRST_TAG)] = 1;
+    auto row_index = [&](TagType tag) { return tag >= FIRST_TAG ? N + (tag - FIRST_TAG) : tag; };
+    size_t returned_deleted = 0, delete_mismatches = 0;
+    loaded->config.ivf_rerank_m = 0;  // the default: a full re-rank per query is slow, and not needed here
+    for (size_t i = 0; i < gone_base.size(); i += 10) {
+        std::vector<TagType> got = bufann_query<T>(*loaded, row_of(gone_base[i]), 1, NLIST);
+        returned_deleted += got.size() != 1 || got[0] == gone_base[i];
+    }
+    for (TagType tag : gone_inserted) {
+        std::vector<TagType> got = bufann_query<T>(*loaded, row_of(tag), 1, NLIST);
+        returned_deleted += got.size() != 1 || got[0] == tag;
+    }
+    t.check(returned_deleted == 0, std::to_string(returned_deleted) + " deleted tags were returned (or nothing was)");
+    loaded->config.ivf_rerank_m = N + NI;
+    for (uint32_t q = 0; q < NQ; ++q) {
+        const T* query = queries.data() + size_t(q) * DIM;
+        std::vector<TagType> got = bufann_query<T>(*loaded, query, K, NLIST);
+        std::vector<TagType> truth = brute_force<T>(combined, query, K, dead);
+        bool ok = got.size() == K;
+        for (uint32_t i = 0; ok && i < K; ++i) {
+            const float want = sq_dist(combined.data() + size_t(truth[i]) * DIM, query);
+            const float have = sq_dist(row_of(got[i]), query);
+            ok = !dead[row_index(got[i])] && std::fabs(have - want) <= 1e-5f * std::max(have, want) &&
+                 std::count(got.begin(), got.end(), got[i]) == 1;
+        }
+        delete_mismatches += !ok;
+    }
+    t.check(delete_mismatches == 0, std::to_string(delete_mismatches) + " queries are not brute force over the live vectors");
+    t.expect_throw_any("deleting a deleted base tag", [&] { bufann_delete<T>(*loaded, gone_base[0]); });
+    t.expect_throw_any("deleting a deleted inserted tag", [&] { bufann_delete<T>(*loaded, gone_inserted[0]); });
+    t.expect_throw_any("deleting a tag never inserted", [&] { bufann_delete<T>(*loaded, FIRST_TAG + NI); });
+    t.expect_throw_any("deleting INVALID_TAG", [&] { bufann_delete<T>(*loaded, INVALID_TAG); });
+    t.check(bufann_query<T>(*loaded, row_of(gone_base[1]), 1, NLIST)[0] != gone_base[1],
+            "a rejected delete disturbed the index");
+
+    // A deleted tag is reusable, base or inserted: the query for the new
+    // vector returns it. The new vectors are two live inserts, deleted first
+    // so the query is not a tie between the old and the new tag.
+    const T* moved_a = extra.data() + size_t(NI - 1) * DIM;
+    const T* moved_b = extra.data() + size_t(NI - 2) * DIM;
+    bufann_delete<T>(*loaded, FIRST_TAG + NI - 1);
+    bufann_delete<T>(*loaded, FIRST_TAG + NI - 2);
+    bufann_insert<T>(*loaded, gone_base[0], moved_a);
+    bufann_insert<T>(*loaded, gone_inserted[0], moved_b);
+    t.check(bufann_query<T>(*loaded, moved_a, 1, NLIST) == std::vector<TagType>{gone_base[0]} &&
+                bufann_query<T>(*loaded, moved_b, 1, NLIST) == std::vector<TagType>{gone_inserted[0]},
+            "a re-inserted tag does not resolve to its new vector");
+    t.expect_throw_any("re-inserting a re-inserted tag", [&] { bufann_insert<T>(*loaded, gone_base[0], moved_a); });
 
     // The heap has outgrown what the index file records, so until the
     // rebuild rewrites the file a reload is refused rather than wrong.

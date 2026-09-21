@@ -50,7 +50,8 @@ struct IVFPQSearchScratch {
 // must be at least k. Vectors whose RID is inactive are dropped. `delta`,
 // when given, contributes the vectors inserted since the index file was
 // written (ivf_pq_insert), scanned in the probed partitions like the base
-// vectors; searches may run concurrently with inserts into it.
+// vectors, and withholds the deleted ones (ivf_pq_delete); searches may run
+// concurrently with inserts into and deletes from it.
 template<typename T>
 IVFPQSearchResult ivf_pq_search(const IVFPQIndex& index, const RawVectorHeap& heap, const float* query,
                                 uint32_t k, uint32_t nprobe, uint32_t rerank_m,

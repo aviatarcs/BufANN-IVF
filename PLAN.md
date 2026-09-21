@@ -44,17 +44,22 @@ completes it, citing the commit subject.
       merges pending inserts. Tests: inserted vectors are found at nprobe
       covering their partition. (Add IVF-PQ insert; the delta is consulted by
       search and published through bufann_insert)
-- [ ] **Mutation: delete.** Tombstone in `PostingListDelta`, clear RID active
+- [x] **Mutation: delete.** Tombstone in `PostingListDelta`, clear RID active
       bit with `store_rid` (seq_cst, which the grace period relies on) before
-      freeing the slot through it. Search drops tombstoned ids.
+      freeing the slot through it. Search drops tombstoned ids. (Add IVF-PQ
+      delete; tombstoned base ids are dropped before selection and freed
+      slots go through the grace period)
 - [ ] **Posting-list rebuild.** Fold `PostingListDelta` and `DynamicPQCodes`
       into fresh `PostingLists`/`PQMetadata` off to the side, publish with
       one atomic pointer store in `IVFPQSearchConfig`, reclaim the old
       structures after a grace period. Searches must run throughout; test
       with a search thread hammering during a rebuild. Then rewrite the
       index file (with the heap's current page count and cursor) so a
-      prefix with inserts is loadable again; the backend's inserted-tag maps
-      must survive the fold or be persisted with it.
+      prefix with inserts is loadable again and one with deletes stops
+      resurrecting them on load (the file's RID table still marks deleted
+      base vectors active; only the heap's occupancy bit says otherwise);
+      the backend's inserted-tag maps must survive the fold or be persisted
+      with it.
 
 ## Not planned
 

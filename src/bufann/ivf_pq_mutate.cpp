@@ -1,5 +1,6 @@
 #include "bufann/ivf_pq_mutate.h"
 
+#include <algorithm>
 #include <mutex>
 #include <shared_mutex>
 #include <vector>
@@ -92,6 +93,37 @@ uint32_t ivf_pq_insert(IVFPQIndex& ix, RawVectorHeap& heap, IVFPQDelta& delta, c
     IVFPQPreparedInsert prepared = ivf_pq_prepare_insert<T>(ix, heap, delta, vec);
     std::unique_lock<std::shared_mutex> lock(delta.mtx);
     return ivf_pq_publish_insert(ix, delta, std::move(prepared));
+}
+
+uint32_t ivf_pq_retract_delete(IVFPQIndex& ix, IVFPQDelta& delta, uint32_t id) {
+    IVF_PQ_REQUIRE(id < ix.rid_table.rid.size(), "vector " + std::to_string(id) + " does not exist");
+    const RawVectorRID rid = load_rid(ix.rid_table.rid[id]);
+    IVF_PQ_REQUIRE(rid_is_active(rid), "vector " + std::to_string(id) + " is not active");
+    // Cleared first: from here on no search picks the slot up, and the
+    // heap's grace period covers any that already did.
+    store_rid(ix.rid_table.rid[id], make_raw_vector_rid(rid_flat_slot(rid), false));
+
+    if (id < ivf_pq_num_base(ix)) {
+        delta.lists.tombstones.insert(id);
+    } else {
+        const std::string unlisted = "inserted vector " + std::to_string(id) + " is not in its delta list";
+        auto listed = delta.lists.pending_inserts.find(ix.assignments.cluster_id[id]);
+        IVF_PQ_REQUIRE(listed != delta.lists.pending_inserts.end(), unlisted);
+        auto it = std::find(listed->second.begin(), listed->second.end(), id);
+        IVF_PQ_REQUIRE(it != listed->second.end(), unlisted);
+        listed->second.erase(it);
+        delta.codes.codes.erase(id);
+    }
+    return rid_flat_slot(rid);
+}
+
+void ivf_pq_delete(IVFPQIndex& ix, RawVectorHeap& heap, IVFPQDelta& delta, uint32_t id) {
+    uint32_t slot;
+    {
+        std::unique_lock<std::shared_mutex> lock(delta.mtx);
+        slot = ivf_pq_retract_delete(ix, delta, id);
+    }
+    heap.free_slot(slot, delta.free_list);
 }
 
 #define IVF_PQ_INSTANTIATE_INSERT(T)                                                                          \

@@ -109,10 +109,13 @@ struct RawVectorFreeList {
     std::vector<uint32_t> free_slots;  // reusable now
 };
 
-// PostingListDelta: pending mutations not yet folded into PostingLists
+// PostingListDelta: pending mutations not yet folded into PostingLists.
+// A deleted base vector stays in its posting list until the rebuild, so it
+// is tombstoned and searches skip it; a deleted inserted vector is simply
+// removed from pending_inserts, so tombstones never holds an inserted id.
 struct PostingListDelta {
     std::unordered_map<uint32_t, std::vector<uint32_t>> pending_inserts;  // cluster_id -> vector_ids
-    tsl::robin_set<uint32_t> tombstones;                                  // vector_ids
+    tsl::robin_set<uint32_t> tombstones;                                  // deleted base vector_ids
 };
 
 // DynamicPQCodes: PQ codes for vectors inserted since the last rebuild
@@ -123,12 +126,15 @@ struct DynamicPQCodes {
 };
 
 // IVFPQDelta: what mutations change that the index file does not hold, and
-// the lock that orders them against searches. An insert publishes under mtx
-// held exclusively; a search holds it shared while it reads the delta and
-// the RID table (which inserts grow) and releases it before its heap reads.
-// Ids at or past the base count are inserts, with codes in `codes` and
-// posting-list membership in `lists`, until the rebuild folds them into the
-// index (write_ivf_pq_index refuses an index with unfolded inserts).
+// the lock that orders them against searches. An insert publishes and a
+// delete retracts under mtx held exclusively; a search holds it shared while
+// it reads the delta and the RID table (which inserts grow) and releases it
+// before its heap reads. Ids at or past the base count are inserts, with
+// codes in `codes` and posting-list membership in `lists`, until the rebuild
+// folds them into the index (write_ivf_pq_index refuses an index with
+// unfolded inserts). Deletes are likewise in memory and the heap's
+// occupancy bitmap only: the index file still lists the vector, so a reload
+// of the prefix brings it back until the rebuild rewrites the file.
 struct IVFPQDelta {
     mutable std::shared_mutex mtx;
     PostingListDelta lists;

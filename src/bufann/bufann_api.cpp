@@ -792,8 +792,10 @@ template<typename T>
 void diskann::inplace::bufann_delete(
         BufANNIndex<T>& idx,
         TagType tag) {
-    if (idx.ivf)
-        throw std::runtime_error("bufann_delete: not supported for an IVF-PQ index yet");
+    if (idx.ivf) {
+        ivf_pq_backend_delete(*idx.ivf, tag);
+        return;
+    }
     idx.store.mark_tag_deleted(tag);
 }
 
@@ -806,8 +808,10 @@ void diskann::inplace::bufann_delete_batch(
         BufANNIndex<T>& idx,
         const TagType* tags,
         size_t count) {
-    if (idx.ivf)
-        throw std::runtime_error("bufann_delete_batch: not supported for an IVF-PQ index yet");
+    if (idx.ivf) {
+        for (size_t i = 0; i < count; ++i) ivf_pq_backend_delete(*idx.ivf, tags[i]);
+        return;
+    }
     if (count == 0) return;
     for (size_t i = 0; i < count; ++i) {
         idx.store.mark_tag_deleted(tags[i]);

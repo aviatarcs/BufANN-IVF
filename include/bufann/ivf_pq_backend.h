@@ -4,9 +4,10 @@
 //
 // A base vector's tag is its row in the base file (the RID table is the
 // identity at build time); an inserted vector's tag is whatever the caller
-// gave bufann_insert, recorded in the tag maps below. Inserts live in
-// `delta` and the heap only: they are not in the index file until the
-// posting-list rebuild (PLAN), so a reload drops them.
+// gave bufann_insert, recorded in the tag maps below. Inserts and deletes
+// live in `delta` and the heap only: they are not in the index file until
+// the posting-list rebuild (PLAN), so a reload drops the inserts and
+// brings the deleted base vectors back.
 
 #pragma once
 
@@ -56,6 +57,12 @@ std::unique_ptr<IVFPQBackend> ivf_pq_backend_load(const std::string& index_prefi
 // std::runtime_error on an internal failure.
 template<typename T>
 void ivf_pq_backend_insert(IVFPQBackend& backend, const BufANNConfig& config, TagType tag, const T* coords);
+
+// Deletes the vector under `tag`. Throws std::invalid_argument when the tag
+// is not active (never inserted, already deleted, or still being inserted
+// by a concurrent bufann_insert), std::runtime_error on an internal
+// failure. The tag may be inserted again afterwards.
+void ivf_pq_backend_delete(IVFPQBackend& backend, TagType tag);
 
 // Top-k search. `nprobe` 0 means config.ivf_nprobe; `rerank_m` 0 means
 // config.ivf_rerank_m, itself 0 meaning max(100, 10 * topK). Writes at most
