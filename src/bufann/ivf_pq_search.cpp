@@ -128,9 +128,12 @@ IVFPQSearchResult search_from_centroid_dist(const IVFPQIndex& ix, const RawVecto
     }
 
     // Inserts grow the delta and the RID table, so both are read under the
-    // delta's shared lock, which is dropped before the heap reads below.
-    std::shared_lock<std::shared_mutex> delta_lock;
-    if (delta != nullptr) delta_lock = std::shared_lock<std::shared_mutex>(delta->mtx);
+    // delta's shared lock: once here for the delta, once below for the RIDs
+    // of the shortlist, with the selection in between unlocked so a writer
+    // waiting on the lock is held up by at most a scan. The heap reads at
+    // the end are outside it.
+    std::shared_lock<WriterPreferringSharedMutex> delta_lock;
+    if (delta != nullptr) delta_lock = std::shared_lock<WriterPreferringSharedMutex>(delta->mtx);
     IVF_PQ_REQUIRE(ix.rid_table.rid.size() >= ivf_pq_num_base(ix), "RID table does not cover every base vector");
     if (delta != nullptr) {
         // Deleted base vectors stay in the posting lists until the rebuild;
@@ -160,9 +163,13 @@ IVFPQSearchResult search_from_centroid_dist(const IVFPQIndex& ix, const RawVecto
         }
     }
 
-    // Deleted vectors were dropped above; the active check honours a RID
-    // cleared by other means (an index searched without its delta).
+    if (delta_lock.owns_lock()) delta_lock.unlock();
+
+    // Deleted vectors were dropped above; the active check covers a delete
+    // that landed while the lock was released, and a RID cleared by other
+    // means (an index searched without its delta).
     select_smallest(scratch.pq_dist, rerank_m == 0 ? k : rerank_m, scratch.order);
+    if (delta != nullptr) delta_lock.lock();
     scratch.shortlist.clear();
     scratch.shortlist_slot.clear();
     scratch.exact_dist.clear();

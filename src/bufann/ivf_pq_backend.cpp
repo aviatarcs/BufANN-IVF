@@ -117,14 +117,14 @@ void ivf_pq_backend_insert(IVFPQBackend& backend, const BufANNConfig& config, Ta
     if (coords == nullptr) throw std::invalid_argument("bufann_insert: coords is null");
     (void)config;  // dim is checked against the index by the prepare step
     {
-        std::unique_lock<std::shared_mutex> lock(backend.delta.mtx);
+        std::unique_lock<WriterPreferringSharedMutex> lock(backend.delta.mtx);
         if (tag_is_taken(backend, tag)) {
             throw std::invalid_argument("bufann_insert: tag " + std::to_string(tag) + " is already active");
         }
         backend.inserted_id[tag] = IVF_PQ_PENDING_ID;
     }
     auto release_tag = [&] {
-        std::unique_lock<std::shared_mutex> lock(backend.delta.mtx);
+        std::unique_lock<WriterPreferringSharedMutex> lock(backend.delta.mtx);
         backend.inserted_id.erase(tag);
     };
     IVFPQPreparedInsert prepared;
@@ -136,7 +136,7 @@ void ivf_pq_backend_insert(IVFPQBackend& backend, const BufANNConfig& config, Ta
         throw;
     }
     const uint32_t slot = prepared.slot;
-    std::unique_lock<std::shared_mutex> lock(backend.delta.mtx);
+    std::unique_lock<WriterPreferringSharedMutex> lock(backend.delta.mtx);
     uint32_t id;
     try {
         id = as_std_exception([&] { return ivf_pq_publish_insert(backend.index, backend.delta, std::move(prepared)); });
@@ -160,7 +160,7 @@ void ivf_pq_backend_delete(IVFPQBackend& backend, TagType tag) {
     auto not_active = [&] { return std::invalid_argument("bufann_delete: tag " + std::to_string(tag) + " is not active"); };
     uint32_t slot;
     {
-        std::unique_lock<std::shared_mutex> lock(backend.delta.mtx);
+        std::unique_lock<WriterPreferringSharedMutex> lock(backend.delta.mtx);
         const uint32_t num_base = ivf_pq_num_base(backend.index);
         auto inserted = backend.inserted_id.find(tag);
         uint32_t id;
@@ -203,7 +203,7 @@ uint32_t ivf_pq_backend_query(IVFPQBackend& backend, const BufANNConfig& config,
     const uint32_t n = uint32_t(std::min<size_t>(topK, r.ids.size()));
     if (out_tags != nullptr) {
         const uint32_t num_base = ivf_pq_num_base(backend.index);
-        std::shared_lock<std::shared_mutex> lock(backend.delta.mtx);
+        std::shared_lock<WriterPreferringSharedMutex> lock(backend.delta.mtx);
         for (uint32_t i = 0; i < n; ++i) {
             out_tags[i] = r.ids[i] < num_base ? TagType(r.ids[i]) : backend.inserted_tag[r.ids[i] - num_base];
         }

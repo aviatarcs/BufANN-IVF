@@ -67,7 +67,7 @@ IVFPQPreparedInsert ivf_pq_prepare_insert(IVFPQIndex& ix, RawVectorHeap& heap, I
     p.slot = heap.allocate_slot(delta.free_list);
     try {
         {
-            std::unique_lock<std::shared_mutex> lock(delta.mtx);
+            std::unique_lock<WriterPreferringSharedMutex> lock(delta.mtx);
             IVF_PQ_REQUIRE(ix.rid_table.rid.size() == ix.assignments.cluster_id.size(),
                            "RID table and cluster assignments disagree on the vector count");
             IVF_PQ_REQUIRE(ix.rid_table.rid.size() < 0xFFFFFFFFu, "no unused vector id is left");
@@ -97,7 +97,7 @@ uint32_t ivf_pq_publish_insert(IVFPQIndex& ix, IVFPQDelta& delta, IVFPQPreparedI
 template<typename T>
 uint32_t ivf_pq_insert(IVFPQIndex& ix, RawVectorHeap& heap, IVFPQDelta& delta, const T* vec) {
     IVFPQPreparedInsert prepared = ivf_pq_prepare_insert<T>(ix, heap, delta, vec);
-    std::unique_lock<std::shared_mutex> lock(delta.mtx);
+    std::unique_lock<WriterPreferringSharedMutex> lock(delta.mtx);
     return ivf_pq_publish_insert(ix, delta, std::move(prepared));
 }
 
@@ -126,7 +126,7 @@ uint32_t ivf_pq_retract_delete(IVFPQIndex& ix, IVFPQDelta& delta, uint32_t id) {
 void ivf_pq_delete(IVFPQIndex& ix, RawVectorHeap& heap, IVFPQDelta& delta, uint32_t id) {
     uint32_t slot;
     {
-        std::unique_lock<std::shared_mutex> lock(delta.mtx);
+        std::unique_lock<WriterPreferringSharedMutex> lock(delta.mtx);
         slot = ivf_pq_retract_delete(ix, delta, id);
     }
     heap.free_slot(slot, delta.free_list);

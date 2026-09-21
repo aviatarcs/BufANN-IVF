@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <filesystem>
@@ -778,6 +779,56 @@ bool test_churn_races_searches(const std::string& prefix, Built& b, const std::v
     return t.done();
 }
 
+// Eight threads take the delta's lock shared back to back, each holding it
+// for a spell of work like a search's delta scan; a writer must still get
+// in promptly every time. (glibc's reader-preferring std::shared_mutex
+// never lets it in here.)
+bool test_writers_get_in_under_constant_readers() {
+    TestCase t("a writer gets the delta lock under eight back-to-back readers");
+    IVFPQDelta delta;
+    std::atomic<bool> stop{false};
+    std::atomic<size_t> reads{0};
+    std::vector<std::thread> readers;
+    for (int r = 0; r < 8; ++r) {
+        readers.emplace_back([&] {
+            while (!stop.load()) {
+                std::shared_lock<WriterPreferringSharedMutex> lock(delta.mtx);
+                const auto until = std::chrono::steady_clock::now() + std::chrono::microseconds(50);
+                while (std::chrono::steady_clock::now() < until) {
+                }
+                reads.fetch_add(1);
+            }
+        });
+    }
+    // The writer runs on its own thread so a starved lock() is a failure
+    // here, not a hang: the main thread gives each acquisition a deadline.
+    std::atomic<int> acquired{0};
+    double worst_ms = 0.0;
+    bool starved = false;
+    std::thread writer([&] {
+        for (int i = 0; i < 50 && !stop.load(); ++i) {
+            const auto t0 = std::chrono::steady_clock::now();
+            std::unique_lock<WriterPreferringSharedMutex> lock(delta.mtx);
+            worst_ms = std::max(worst_ms, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+            lock.unlock();
+            acquired.fetch_add(1);
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+    });
+    for (int i = 1; i <= 50 && !starved; ++i) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (acquired.load() < i && std::chrono::steady_clock::now() < deadline) std::this_thread::yield();
+        starved = acquired.load() < i;
+    }
+    stop.store(true);
+    for (auto& th : readers) th.join();  // once they stop, a starved writer gets in and exits
+    writer.join();
+    std::cout << "  worst wait for the exclusive lock: " << worst_ms << " ms over " << reads.load() << " reads" << std::endl;
+    t.check(!starved, "a writer waited over 2 s behind back-to-back readers");
+    t.check(worst_ms < 100.0, "a writer waited " + std::to_string(worst_ms) + " ms behind back-to-back readers");
+    return t.done();
+}
+
 bool test_guards(const std::string& prefix, Built& b, const std::vector<float>& extra) {
     TestCase t("mutation guards: null vector, wrong element type, prepared insert that does not fit, RID on another slot, bad deletes");
     IVFPQIndex ix = b.index;
@@ -807,7 +858,7 @@ bool test_guards(const std::string& prefix, Built& b, const std::vector<float>& 
             "a prepared but unpublished insert was found, or took no slot");
     uint32_t id;
     {
-        std::unique_lock<std::shared_mutex> lock(delta.mtx);
+        std::unique_lock<WriterPreferringSharedMutex> lock(delta.mtx);
         id = ivf_pq_publish_insert(ix, delta, std::move(p));
     }
     IVFPQSearchResult after = ivf_pq_search<float>(ix, b.heap, extra.data(), 1, NLIST, 10, scratch, &delta);
@@ -853,6 +904,7 @@ int main() {
         all_pass &= test_deletes_survive_a_reload(prefix_f, *f, base_f, queries);
         all_pass &= test_inserts_race_searches(*f, queries);
         all_pass &= test_churn_races_searches(prefix_f, *f, base_f, queries);
+        all_pass &= test_writers_get_in_under_constant_readers();
         all_pass &= test_guards(prefix_f, *f, extra_f);
 
         f->heap.close();

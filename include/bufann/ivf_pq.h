@@ -7,6 +7,8 @@
 #include <atomic>
 #include <cstdint>
 #include <mutex>
+#include <pthread.h>
+
 #include <shared_mutex>
 #include <unordered_map>
 #include <vector>
@@ -125,6 +127,37 @@ struct DynamicPQCodes {
     std::unordered_map<uint32_t, std::vector<uint8_t>> codes;  // vector_id -> [chunks]
 };
 
+// The delta's lock. std::shared_mutex is glibc's reader-preferring rwlock,
+// under which a writer waits for a moment with no reader at all; with a few
+// threads searching back to back that moment never comes and every insert
+// and delete stalls for good (seen: 8 searchers on SIFT1M starved 4
+// inserters indefinitely). This one makes new readers wait once a writer is
+// waiting, so a mutation gets in after the searches already inside leave.
+// Meets the SharedLockable requirements of std::shared_lock/unique_lock.
+class WriterPreferringSharedMutex {
+public:
+    WriterPreferringSharedMutex() {
+        pthread_rwlockattr_t attr;
+        pthread_rwlockattr_init(&attr);
+        pthread_rwlockattr_setkind_np(&attr, PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP);
+        pthread_rwlock_init(&_lock, &attr);
+        pthread_rwlockattr_destroy(&attr);
+    }
+    ~WriterPreferringSharedMutex() { pthread_rwlock_destroy(&_lock); }
+    WriterPreferringSharedMutex(const WriterPreferringSharedMutex&)            = delete;
+    WriterPreferringSharedMutex& operator=(const WriterPreferringSharedMutex&) = delete;
+
+    void lock() { pthread_rwlock_wrlock(&_lock); }
+    bool try_lock() { return pthread_rwlock_trywrlock(&_lock) == 0; }
+    void unlock() { pthread_rwlock_unlock(&_lock); }
+    void lock_shared() { pthread_rwlock_rdlock(&_lock); }
+    bool try_lock_shared() { return pthread_rwlock_tryrdlock(&_lock) == 0; }
+    void unlock_shared() { pthread_rwlock_unlock(&_lock); }
+
+private:
+    pthread_rwlock_t _lock;
+};
+
 // IVFPQDelta: what mutations change that the index file does not hold, and
 // the lock that orders them against searches. An insert publishes and a
 // delete retracts under mtx held exclusively; a search holds it shared while
@@ -136,7 +169,7 @@ struct DynamicPQCodes {
 // occupancy bitmap only; the index file still lists the vector, and a load
 // retracts it again from the bitmap (ivf_pq_recover_deletes).
 struct IVFPQDelta {
-    mutable std::shared_mutex mtx;
+    mutable WriterPreferringSharedMutex mtx;
     PostingListDelta lists;
     DynamicPQCodes codes;
     RawVectorFreeList free_list;
