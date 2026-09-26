@@ -36,23 +36,6 @@ const uint32_t RERANK_M = 100;
 const float RECALL_FLOOR = 0.90f;
 const std::vector<uint32_t> NPROBES = {1, 4, 16, 64};
 
-float sq_dist(const float* a, const float* b, uint32_t dim) {
-    float s = 0.0f;
-    for (uint32_t d = 0; d < dim; ++d) s += (a[d] - b[d]) * (a[d] - b[d]);
-    return s;
-}
-
-// Indices of the `k` smallest values, ascending by value.
-std::vector<uint32_t> top_k(const std::vector<float>& values, uint32_t k) {
-    std::vector<uint32_t> order(values.size());
-    std::iota(order.begin(), order.end(), 0u);
-    k = std::min<uint32_t>(k, uint32_t(order.size()));
-    std::partial_sort(order.begin(), order.begin() + k, order.end(),
-                      [&](uint32_t a, uint32_t b) { return values[a] < values[b]; });
-    order.resize(k);
-    return order;
-}
-
 // Ground truth as [nq][>= K] ids, from a DiskANN truthset .bin or an .ivecs.
 std::vector<std::vector<uint32_t>> load_gt(const std::string& path, size_t nq) {
     std::vector<std::vector<uint32_t>> gt(nq);

@@ -76,9 +76,17 @@ target_link_libraries(ivf_pq_recall_test ${PROJECT_NAME} aio -ltcmalloc)
 add_executable(ivf_pq_search_test ivf_pq_search_test.cpp)
 target_link_libraries(ivf_pq_search_test ${PROJECT_NAME} aio -ltcmalloc)
 
+# ivf_pq_insert against the build's encoders, brute force, and racing searches.
+add_executable(ivf_pq_mutate_test ivf_pq_mutate_test.cpp)
+target_link_libraries(ivf_pq_mutate_test ${PROJECT_NAME} aio -ltcmalloc)
+
 # IVF-PQ index builder for the benchmark scripts (the driver only loads).
 add_executable(ivf_pq_build_index ivf_pq_build_index.cpp)
 target_link_libraries(ivf_pq_build_index ${PROJECT_NAME} aio -ltcmalloc)
+
+# Insert/delete throughput and the search cost of an unfolded delta.
+add_executable(ivf_pq_mutation_bench ivf_pq_mutation_bench.cpp)
+target_link_libraries(ivf_pq_mutation_bench ${PROJECT_NAME} aio -ltcmalloc)
 
 # IVF-PQ through the public BufANN API.
 add_executable(ivf_pq_api_test ivf_pq_api_test.cpp)
@@ -89,5 +97,6 @@ add_test(NAME ivf_pq_raw_vector_heap COMMAND ivf_pq_raw_vector_heap_test)
 add_test(NAME ivf_pq_build COMMAND ivf_pq_build_test)
 add_test(NAME ivf_pq_scale_smoke COMMAND ivf_pq_scale_test 50000 128 64 32)
 add_test(NAME ivf_pq_recall_synthetic COMMAND ivf_pq_recall_test)
+add_test(NAME ivf_pq_mutate COMMAND ivf_pq_mutate_test)
 add_test(NAME ivf_pq_api COMMAND ivf_pq_api_test)
 add_test(NAME ivf_pq_search COMMAND ivf_pq_search_test)

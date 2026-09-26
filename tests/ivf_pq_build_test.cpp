@@ -43,14 +43,6 @@ std::vector<float> blob_center(uint32_t b, float spacing) {
 }
 
 template<typename T>
-T clamp_to(float v) {
-    float lo = float(std::numeric_limits<T>::lowest()), hi = float(std::numeric_limits<T>::max());
-    return T(std::round(std::min(hi, std::max(lo, v))));
-}
-template<>
-float clamp_to<float>(float v) { return v; }
-
-template<typename T>
 std::vector<T> write_synthetic_base(const std::string& path, float spacing) {
     std::mt19937 gen(42);
     std::normal_distribution<float> noise(0.0f, 1.0f);

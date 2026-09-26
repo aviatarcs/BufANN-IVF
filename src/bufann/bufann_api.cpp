@@ -694,8 +694,10 @@ void diskann::inplace::bufann_insert(
         TagType tag,
         const T* coords,
         uint32_t search_L) {
-    if (idx.ivf)
-        throw std::runtime_error("bufann_insert: not supported for an IVF-PQ index yet");
+    if (idx.ivf) {
+        ivf_pq_backend_insert<T>(*idx.ivf, tag, coords);  // search_L is a graph parameter
+        return;
+    }
     if (tag == INVALID_TAG) {
         throw std::invalid_argument("bufann_insert: INVALID_TAG is reserved");
     }
@@ -790,8 +792,10 @@ template<typename T>
 void diskann::inplace::bufann_delete(
         BufANNIndex<T>& idx,
         TagType tag) {
-    if (idx.ivf)
-        throw std::runtime_error("bufann_delete: not supported for an IVF-PQ index yet");
+    if (idx.ivf) {
+        ivf_pq_backend_delete(*idx.ivf, tag);
+        return;
+    }
     idx.store.mark_tag_deleted(tag);
 }
 
@@ -804,8 +808,10 @@ void diskann::inplace::bufann_delete_batch(
         BufANNIndex<T>& idx,
         const TagType* tags,
         size_t count) {
-    if (idx.ivf)
-        throw std::runtime_error("bufann_delete_batch: not supported for an IVF-PQ index yet");
+    if (idx.ivf) {
+        for (size_t i = 0; i < count; ++i) ivf_pq_backend_delete(*idx.ivf, tags[i]);
+        return;
+    }
     if (count == 0) return;
     for (size_t i = 0; i < count; ++i) {
         idx.store.mark_tag_deleted(tags[i]);

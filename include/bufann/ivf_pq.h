@@ -7,6 +7,9 @@
 #include <atomic>
 #include <cstdint>
 #include <mutex>
+#include <pthread.h>
+
+#include <shared_mutex>
 #include <unordered_map>
 #include <vector>
 
@@ -61,10 +64,20 @@ struct IVFPQSearchConfig {
 };
 
 // RawVectorRID: bit 31 is the active flag, the low 31 bits a flat heap slot.
+// RIDs that searches read concurrently with mutations go through
+// load_rid/store_rid; their seq_cst ordering is what RawVectorHeap::ReadGuard
+// relies on.
 struct RawVectorRID {
     uint32_t packed = 0;
 };
 static_assert(sizeof(RawVectorRID) == 4, "RawVectorRID must pack into 32 bits");
+
+inline RawVectorRID load_rid(const RawVectorRID& rid) {
+    return RawVectorRID{std::atomic_ref<const uint32_t>(rid.packed).load()};
+}
+inline void store_rid(RawVectorRID& rid, RawVectorRID value) {
+    std::atomic_ref<uint32_t>(rid.packed).store(value.packed);
+}
 
 constexpr uint32_t RAW_VECTOR_RID_ACTIVE_BIT = 0x80000000u;
 constexpr uint32_t RAW_VECTOR_RID_SLOT_MASK  = 0x7FFFFFFFu;
@@ -83,16 +96,26 @@ struct RawVectorRIDTable {
     std::vector<RawVectorRID> rid;
 };
 
-// Slots released by deletes, reused by inserts.
+// Slots released by deletes. free_slot appends to `deferred` with the heap
+// epoch of the free; allocate_slot moves the entries no in-flight reader can
+// still address onto `free_slots` (see RawVectorHeap::ReadGuard) and pops
+// from there. Both vectors are guarded by mtx.
 struct RawVectorFreeList {
+    struct Deferred {
+        uint64_t epoch;      // RawVectorHeap epoch at the free
+        uint32_t flat_slot;  // see RawVectorRID
+    };
     std::mutex mtx;
-    std::vector<uint32_t> free_slots;  // flat slot indices, see RawVectorRID
+    std::vector<Deferred> deferred;    // ascending by epoch
+    std::vector<uint32_t> free_slots;  // reusable now
 };
 
-// PostingListDelta: pending mutations not yet folded into PostingLists
+// PostingListDelta: pending mutations not yet folded into PostingLists. A
+// deleted base vector stays in its posting list until the rebuild, so it is
+// tombstoned; a deleted insert just leaves pending_inserts.
 struct PostingListDelta {
     std::unordered_map<uint32_t, std::vector<uint32_t>> pending_inserts;  // cluster_id -> vector_ids
-    tsl::robin_set<uint32_t> tombstones;                                  // vector_ids
+    tsl::robin_set<uint32_t> tombstones;                                  // deleted base vector_ids
 };
 
 // DynamicPQCodes: PQ codes for vectors inserted since the last rebuild
@@ -102,9 +125,52 @@ struct DynamicPQCodes {
     std::unordered_map<uint32_t, std::vector<uint8_t>> codes;  // vector_id -> [chunks]
 };
 
+// The delta's lock. std::shared_mutex is glibc's reader-preferring rwlock,
+// under which a writer waits for a moment with no reader at all; a few
+// threads searching back to back never leave one, and mutations stall for
+// good. This one holds new readers back while a writer waits. For the same
+// reason a thread must not take it shared twice without releasing.
+class WriterPreferringSharedMutex {
+public:
+    WriterPreferringSharedMutex() {
+        pthread_rwlockattr_t attr;
+        pthread_rwlockattr_init(&attr);
+        pthread_rwlockattr_setkind_np(&attr, PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP);
+        pthread_rwlock_init(&_lock, &attr);
+        pthread_rwlockattr_destroy(&attr);
+    }
+    ~WriterPreferringSharedMutex() { pthread_rwlock_destroy(&_lock); }
+    WriterPreferringSharedMutex(const WriterPreferringSharedMutex&)            = delete;
+    WriterPreferringSharedMutex& operator=(const WriterPreferringSharedMutex&) = delete;
+
+    void lock() { pthread_rwlock_wrlock(&_lock); }
+    void unlock() { pthread_rwlock_unlock(&_lock); }
+    void lock_shared() { pthread_rwlock_rdlock(&_lock); }
+    void unlock_shared() { pthread_rwlock_unlock(&_lock); }
+
+private:
+    pthread_rwlock_t _lock;
+};
+
+// IVFPQDelta: what mutations change that the index file does not hold.
+// Mutations take mtx exclusively; a search holds it shared while it reads
+// the delta and the RID table (which inserts grow), never across heap I/O.
+// Ids at or past the base count are inserts, with codes in `codes` and list
+// membership in `lists`, until the rebuild folds them in (write_ivf_pq_index
+// refuses an index with unfolded inserts). Deletes reach the file only as
+// the heap's occupancy bits; a load recovers them (ivf_pq_recover_deletes).
+struct IVFPQDelta {
+    mutable WriterPreferringSharedMutex mtx;
+    PostingListDelta lists;
+    DynamicPQCodes codes;
+    RawVectorFreeList free_list;
+};
+
 // IVFPQIndex: everything the combined index file persists, in memory. The
 // raw vectors themselves stay in the heap file; heap_layout, heap_pages and
 // heap_next_slot describe it and are what RawVectorHeap::open_existing needs.
+// assignments and rid_table also cover inserted vectors; lists and pq.codes
+// cover only the base vectors the file was written from.
 struct IVFPQIndex {
     IVFMetadata meta;
     ClusterAssignments assignments;
@@ -116,13 +182,19 @@ struct IVFPQIndex {
     uint32_t heap_next_slot = 0;  // RawVectorHeap::next_flat_slot() when the file was written
 };
 
+// Vectors the posting lists and PQ codes cover; ids from here on are inserts.
+inline uint32_t ivf_pq_num_base(const IVFPQIndex& index) {
+    return index.lists.offsets.empty() ? 0 : index.lists.offsets.back();
+}
+
 // IVFPQIndexFileHeader: on-disk header for the combined IVF-PQ index file.
 // Fixed layout, written and read as raw bytes; bump version on any change.
 // Version 2 added raw_vector_next_slot and the RawVectorPageHeader; version 3
 // grew that page header from 8 to 16 bytes to record page_size and elem_size,
-// which moves every slot in the heap file.
+// which moves every slot in the heap file; version 4 added the per-page
+// owner-id array between the bitmap and the slots, which moves them again.
 constexpr uint32_t IVF_PQ_INDEX_MAGIC   = 0x51465649;  // "IVFQ" little-endian
-constexpr uint32_t IVF_PQ_INDEX_VERSION = 3;
+constexpr uint32_t IVF_PQ_INDEX_VERSION = 4;
 
 struct IVFPQIndexFileHeader {
     uint32_t magic   = 0;

@@ -78,12 +78,6 @@ std::vector<float> read_rows(const std::string& path, const std::vector<size_t>&
     return rows;
 }
 
-float sq_dist(const float* a, const float* b, uint32_t dim) {
-    float s = 0.0f;
-    for (uint32_t d = 0; d < dim; ++d) s += (a[d] - b[d]) * (a[d] - b[d]);
-    return s;
-}
-
 float sq_norm(const float* a, uint32_t dim) {
     float s = 0.0f;
     for (uint32_t d = 0; d < dim; ++d) s += a[d] * a[d];

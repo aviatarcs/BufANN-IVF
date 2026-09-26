@@ -1,12 +1,15 @@
 #include "bufann/ivf_pq_backend.h"
 
 #include <algorithm>
+#include <mutex>
+#include <shared_mutex>
 #include <stdexcept>
 
 #include "ann_exception.h"
 #include "bufann/bufann_api.h"
 #include "bufann/ivf_pq_build.h"
 #include "bufann/ivf_pq_index_file.h"
+#include "bufann/ivf_pq_mutate.h"
 
 namespace diskann {
 namespace inplace {
@@ -82,8 +85,105 @@ std::unique_ptr<IVFPQBackend> ivf_pq_backend_load(const std::string& index_prefi
                                  "-byte elements, not the " + std::to_string(sizeof(T)) + "-byte T requested");
     }
     backend->heap.open_existing(ivf_raw_vectors_path(index_prefix), ix.heap_layout, ix.heap_next_slot, ix.heap_pages);
+    ivf_pq_recover_deletes(backend->index, backend->heap, backend->delta);
     return backend;
     });
+}
+
+namespace {
+
+// Marks a tag in inserted_id whose insert is between reservation and publish.
+constexpr uint32_t IVF_PQ_PENDING_ID = 0xFFFFFFFFu;
+constexpr uint32_t IVF_PQ_NO_ID      = 0xFFFFFFFFu;
+
+// The id of the active vector under `tag`, or IVF_PQ_NO_ID. Caller holds
+// delta.mtx.
+uint32_t active_id(const IVFPQBackend& backend, TagType tag) {
+    auto inserted = backend.inserted_id.find(tag);
+    uint32_t id;
+    if (inserted != backend.inserted_id.end()) {
+        if (inserted->second == IVF_PQ_PENDING_ID) return IVF_PQ_NO_ID;
+        id = inserted->second;
+    } else if (tag < ivf_pq_num_base(backend.index)) {
+        id = tag;
+    } else {
+        return IVF_PQ_NO_ID;
+    }
+    return rid_is_active(load_rid(backend.index.rid_table.rid[id])) ? id : IVF_PQ_NO_ID;
+}
+
+// Whether `tag` names an active vector or one being inserted. Caller holds
+// delta.mtx.
+bool tag_is_taken(const IVFPQBackend& backend, TagType tag) {
+    auto inserted = backend.inserted_id.find(tag);
+    return (inserted != backend.inserted_id.end() && inserted->second == IVF_PQ_PENDING_ID) ||
+           active_id(backend, tag) != IVF_PQ_NO_ID;
+}
+
+}  // namespace
+
+// The tag is reserved before the heap work so two concurrent inserts of one
+// tag cannot both get in, and the vector and its tag are published in one
+// critical section so a search never returns an id without a tag.
+template<typename T>
+void ivf_pq_backend_insert(IVFPQBackend& backend, TagType tag, const T* coords) {
+    if (tag == INVALID_TAG) throw std::invalid_argument("bufann_insert: INVALID_TAG is reserved");
+    if (coords == nullptr) throw std::invalid_argument("bufann_insert: coords is null");
+    {
+        std::unique_lock<WriterPreferringSharedMutex> lock(backend.delta.mtx);
+        if (tag_is_taken(backend, tag)) {
+            throw std::invalid_argument("bufann_insert: tag " + std::to_string(tag) + " is already active");
+        }
+        backend.inserted_id[tag] = IVF_PQ_PENDING_ID;
+    }
+    auto release_tag = [&] {
+        std::unique_lock<WriterPreferringSharedMutex> lock(backend.delta.mtx);
+        backend.inserted_id.erase(tag);
+    };
+    IVFPQPreparedInsert prepared;
+    try {
+        prepared = as_std_exception(
+            [&] { return ivf_pq_prepare_insert<T>(backend.index, backend.heap, backend.delta, coords); });
+    } catch (...) {
+        release_tag();
+        throw;
+    }
+    const uint32_t slot = prepared.slot;
+    std::unique_lock<WriterPreferringSharedMutex> lock(backend.delta.mtx);
+    uint32_t id;
+    try {
+        id = as_std_exception([&] { return ivf_pq_publish_insert(backend.index, backend.delta, std::move(prepared)); });
+    } catch (...) {
+        backend.inserted_id.erase(tag);
+        lock.unlock();
+        backend.heap.free_slot(slot, backend.delta.free_list);  // never published, so no reader can hold it
+        throw;
+    }
+    // Ids are reserved in prepare order but published in lock order, so a
+    // smaller id may arrive after a larger one has grown the map.
+    const size_t at = size_t(id) - ivf_pq_num_base(backend.index);
+    if (backend.inserted_tag.size() <= at) backend.inserted_tag.resize(at + 1, INVALID_TAG);
+    backend.inserted_tag[at] = tag;
+    backend.inserted_id[tag] = id;
+}
+
+// Resolving the tag and retracting the vector share one critical section,
+// so a concurrent insert of the tag sees it free only once the delete is
+// visible; the slot is freed outside it, as free_slot does heap I/O.
+void ivf_pq_backend_delete(IVFPQBackend& backend, TagType tag) {
+    uint32_t slot;
+    {
+        std::unique_lock<WriterPreferringSharedMutex> lock(backend.delta.mtx);
+        const uint32_t id = active_id(backend, tag);
+        if (id == IVF_PQ_NO_ID) {
+            throw std::invalid_argument("bufann_delete: tag " + std::to_string(tag) + " is not active");
+        }
+        slot = as_std_exception([&] { return ivf_pq_retract_delete(backend.index, backend.delta, id); });
+        // inserted_tag keeps the entry: ids are never reused, and a query
+        // that found the vector before this delete still resolves its tag.
+        if (id >= ivf_pq_num_base(backend.index)) backend.inserted_id.erase(tag);
+    }
+    as_std_exception([&] { backend.heap.free_slot(slot, backend.delta.free_list); });
 }
 
 template<typename T>
@@ -101,11 +201,16 @@ uint32_t ivf_pq_backend_query(IVFPQBackend& backend, const BufANNConfig& config,
     // out first: ivf_pq_search overwrites scratch.vector during the re-rank.
     std::vector<float> q(scratch.vector.begin(), scratch.vector.end());
 
-    IVFPQSearchResult r = as_std_exception(
-        [&] { return ivf_pq_search<T>(backend.index, backend.heap, q.data(), topK, nprobe, rerank_m, scratch); });
+    IVFPQSearchResult r = as_std_exception([&] {
+        return ivf_pq_search<T>(backend.index, backend.heap, q.data(), topK, nprobe, rerank_m, scratch, &backend.delta);
+    });
     const uint32_t n = uint32_t(std::min<size_t>(topK, r.ids.size()));
     if (out_tags != nullptr) {
-        for (uint32_t i = 0; i < n; ++i) out_tags[i] = TagType(r.ids[i]);
+        const uint32_t num_base = ivf_pq_num_base(backend.index);
+        std::shared_lock<WriterPreferringSharedMutex> lock(backend.delta.mtx);
+        for (uint32_t i = 0; i < n; ++i) {
+            out_tags[i] = r.ids[i] < num_base ? TagType(r.ids[i]) : backend.inserted_tag[r.ids[i] - num_base];
+        }
     }
     return n;
 }
@@ -114,6 +219,7 @@ uint32_t ivf_pq_backend_query(IVFPQBackend& backend, const BufANNConfig& config,
     template std::unique_ptr<IVFPQBackend> ivf_pq_backend_build<T>(const std::string&, const std::string&,      \
                                                                    const BufANNConfig&);                        \
     template std::unique_ptr<IVFPQBackend> ivf_pq_backend_load<T>(const std::string&, const BufANNConfig&);     \
+    template void ivf_pq_backend_insert<T>(IVFPQBackend&, TagType, const T*);                                  \
     template uint32_t ivf_pq_backend_query<T>(IVFPQBackend&, const BufANNConfig&, const T*, uint32_t, TagType*, \
                                               uint32_t, uint32_t, IVFPQSearchScratch&);
 IVF_PQ_INSTANTIATE_BACKEND(float)

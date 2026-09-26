@@ -35,6 +35,7 @@ struct IVFPQSearchScratch {
     std::vector<float> pq_dist;         // parallel to candidates
     std::vector<uint32_t> order;        // selection workspace over candidates
     std::vector<uint32_t> shortlist;    // ids kept for the re-rank
+    std::vector<uint32_t> shortlist_slot;  // their heap slots, parallel to shortlist
     std::vector<float> exact_dist;      // parallel to shortlist
     std::vector<char> raw_vector;       // [heap elem_size]
     std::vector<float> vector;          // [dim]
@@ -46,11 +47,15 @@ struct IVFPQSearchScratch {
 // ||q||^2 + ||c||^2 - 2 q.c, so partitions equidistant to within a few ulps
 // of those norms may be ordered either way. nprobe is clamped to nlist.
 // rerank_m == 0 skips the re-rank and ranks by PQ distance; otherwise it
-// must be at least k. Vectors whose RID is inactive are dropped.
+// must be at least k. Vectors whose RID is inactive are dropped. `delta`,
+// when given, contributes the vectors inserted since the index file was
+// written (ivf_pq_insert), scanned in the probed partitions like the base
+// vectors, and withholds the deleted ones (ivf_pq_delete); searches may run
+// concurrently with inserts into and deletes from it.
 template<typename T>
 IVFPQSearchResult ivf_pq_search(const IVFPQIndex& index, const RawVectorHeap& heap, const float* query,
                                 uint32_t k, uint32_t nprobe, uint32_t rerank_m,
-                                IVFPQSearchScratch& scratch);
+                                IVFPQSearchScratch& scratch, const IVFPQDelta* delta = nullptr);
 
 // Allocates a scratch per call; for one-off queries.
 template<typename T>
@@ -67,7 +72,8 @@ template<typename T>
 std::vector<IVFPQSearchResult> ivf_pq_search_batch(const IVFPQIndex& index, const RawVectorHeap& heap,
                                                    const float* queries, size_t nq, uint32_t k,
                                                    uint32_t nprobe, uint32_t rerank_m,
-                                                   uint32_t gemm_rows = IVF_PQ_SEARCH_GEMM_ROWS);
+                                                   uint32_t gemm_rows = IVF_PQ_SEARCH_GEMM_ROWS,
+                                                   const IVFPQDelta* delta = nullptr);
 
 }  // namespace inplace
 }  // namespace diskann

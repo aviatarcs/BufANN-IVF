@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <cstring>
+#include <thread>
 
 #include "bufann/ivf_pq_require.h"
 
@@ -16,12 +17,13 @@ namespace inplace {
 RawVectorHeapLayout compute_raw_vector_heap_layout(uint32_t page_size, uint32_t elem_size) {
     IVF_PQ_REQUIRE(elem_size > 0, "raw-vector element size must be greater than zero");
     auto bytes_used = [&](uint32_t slots) {
-        return uint64_t(RAW_VECTOR_PAGE_HEADER_BYTES) + (slots + 7) / 8 + uint64_t(slots) * elem_size;
+        return uint64_t(RAW_VECTOR_PAGE_HEADER_BYTES) + (slots + 7) / 8 +
+               uint64_t(slots) * (RAW_VECTOR_OWNER_BYTES + elem_size);
     };
 
     // Start from the count that ignores the bitmap and step down until it fits.
     uint32_t slots = page_size > RAW_VECTOR_PAGE_HEADER_BYTES
-                         ? (page_size - RAW_VECTOR_PAGE_HEADER_BYTES) / elem_size
+                         ? (page_size - RAW_VECTOR_PAGE_HEADER_BYTES) / (RAW_VECTOR_OWNER_BYTES + elem_size)
                          : 0;
     while (slots > 0 && bytes_used(slots) > page_size) {
         --slots;
@@ -33,7 +35,8 @@ RawVectorHeapLayout compute_raw_vector_heap_layout(uint32_t page_size, uint32_t 
     layout.elem_size = elem_size;
     layout.slots_per_page = slots;
     layout.bitmap_bytes = (slots + 7) / 8;
-    layout.slots_offset = RAW_VECTOR_PAGE_HEADER_BYTES + layout.bitmap_bytes;
+    layout.owners_offset = RAW_VECTOR_PAGE_HEADER_BYTES + layout.bitmap_bytes;
+    layout.slots_offset = layout.owners_offset + slots * RAW_VECTOR_OWNER_BYTES;
     return layout;
 }
 
@@ -62,11 +65,61 @@ void require_page_header(const void* page, const RawVectorHeapLayout& layout, ui
 
 }  // namespace
 
+RawVectorHeap::RawVectorHeap(uint32_t max_readers) : _readers(max_readers) {
+    IVF_PQ_REQUIRE(max_readers > 0, "raw-vector heap needs at least one reader registry entry");
+}
+
 RawVectorHeap::~RawVectorHeap() { close(); }
+
+// Everything the grace period relies on is seq_cst: the epoch load and the
+// CAS here, the deleter's RID store and the epoch increment in free_slot,
+// and the registry scan in oldest_reader_epoch. In that single total order,
+// a reclaim that found this entry empty precedes the CAS, so every RID this
+// reader loads afterwards is one the deleter had already cleared; and a
+// reader whose recorded epoch is newer than a free loaded the epoch after
+// that free's increment, hence after its RID store. The epoch may advance
+// between the load and the CAS; recording the older value only makes the
+// reader block reclaims it did not need to.
+//
+// A full registry means max_readers searches are mid-query; waiting for one
+// to finish is a stall, where throwing would abort a query (and terminate
+// the process from inside ivf_pq_search_batch's OpenMP loop).
+uint32_t RawVectorHeap::enter_reader() const {
+    thread_local uint32_t hint = 0;
+    const uint32_t n = uint32_t(_readers.size());
+    for (;;) {
+        const uint64_t epoch = _epoch.load();
+        for (uint32_t tries = 0; tries < n; ++tries) {
+            const uint32_t i = (hint + tries) % n;
+            uint64_t expected = 0;
+            if (_readers[i].epoch.compare_exchange_strong(expected, epoch)) {
+                hint = i;
+                return i;
+            }
+        }
+        std::this_thread::yield();
+    }
+}
+
+void RawVectorHeap::leave_reader(uint32_t reader) const { _readers[reader].epoch.store(0); }
+
+uint64_t RawVectorHeap::oldest_reader_epoch() const {
+    uint64_t oldest = UINT64_MAX;
+    for (const ReaderEntry& r : _readers) {
+        const uint64_t e = r.epoch.load();
+        if (e != 0 && e < oldest) oldest = e;
+    }
+    return oldest;
+}
+
+RawVectorHeap::ReadGuard::ReadGuard(const RawVectorHeap& heap) : _heap(heap), _reader(heap.enter_reader()) {}
+
+RawVectorHeap::ReadGuard::~ReadGuard() { _heap.leave_reader(_reader); }
 
 void RawVectorHeap::set_layout(RawVectorHeapLayout layout) {
     IVF_PQ_REQUIRE(layout.slots_per_page > 0 && layout.elem_size > 0 &&
-                       layout.slots_offset == RAW_VECTOR_PAGE_HEADER_BYTES + layout.bitmap_bytes &&
+                       layout.owners_offset == RAW_VECTOR_PAGE_HEADER_BYTES + layout.bitmap_bytes &&
+                       layout.slots_offset == layout.owners_offset + layout.slots_per_page * RAW_VECTOR_OWNER_BYTES &&
                        layout.bitmap_bytes * 8 >= layout.slots_per_page &&
                        uint64_t(layout.slots_offset) + uint64_t(layout.slots_per_page) * layout.elem_size <=
                            layout.page_size,
@@ -172,6 +225,7 @@ void RawVectorHeap::require_page_header_on_disk(uint32_t page_id) const {
 uint32_t RawVectorHeap::allocate_slot(RawVectorFreeList& free_list) {
     {
         std::lock_guard<std::mutex> lg(free_list.mtx);
+        if (free_list.free_slots.empty()) reclaim_locked(free_list);
         if (!free_list.free_slots.empty()) {
             uint32_t flat = free_list.free_slots.back();
             free_list.free_slots.pop_back();
@@ -197,23 +251,31 @@ uint32_t RawVectorHeap::allocate_slot(RawVectorFreeList& free_list) {
     return flat;
 }
 
-void RawVectorHeap::write_vector(uint32_t flat_slot, const void* data) {
+// Owner and bytes land before the bit, so a slot whose bit a crash left set
+// is fully described.
+void RawVectorHeap::write_vector(uint32_t flat_slot, uint32_t owner, const void* data) {
     require_allocated(flat_slot);
+    write_at(_layout.owner_offset(flat_slot), &owner, RAW_VECTOR_OWNER_BYTES, "write raw vector owner");
     write_at(_layout.slot_offset(flat_slot), data, _layout.elem_size, "write raw vector");
     set_occupancy_bit(flat_slot, true);
 }
 
 // One pread from the page start through the slot, so checking the header
-// costs no second system call; it copies at most a page instead of a slot.
-void RawVectorHeap::read_vector(uint32_t flat_slot, void* out) const {
+// and picking up the owner cost no second system call; it copies at most a
+// page instead of a slot.
+uint32_t RawVectorHeap::read_vector(uint32_t flat_slot, void* out) const {
     require_allocated(flat_slot);
     const uint32_t page_id = _layout.page_of(flat_slot);
-    const uint32_t slot_in_page = _layout.slot_offset_in_page(_layout.index_in_page(flat_slot));
+    const uint32_t index = _layout.index_in_page(flat_slot);
+    const uint32_t slot_in_page = _layout.slot_offset_in_page(index);
     thread_local std::vector<char> prefix;
     prefix.resize(size_t(slot_in_page) + _layout.elem_size);
     read_at(_layout.page_offset(page_id), prefix.data(), prefix.size(), "read raw vector");
     require_page_header(prefix.data(), _layout, page_id);
     std::memcpy(out, prefix.data() + slot_in_page, _layout.elem_size);
+    uint32_t owner;
+    std::memcpy(&owner, prefix.data() + _layout.owner_offset_in_page(index), RAW_VECTOR_OWNER_BYTES);
+    return owner;
 }
 
 bool RawVectorHeap::is_slot_occupied(uint32_t flat_slot) const {
@@ -224,11 +286,43 @@ bool RawVectorHeap::is_slot_occupied(uint32_t flat_slot) const {
     return (byte & _layout.bitmap_mask(_layout.index_in_page(flat_slot))) != 0;
 }
 
+void RawVectorHeap::read_page_directory(uint32_t page_id, uint8_t* bitmap, uint32_t* owners) const {
+    IVF_PQ_REQUIRE(page_id < allocated_pages(),
+                   "raw-vector page " + std::to_string(page_id) + " is past the allocated pages");
+    std::vector<char> prefix(_layout.slots_offset);
+    std::lock_guard<std::mutex> lg(_bitmap_mtx[page_id % RAW_VECTOR_BITMAP_LOCK_STRIPES]);
+    read_at(_layout.page_offset(page_id), prefix.data(), prefix.size(), "read page directory");
+    require_page_header(prefix.data(), _layout, page_id);
+    std::memcpy(bitmap, prefix.data() + RAW_VECTOR_PAGE_HEADER_BYTES, _layout.bitmap_bytes);
+    std::memcpy(owners, prefix.data() + _layout.owners_offset, size_t(_layout.slots_per_page) * RAW_VECTOR_OWNER_BYTES);
+}
+
 void RawVectorHeap::free_slot(uint32_t flat_slot, RawVectorFreeList& free_list) {
     require_allocated(flat_slot);
     set_occupancy_bit(flat_slot, false);
     std::lock_guard<std::mutex> lg(free_list.mtx);
-    free_list.free_slots.push_back(flat_slot);
+    // The epoch is taken under the lock so `deferred` stays ascending.
+    free_list.deferred.push_back({_epoch.fetch_add(1), flat_slot});
+}
+
+size_t RawVectorHeap::reclaim_freed_slots(RawVectorFreeList& free_list) {
+    std::lock_guard<std::mutex> lg(free_list.mtx);
+    return reclaim_locked(free_list);
+}
+
+// A slot freed at epoch f may still be addressed by a reader whose recorded
+// epoch is <= f, and by no other; `deferred` is ascending, so the reclaimable
+// entries are a prefix.
+size_t RawVectorHeap::reclaim_locked(RawVectorFreeList& free_list) {
+    if (free_list.deferred.empty()) return 0;
+    const uint64_t oldest = oldest_reader_epoch();
+    auto& deferred = free_list.deferred;
+    auto end = std::find_if(deferred.begin(), deferred.end(),
+                            [&](const RawVectorFreeList::Deferred& d) { return d.epoch >= oldest; });
+    for (auto it = deferred.begin(); it != end; ++it) free_list.free_slots.push_back(it->flat_slot);
+    const size_t reclaimed = size_t(end - deferred.begin());
+    deferred.erase(deferred.begin(), end);
+    return reclaimed;
 }
 
 void RawVectorHeap::set_occupancy_bit(uint32_t flat_slot, bool occupied) {
@@ -268,7 +362,7 @@ RawVectorHeapBulkWriter::RawVectorHeapBulkWriter(RawVectorHeap& heap, uint32_t p
     _buf_capacity_slots = pages_per_flush * _layout.slots_per_page;
 }
 
-uint32_t RawVectorHeapBulkWriter::append(const void* data) {
+uint32_t RawVectorHeapBulkWriter::append(uint32_t owner, const void* data) {
     IVF_PQ_REQUIRE(!_finished, "append after finish on raw-vector bulk writer");
     IVF_PQ_REQUIRE(_next_flat_slot <= RAW_VECTOR_RID_SLOT_MASK,
                    "raw-vector heap is full: flat slot index exceeds the 31 bits "
@@ -282,6 +376,7 @@ uint32_t RawVectorHeapBulkWriter::append(const void* data) {
     if (index == 0) {
         stamp_page_header(page, _layout, _first_page_in_buf + page_in_buf);
     }
+    std::memcpy(page + _layout.owner_offset_in_page(index), &owner, RAW_VECTOR_OWNER_BYTES);
     std::memcpy(page + _layout.slot_offset_in_page(index), data, _layout.elem_size);
     page[_layout.bitmap_byte_in_page(index)] |= _layout.bitmap_mask(index);
 

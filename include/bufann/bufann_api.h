@@ -171,7 +171,10 @@ uint32_t bufann_snapshot_active_cap(const std::string& index_prefix);
 // coords   - raw vector with config.dim elements. Zero-padded internally
 //            to the aligned dimension.
 // search_L - beam width to use when finding the new node's neighbors.
-//            Pass 0 to use config.L.
+//            Pass 0 to use config.L. Unused by an IVF-PQ index, where the
+//            point is searchable on return but is not in the index file
+//            until the rebuild rewrites it, so bufann_load of the prefix
+//            is refused until then.
 template<typename T>
 void bufann_insert(
     BufANNIndex<T>& idx,
@@ -182,6 +185,11 @@ void bufann_insert(
 // Logically delete a node by external tag. Foreground delete records the tag in
 // an exact deleted-tag set and returns immediately; query result emission filters
 // that set so the tag is invisible before graph repair runs.
+//
+// On an IVF-PQ index the delete is immediate: the vector is invisible to
+// searches on return and the tag may be inserted again; a tag that is not
+// active throws std::invalid_argument. The delete survives a bufann_load
+// through the heap file's occupancy bits.
 template<typename T>
 void bufann_delete(
     BufANNIndex<T>& idx,
@@ -189,6 +197,8 @@ void bufann_delete(
 
 // Micro-batched logical delete: records every tag in `tags` in the deleted-tag
 // set. Tag-to-internal-ID resolution and graph repair happen in maintenance.
+// On an IVF-PQ index it is bufann_delete per tag, stopping at the first
+// tag that throws.
 template<typename T>
 void bufann_delete_batch(
     BufANNIndex<T>& idx,

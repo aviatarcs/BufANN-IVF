@@ -32,23 +32,33 @@ completes it, citing the commit subject.
       (`ivf_nprobe`) through the existing BufANN entry points; the graph path
       is untouched. Test: build + search through the public API on the blob
       fixture. (Wire IndexType::IvfPq into the BufANN API)
-- [ ] **Free-slot grace period.** Freed slots enter a deferred list and are
+- [x] **Free-slot grace period.** Freed slots enter a deferred list and are
       only reusable after every search that could hold the slot has finished
       (epoch counter). Required before concurrent search + delete. Test with
       threads: a reader holding a slot across a free never observes the
-      replacement's bytes.
-- [ ] **Mutation: insert.** Allocate a slot (free list or grow), write raw
+      replacement's bytes. (Defer freed heap slots until in-flight readers
+      have left)
+- [x] **Mutation: insert.** Allocate a slot (free list or grow), write raw
       bytes, assign to nearest centroid, encode PQ code into `DynamicPQCodes`,
       append to `PostingListDelta::pending_inserts`, set RID active. Search
       merges pending inserts. Tests: inserted vectors are found at nprobe
-      covering their partition.
-- [ ] **Mutation: delete.** Tombstone in `PostingListDelta`, clear RID active
-      bit, free the slot through the grace period. Search drops tombstoned ids.
+      covering their partition. (Add IVF-PQ insert; the delta is consulted by
+      search and published through bufann_insert)
+- [x] **Mutation: delete.** Tombstone in `PostingListDelta`, clear RID active
+      bit with `store_rid` (seq_cst, which the grace period relies on) before
+      freeing the slot through it. Search drops tombstoned ids. (Add IVF-PQ
+      delete; tombstoned base ids are dropped before selection and freed
+      slots go through the grace period)
 - [ ] **Posting-list rebuild.** Fold `PostingListDelta` and `DynamicPQCodes`
       into fresh `PostingLists`/`PQMetadata` off to the side, publish with
       one atomic pointer store in `IVFPQSearchConfig`, reclaim the old
       structures after a grace period. Searches must run throughout; test
-      with a search thread hammering during a rebuild.
+      with a search thread hammering during a rebuild. Then rewrite the
+      index file (with the heap's current page count and cursor) so a
+      prefix with inserts is loadable again (deletes already survive a
+      load through the heap's occupancy bitmap, `ivf_pq_recover_deletes`);
+      the backend's inserted-tag maps must survive the fold or be persisted
+      with it.
 
 ## Not planned
 
