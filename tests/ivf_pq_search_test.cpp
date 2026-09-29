@@ -274,6 +274,66 @@ bool test_scratch_follows_index(const Built& a, const Built& b, const std::vecto
     return t.done();
 }
 
+// A beam as wide as nlist makes the graph's probe set the exact nearest
+// nprobe, so ivf_pq_search_graph must then match the reference search; a
+// narrow beam must still return well-formed results from nprobe partitions.
+template<typename T>
+bool test_graph_matches_reference(const std::string& tag, const Built& b, const std::vector<float>& queries) {
+    TestCase t(tag + ": ivf_pq_search_graph with a beam of nlist matches the reference search within ties");
+    const IVFCentroidGraph graph = build_ivf_centroid_graph(b.index.meta);
+    IVFPQSearchScratch scratch;
+    size_t compared = 0, skipped = 0;
+    for (uint32_t nprobe : {1u, 3u, 8u, NLIST, 2 * NLIST}) {
+        for (uint32_t rerank_m : {0u, RERANK_M}) {
+            for (uint32_t q = 0; q < NQ; ++q) {
+                const float* query = queries.data() + size_t(q) * DIM;
+                if (probe_boundary_is_tied(b.index, query, nprobe)) {
+                    ++skipped;
+                    continue;
+                }
+                ++compared;
+                IVFPQSearchResult want = reference_search<T>(b.index, b.heap, query, K, nprobe, rerank_m);
+                IVFPQSearchResult got =
+                    ivf_pq_search_graph<T>(b.index, graph, b.heap, query, K, nprobe, NLIST, rerank_m, scratch);
+                if (!t.check(same_within_ties(got, want), "query " + std::to_string(q) + " nprobe " +
+                                                              std::to_string(nprobe) + " rerank_m " +
+                                                              std::to_string(rerank_m) + " differs")) {
+                    return t.done();
+                }
+            }
+        }
+    }
+    t.check(skipped < compared / 20, "too many tied probe boundaries for the comparison to mean anything");
+
+    // nprobe = 1 with the narrowest beam: every result comes from the one
+    // partition the graph returned, which is a real partition.
+    std::vector<uint32_t> part_of(N);
+    for (uint32_t p = 0; p < NLIST; ++p) {
+        for (uint32_t i = b.index.lists.offsets[p]; i < b.index.lists.offsets[p + 1]; ++i) part_of[b.index.lists.ids[i]] = p;
+    }
+    for (uint32_t q = 0; q < NQ; ++q) {
+        IVFPQSearchResult got =
+            ivf_pq_search_graph<T>(b.index, graph, b.heap, queries.data() + size_t(q) * DIM, K, 1, 1, RERANK_M, scratch);
+        bool ok = !got.ids.empty() && std::is_sorted(got.dists.begin(), got.dists.end());
+        for (uint32_t id : got.ids) ok = ok && part_of[id] == part_of[got.ids[0]];
+        if (!t.check(ok, "query " + std::to_string(q) + ": nprobe 1 result is not from a single partition")) break;
+    }
+
+    t.expect_throw("centroid_L < nprobe",
+                   [&] { ivf_pq_search_graph<T>(b.index, graph, b.heap, queries.data(), K, 8, 7, RERANK_M, scratch); });
+    t.expect_throw("null query",
+                   [&] { ivf_pq_search_graph<T>(b.index, graph, b.heap, nullptr, K, 8, 16, RERANK_M, scratch); });
+    t.expect_throw("k = 0",
+                   [&] { ivf_pq_search_graph<T>(b.index, graph, b.heap, queries.data(), 0, 8, 16, RERANK_M, scratch); });
+    IVFCentroidGraph other = graph;
+    other.nlist = NLIST / 2;
+    other.neighbors.resize(size_t(other.nlist) * other.degree);
+    other.entry = 0;
+    t.expect_throw("graph built for another nlist",
+                   [&] { ivf_pq_search_graph<T>(b.index, other, b.heap, queries.data(), K, 8, 16, RERANK_M, scratch); });
+    return t.done();
+}
+
 bool test_guards(const Built& b, const std::vector<float>& queries) {
     TestCase t("argument and index-consistency guards");
     const IVFPQIndex& ix = b.index;
@@ -323,6 +383,8 @@ int main() {
         all_pass &= test_result_size_follows_candidates<float>("f32", *f, queries);
         all_pass &= test_inactive_rid_is_dropped<float>("f32", *f, queries);
         all_pass &= test_inactive_rid_is_dropped<uint8_t>("u8", *u, queries);
+        all_pass &= test_graph_matches_reference<float>("f32", *f, queries);
+        all_pass &= test_graph_matches_reference<uint8_t>("u8", *u, queries);
         all_pass &= test_scratch_follows_index(*f, *u, queries);
         all_pass &= test_guards(*f, queries);
 

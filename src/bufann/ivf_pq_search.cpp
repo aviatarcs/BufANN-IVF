@@ -87,24 +87,18 @@ void centroid_distances(const IVFMetadata& meta, const float* queries_padded, ui
                 meta.centroids.data(), kdim, 1.0f, dist, n);
 }
 
-// Everything after the centroid distances: probe order, PQ table, scan of
-// the probed posting lists, selection, optional exact re-rank.
+// Everything after choosing the partitions in scratch.probe_order: PQ table,
+// scan of the probed posting lists, selection, optional exact re-rank.
 template<typename T>
-IVFPQSearchResult search_from_centroid_dist(const IVFPQIndex& ix, const RawVectorHeap& heap,
-                                            const IVFPQDelta* delta, const float* query,
-                                            const float* centroid_dist, uint32_t k, uint32_t nprobe,
-                                            uint32_t rerank_m, IVFPQSearchScratch& scratch) {
+IVFPQSearchResult search_probes(const IVFPQIndex& ix, const RawVectorHeap& heap, const IVFPQDelta* delta,
+                                const float* query, uint32_t k, uint32_t rerank_m, IVFPQSearchScratch& scratch) {
     const IVFMetadata& meta = ix.meta;
     const PQMetadata& pq = ix.pq;
     const uint32_t dim = meta.dim;
-    size_scratch(scratch, ix);
 
     // Held from the first RID load through the last read_vector, so a slot a
     // concurrent delete frees is not refilled under this query's re-rank.
     RawVectorHeap::ReadGuard guard(heap);
-
-    std::copy_n(centroid_dist, meta.nlist, scratch.centroid_dist.begin());
-    select_smallest(scratch.centroid_dist, std::min(nprobe, meta.nlist), scratch.probe_order);
 
     for (uint32_t c = 0; c < pq.chunks; ++c) {
         for (uint32_t j = 0; j < pq.k; ++j) {
@@ -206,6 +200,18 @@ IVFPQSearchResult search_from_centroid_dist(const IVFPQIndex& ix, const RawVecto
     return result;
 }
 
+// The nprobe partitions nearest by `centroid_dist` ([nlist]), then the rest.
+template<typename T>
+IVFPQSearchResult search_from_centroid_dist(const IVFPQIndex& ix, const RawVectorHeap& heap,
+                                            const IVFPQDelta* delta, const float* query,
+                                            const float* centroid_dist, uint32_t k, uint32_t nprobe,
+                                            uint32_t rerank_m, IVFPQSearchScratch& scratch) {
+    size_scratch(scratch, ix);
+    std::copy_n(centroid_dist, ix.meta.nlist, scratch.centroid_dist.begin());
+    select_smallest(scratch.centroid_dist, std::min(nprobe, ix.meta.nlist), scratch.probe_order);
+    return search_probes<T>(ix, heap, delta, query, k, rerank_m, scratch);
+}
+
 }  // namespace
 
 template<typename T>
@@ -223,6 +229,20 @@ IVFPQSearchResult ivf_pq_search(const IVFPQIndex& ix, const RawVectorHeap& heap,
     mkl_set_num_threads_local(mkl_threads);
     return search_from_centroid_dist<T>(ix, heap, delta, query, scratch.centroid_dist.data(), k, nprobe,
                                         rerank_m, scratch);
+}
+
+template<typename T>
+IVFPQSearchResult ivf_pq_search_graph(const IVFPQIndex& ix, const IVFCentroidGraph& graph, const RawVectorHeap& heap,
+                                      const float* query, uint32_t k, uint32_t nprobe, uint32_t centroid_L,
+                                      uint32_t rerank_m, IVFPQSearchScratch& scratch, const IVFPQDelta* delta) {
+    IVF_PQ_REQUIRE(query != nullptr, "query is null");
+    require_search_args(ix, k, nprobe, rerank_m, heap.layout().elem_size, sizeof(T));
+    size_scratch(scratch, ix);
+    // Throws unless centroid_L >= nprobe (clamped to nlist) and the graph
+    // has the index's nlist.
+    search_ivf_centroid_graph(ix.meta, graph, query, centroid_L, std::min(nprobe, ix.meta.nlist), scratch.graph,
+                              scratch.probe_order);
+    return search_probes<T>(ix, heap, delta, query, k, rerank_m, scratch);
 }
 
 template<typename T>
@@ -271,6 +291,10 @@ IVFPQSearchResult ivf_pq_search(const IVFPQIndex& index, const RawVectorHeap& he
                                                 const IVFPQDelta*);                                        \
     template IVFPQSearchResult ivf_pq_search<T>(const IVFPQIndex&, const RawVectorHeap&, const float*,     \
                                                 uint32_t, uint32_t, uint32_t);                             \
+    template IVFPQSearchResult ivf_pq_search_graph<T>(const IVFPQIndex&, const IVFCentroidGraph&,           \
+                                                      const RawVectorHeap&, const float*, uint32_t, uint32_t, \
+                                                      uint32_t, uint32_t, IVFPQSearchScratch&,             \
+                                                      const IVFPQDelta*);                                  \
     template std::vector<IVFPQSearchResult> ivf_pq_search_batch<T>(const IVFPQIndex&, const RawVectorHeap&, \
                                                                    const float*, size_t, uint32_t, uint32_t, \
                                                                    uint32_t, uint32_t, const IVFPQDelta*);

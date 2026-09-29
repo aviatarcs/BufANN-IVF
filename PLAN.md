@@ -77,7 +77,7 @@ completes it, citing the commit subject.
       against one GEMM per batch). Build peak RSS 4.5 / 3.4 /
       4.2 / 6.2 GB; bench RSS 1.2-1.6 GB at every nlist. Logs:
       `/var/tmp/bufann-ivf-evpeng/nlist/`.)
-- [ ] **Centroid search that scales with nlist.** The per-query centroid
+- [x] **Centroid search that scales with nlist.** The per-query centroid
       GEMV reads nlist x aligned_dim floats: 32 MB at 64K, ~125 GB/s at
       4K q/s. Search a proximity graph over the centroids (the in-repo
       in-memory Vamana; the paper uses HNSW, refines its bottom layer and
@@ -89,6 +89,41 @@ completes it, citing the commit subject.
       measurement, which found the GEMV halves single-query q/s at 65536
       (5180 vs 8866 batched at recall 90), so the target is 65536 and up
       at the batched path's q/s or better.
+      (Done in "Search the IVF centroids through a proximity graph". A
+      Vamana graph of its own (R 32, build L 100, alpha 1.2) rather than
+      the in-repo Index, which builds only from a file, seeds its build
+      from random_device, sets the global OpenMP thread count and
+      allocates hash sets per query. Built after load in 0.47 s at 32768
+      and 1.24 s at 65536; the beam's distances are exact, so it is its
+      own re-rank. SIFT10M 9M, 32 threads, beam 2 x nprobe, single-query
+      q/s against the exact path's single / batched, recall unchanged to
+      0.02 points, probe-set recall >= 0.998:
+
+      | nlist | nprobe | recall | exact single / batched | graph  |
+      |-------|--------|--------|------------------------|--------|
+      | 32768 | 128    | 96.26  | 7163 / 7782            | 10341  |
+      | 32768 | 256    | 98.55  | 4788 / 5271            | 5978   |
+      | 65536 | 64     | 88.91  | 5508 / 9746            | 23285  |
+      | 65536 | 256    | 97.57  | 4196 / 6462            | 8496   |
+      | 65536 | 512    | 99.11  | 3135 / 4374            | 4823   |
+
+      Best at recall >= 95 / 98 / 99 moves from 8424 / 5351 / 3074
+      (32768, batched) to 10341 / 5978 (32768, graph) / 4823 (65536,
+      graph). A 4 x beam costs 8-17% q/s for no recall. PCA not tried:
+      the graph visits a few hundred 128-d centroids, not the cost.
+      Logs: `/var/tmp/bufann-ivf-evpeng/nlist/bench_graph_n*.log`.)
+- [ ] **Graph centroid search in the backend.** The backend and the batched
+      path still use the exact GEMM/GEMV. Build the graph when the backend
+      loads an index (or persist it in the index file if load time
+      matters at 90M+), rebuild it with the centroids, and expose
+      centroid_L (as a multiple of nprobe, default 2) next to nprobe.
+      Test through the public API against the exact path at a full beam.
+- [ ] **nlist sweep with graph search.** With the per-query centroid cost
+      gone, the sweep's optimum may move up: rerun
+      `GRAPH_BEAMS=2 scripts/nlist_sweep.sh` at 9M over nlist 32768,
+      65536 and 131072 (~20 sqrt(N) is 60K) with nprobes between the
+      powers of two, and at 90M; build time (59 min at 65536) is then
+      the cost, so this and the build-time item inform each other.
 - [ ] **Build time at large nlist.** Assignment of 9M to 32K centroids took
       378 s, ~200 GFLOP/s against a ~1.2 TFLOP/s peak; find where it goes
       before changing the algorithm. Then, if still needed, assign through

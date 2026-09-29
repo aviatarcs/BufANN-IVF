@@ -15,6 +15,9 @@
 #       /var/tmp/bufann-ivf-$USER/nlist 4096,16384,32768,65536
 #
 # Each 9M index takes ~1.9 GB of disk. Run scripts/dev_env.sh first.
+# GRAPH_BEAMS=2,4 also runs each nprobe through the centroid graph with
+# beams of 2 and 4 x nprobe (ivf_pq_query_bench --graph_beams), adding a
+# "graph" row per nlist: the best q/s over those beams.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -40,7 +43,7 @@ for n in ${NLISTS//,/ }; do
     fi
     echo "benchmarking nlist $n" >&2
     "$TESTS/ivf_pq_query_bench" --data_type "$TYPE" --index_prefix "$prefix" --query_file "$QUERY" \
-        --gt_file "$GT" --nprobes "$NPROBES" > "$OUT/bench_n$n.log" 2>&1 ||
+        --gt_file "$GT" --nprobes "$NPROBES" ${GRAPH_BEAMS:+--graph_beams "$GRAPH_BEAMS"} > "$OUT/bench_n$n.log" 2>&1 ||
         { echo "ERROR: bench failed, see $OUT/bench_n$n.log" >&2; exit 1; }
 done
 
@@ -50,16 +53,22 @@ out, nlists = sys.argv[1], sys.argv[2:]
 targets = [90.0, 95.0, 98.0, 99.0]
 # "single" is one query per thread (a centroid GEMV each), "batched" the
 # batched centroid GEMM; they differ once the centroids outgrow the cache.
+# "graph" is one query per thread through the centroid graph.
 print(f"{'nlist':>6} {'build_s':>8} {'path':>8}  " + "  ".join(f"{f'qps@{t:g} (nprobe)':>16}" for t in targets))
 for n in nlists:
     rows = [json.loads(l) for l in open(f"{out}/bench_n{n}.log") if l.startswith("{")]
+    exact = [r for r in rows if r.get("centroid_search", "exact") == "exact"]
+    graph = [r for r in rows if r.get("centroid_search") == "graph"]
     build = open(f"{out}/build_n{n}.log").read()
     m = re.search(r"Elapsed \(wall clock\) time \(h:mm:ss or m:ss\): (\S+)", build)
     secs = sum(float(p) * 60 ** i for i, p in enumerate(reversed(m.group(1).split(":")))) if m else float("nan")
-    for path, qps in (("single", "query_qps"), ("batched", "batched_qps")):
+    for path, qps, rs in (("single", "query_qps", exact), ("batched", "batched_qps", exact),
+                          ("graph", "query_qps", graph)):
+        if not rs:
+            continue
         cells = []
         for t in targets:
-            ok = [r for r in rows if r["recall"] >= t]
+            ok = [r for r in rs if r["recall"] >= t]
             best = max(ok, key=lambda r: r[qps]) if ok else None
             cells.append(f"{best[qps]:9.0f} ({best['nprobe']:4d})" if best else f"{'-':>16}")
         print(f"{n:>6} {secs:8.0f} {path:>8}  " + "  ".join(cells))

@@ -2,16 +2,21 @@
 // the shape of the BufANN query workload so the two can be compared: every
 // thread runs whole queries, and throughput, per-query latency and recall@k
 // against a DiskANN truthset are reported per nprobe, plus the batched path.
+// With --graph_beams, each nprobe is also run through a centroid graph
+// (built after load) with a beam of factor x nprobe, reporting in addition
+// the probe-set recall: the share of probed partitions no farther than the
+// exact nprobe-th nearest centroid.
 //
 //   ivf_pq_query_bench --data_type float|int8|uint8 --index_prefix <prefix>
 //                      --query_file <query.bin> --gt_file <truthset.bin>
 //                      [--nprobes 8,16,32,64,128] [--rerank_m 100] [--k 10]
-//                      [--threads N] [--warmup N]
+//                      [--threads N] [--warmup N] [--graph_beams 2,4]
 //
 // The heap is read with pread through the page cache (not O_DIRECT) and has
 // no bounded buffer pool, so after the warmup its touched pages are cached.
 
 #include "bufann/ivf_pq_build.h"
+#include "bufann/ivf_pq_centroid_graph.h"
 #include "bufann/ivf_pq_index_file.h"
 #include "bufann/ivf_pq_search.h"
 #include "utils.h"
@@ -61,6 +66,13 @@ double percentile_us(std::vector<double> v, double p) {
     return v[std::min(v.size() - 1, size_t(p * double(v.size())))] * 1e6;
 }
 
+std::vector<uint32_t> parse_list(const std::string& s) {
+    std::vector<uint32_t> out;
+    std::stringstream ss(s);
+    for (std::string tok; std::getline(ss, tok, ',');) out.push_back(uint32_t(std::stoul(tok)));
+    return out;
+}
+
 template<typename T>
 int run(int argc, char** argv) {
     const std::string prefix = get_arg(argc, argv, "--index_prefix", "");
@@ -69,11 +81,8 @@ int run(int argc, char** argv) {
     const uint32_t k = uint32_t(std::stoul(get_arg(argc, argv, "--k", "10")));
     const uint32_t rerank_m = uint32_t(std::stoul(get_arg(argc, argv, "--rerank_m", "100")));
     const int threads = std::stoi(get_arg(argc, argv, "--threads", std::to_string(omp_get_max_threads())));
-    std::vector<uint32_t> nprobes;
-    {
-        std::stringstream ss(get_arg(argc, argv, "--nprobes", "8,16,32,64,128"));
-        for (std::string tok; std::getline(ss, tok, ',');) nprobes.push_back(uint32_t(std::stoul(tok)));
-    }
+    const std::vector<uint32_t> nprobes = parse_list(get_arg(argc, argv, "--nprobes", "8,16,32,64,128"));
+    const std::vector<uint32_t> graph_beams = parse_list(get_arg(argc, argv, "--graph_beams", ""));
     for (const std::string& f : {ivf_pq_index_path(prefix), query_file, gt_file}) {
         if (!file_exists(f)) throw diskann::ANNException("missing file: " + f, -1);
     }
@@ -112,6 +121,35 @@ int run(int argc, char** argv) {
                 file_mb(ivf_pq_index_path(prefix)), file_mb(ivf_raw_vectors_path(prefix)),
                 file_mb(ivf_pq_codes_path(prefix)));
 
+    omp_set_num_threads(threads);
+    IVFCentroidGraph graph;
+    // exact_nth[q * max_nprobe + j]: distance from query q to its (j+1)-th
+    // nearest centroid, by brute force, for the probe-set recall.
+    std::vector<float> exact_nth;
+    const uint32_t max_nprobe = std::min(ix.meta.nlist, *std::max_element(nprobes.begin(), nprobes.end()));
+    if (!graph_beams.empty()) {
+        t0 = std::chrono::steady_clock::now();
+        graph = build_ivf_centroid_graph(ix.meta);
+        std::printf("centroid graph: degree %u, built in %.2f s\n", graph.degree, seconds_since(t0));
+        exact_nth.resize(nq * max_nprobe);
+#pragma omp parallel
+        {
+            std::vector<float> d(ix.meta.nlist);
+#pragma omp for schedule(dynamic, 16)
+            for (size_t q = 0; q < nq; ++q) {
+                const float* query = queries.data() + q * dim;
+                for (uint32_t c = 0; c < ix.meta.nlist; ++c) {
+                    const float* cen = ix.meta.centroids.data() + size_t(c) * ix.meta.aligned_dim;
+                    float s = 0.0f;
+                    for (size_t j = 0; j < dim; ++j) s += (query[j] - cen[j]) * (query[j] - cen[j]);
+                    d[c] = s;
+                }
+                std::partial_sort(d.begin(), d.begin() + max_nprobe, d.end());
+                std::copy_n(d.begin(), max_nprobe, exact_nth.begin() + q * max_nprobe);
+            }
+        }
+    }
+
     auto recall_of = [&](const std::vector<IVFPQSearchResult>& res) {
         size_t hits = 0;
         for (size_t q = 0; q < nq; ++q) {
@@ -121,7 +159,6 @@ int run(int argc, char** argv) {
         return 100.0 * double(hits) / double(nq * k);
     };
 
-    omp_set_num_threads(threads);
     for (uint32_t nprobe : nprobes) {
         std::vector<IVFPQSearchResult> res(nq);
         std::vector<double> lat(nq);
@@ -150,7 +187,8 @@ int run(int argc, char** argv) {
         std::vector<IVFPQSearchResult> batch = ivf_pq_search_batch<T>(ix, heap, queries.data(), nq, k, nprobe, rerank_m);
         const double batch_wall = seconds_since(t0);
 
-        std::printf("{\"baseline\":\"IVF-PQ\",\"N\":%zu,\"nlist\":%u,\"pq_chunks\":%u,\"nprobe\":%u,\"rerank_m\":%u,"
+        std::printf("{\"baseline\":\"IVF-PQ\",\"centroid_search\":\"exact\",\"N\":%zu,\"nlist\":%u,\"pq_chunks\":%u,"
+                    "\"nprobe\":%u,\"rerank_m\":%u,"
                     "\"query_threads\":%d,\"query_count\":%zu,\"query_qps\":%.1f,\"query_lat_avg_us\":%.1f,"
                     "\"query_lat_p50_us\":%.1f,\"query_lat_p99_us\":%.1f,\"recall\":%.3f,"
                     "\"batched_qps\":%.1f,\"batched_recall\":%.3f,\"rss_mb\":%.0f}\n",
@@ -158,6 +196,60 @@ int run(int argc, char** argv) {
                     avg * 1e6, percentile_us(lat, 0.50), percentile_us(lat, 0.99), recall,
                     double(nq) / batch_wall, recall_of(batch), rss_mb());
         std::fflush(stdout);
+
+        for (uint32_t factor : graph_beams) {
+            const uint32_t probes = std::min(nprobe, ix.meta.nlist);
+            const uint32_t beam = factor * probes;
+            auto concurrent_graph = [&](size_t count) {
+#pragma omp parallel
+                {
+                    IVFPQSearchScratch scratch;
+#pragma omp for schedule(dynamic, 1)
+                    for (size_t q = 0; q < count; ++q) {
+                        auto s = std::chrono::steady_clock::now();
+                        res[q] = ivf_pq_search_graph<T>(ix, graph, heap, queries.data() + q * dim, k, nprobe, beam,
+                                                        rerank_m, scratch);
+                        lat[q] = seconds_since(s);
+                    }
+                }
+            };
+            concurrent_graph(warmup);
+            t0 = std::chrono::steady_clock::now();
+            concurrent_graph(nq);
+            const double graph_wall = seconds_since(t0);
+            double graph_avg = 0;
+            for (double l : lat) graph_avg += l;
+            graph_avg /= double(nq);
+
+            size_t probe_hits = 0;
+#pragma omp parallel reduction(+ : probe_hits)
+            {
+                IVFCentroidGraphScratch gs;
+                std::vector<uint32_t> probed;
+#pragma omp for schedule(dynamic, 16)
+                for (size_t q = 0; q < nq; ++q) {
+                    const float* query = queries.data() + q * dim;
+                    search_ivf_centroid_graph(ix.meta, graph, query, beam, probes, gs, probed);
+                    const float nth = exact_nth[q * max_nprobe + probes - 1];
+                    for (uint32_t c : probed) {
+                        const float* cen = ix.meta.centroids.data() + size_t(c) * ix.meta.aligned_dim;
+                        float s = 0.0f;
+                        for (size_t j = 0; j < dim; ++j) s += (query[j] - cen[j]) * (query[j] - cen[j]);
+                        probe_hits += s <= nth;
+                    }
+                }
+            }
+            std::printf("{\"baseline\":\"IVF-PQ\",\"centroid_search\":\"graph\",\"centroid_L\":%u,\"N\":%zu,"
+                        "\"nlist\":%u,\"pq_chunks\":%u,\"nprobe\":%u,\"rerank_m\":%u,\"query_threads\":%d,"
+                        "\"query_count\":%zu,\"query_qps\":%.1f,\"query_lat_avg_us\":%.1f,"
+                        "\"query_lat_p50_us\":%.1f,\"query_lat_p99_us\":%.1f,\"recall\":%.3f,"
+                        "\"probe_recall\":%.4f,\"rss_mb\":%.0f}\n",
+                        beam, n, ix.meta.nlist, ix.pq.chunks, nprobe, rerank_m, threads, nq,
+                        double(nq) / graph_wall, graph_avg * 1e6, percentile_us(lat, 0.50),
+                        percentile_us(lat, 0.99), recall_of(res), double(probe_hits) / double(nq * probes),
+                        rss_mb());
+            std::fflush(stdout);
+        }
     }
     delete[] gt_ids;
     delete[] gt_dists;
@@ -174,7 +266,7 @@ int main(int argc, char** argv) {
         get_arg(argc, argv, "--gt_file", "").empty()) {
         std::cerr << "Usage: ivf_pq_query_bench --data_type float|int8|uint8 --index_prefix <prefix> "
                      "--query_file <query.bin> --gt_file <truthset.bin> [--nprobes 8,16,32,64,128] "
-                     "[--rerank_m 100] [--k 10] [--threads N] [--warmup N]"
+                     "[--rerank_m 100] [--k 10] [--threads N] [--warmup N] [--graph_beams 2,4]"
                   << std::endl;
         return 2;
     }
