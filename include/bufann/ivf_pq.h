@@ -34,10 +34,15 @@ struct ClusterAssignments {
     std::vector<uint32_t> cluster_id;  // shape: [N]
 };
 
-// PostingLists: partition c is ids[offsets[c] : offsets[c+1]].
+// PostingLists: partition c is ids[offsets[c] : offsets[c+1]]. `codes` holds
+// the PQ code of ids[i] at [i * chunks, (i + 1) * chunks), so a probe scans
+// its partition's codes sequentially; PQMetadata::codes, indexed by id, would
+// cost a cache miss per candidate. Derived from PQMetadata::codes by
+// set_ivf_posting_codes and not persisted.
 struct PostingLists {
     std::vector<uint32_t> offsets;
     std::vector<uint32_t> ids;
+    std::vector<uint8_t>  codes;  // shape: [ids.size(), chunks]
 };
 
 // PQMetadata: product-quantization pivots and per-vector codes

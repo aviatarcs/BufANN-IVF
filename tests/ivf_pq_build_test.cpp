@@ -488,6 +488,35 @@ void patch(const std::string& path, uint64_t offset, T value) {
     f.write(reinterpret_cast<const char*>(&value), sizeof(value));
 }
 
+bool test_posting_codes_follow_lists() {
+    TestCase t("posting-list codes are each listed id's PQ code, in list order");
+    // Ids deliberately out of id order across and within partitions; code
+    // row r is filled with r * 7 + c so each byte names its row and chunk.
+    IVFPQIndex ix;
+    ix.lists.offsets = {0, 3, 3, 6};
+    ix.lists.ids = {4, 0, 5, 2, 1, 3};
+    ix.pq.chunks = 3;
+    ix.pq.codes.resize(6 * 3);
+    for (uint32_t r = 0; r < 6; ++r) {
+        for (uint32_t c = 0; c < 3; ++c) ix.pq.codes[r * 3 + c] = uint8_t(r * 7 + c);
+    }
+    set_ivf_posting_codes(ix);
+    t.check(ix.lists.codes.size() == ix.lists.ids.size() * 3, "posting codes have the wrong size");
+    size_t wrong = 0;
+    for (size_t i = 0; i < ix.lists.ids.size() && ix.lists.codes.size() == 18; ++i) {
+        for (uint32_t c = 0; c < 3; ++c) wrong += ix.lists.codes[i * 3 + c] != uint8_t(ix.lists.ids[i] * 7 + c);
+    }
+    t.check(wrong == 0, std::to_string(wrong) + " posting-code bytes are not their listed id's code");
+
+    IVFPQIndex no_row = ix;
+    no_row.lists.ids[4] = 6;  // one past the last code row
+    t.expect_throw("listed id with no PQ code row", [&] { set_ivf_posting_codes(no_row); });
+    IVFPQIndex no_chunks = ix;
+    no_chunks.pq.chunks = 0;
+    t.expect_throw("zero PQ chunks", [&] { set_ivf_posting_codes(no_chunks); });
+    return t.done();
+}
+
 bool test_index_file(const std::string& prefix, const std::string& base_bin, const std::vector<float>& data,
                      const IVFMetadata& meta) {
     TestCase t("combined index file round-trips, reopens the heap, replaces atomically, and rejects corruption");
@@ -529,6 +558,22 @@ bool test_index_file(const std::string& prefix, const std::string& base_bin, con
                 loaded.heap_layout.slots_per_page == ix.heap_layout.slots_per_page &&
                 loaded.heap_pages == ix.heap_pages && loaded.heap_next_slot == ix.heap_next_slot,
             "loaded index differs from what was written");
+
+    // The loader lays the codes out by posting list; checked against the
+    // codes file as upstream wrote it, row = vector id.
+    {
+        uint8_t* file_codes = nullptr;
+        size_t rows = 0, chunks = 0;
+        diskann::load_bin<uint8_t>(ivf_pq_codes_path(pre), file_codes, rows, chunks);
+        size_t wrong = loaded.lists.codes.size() == rows * chunks ? 0 : 1;
+        for (size_t i = 0; wrong == 0 && i < loaded.lists.ids.size(); ++i) {
+            wrong += !std::equal(file_codes + size_t(loaded.lists.ids[i]) * chunks,
+                                 file_codes + size_t(loaded.lists.ids[i] + 1) * chunks,
+                                 loaded.lists.codes.begin() + i * chunks);
+        }
+        delete[] file_codes;
+        t.check(wrong == 0, "loaded posting-list codes are not the codes file's rows in list order");
+    }
 
     // What the loaded header says about the heap is enough to reopen it, and
     // every RID then reads back the base vector it was assigned for.
@@ -615,6 +660,7 @@ int main() {
         all_pass &= test_assign_clusters_and_load_heap<float>("float", prefix, base_f32, data_f32, meta);
         all_pass &= test_assignment_error_paths(prefix, base_f32, meta);
         all_pass &= test_posting_lists_invert_assignments(prefix);
+        all_pass &= test_posting_codes_follow_lists();
         all_pass &= test_pq_pivots_and_codes<float>("float", prefix, base_f32, data_f32, 4);
         all_pass &= test_pq_error_paths(prefix, base_f32);
         all_pass &= test_index_file(prefix, base_f32, data_f32, meta);

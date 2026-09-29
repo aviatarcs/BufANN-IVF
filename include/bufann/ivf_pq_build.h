@@ -78,7 +78,11 @@ RawVectorRIDTable load_ivf_rid_table(const std::string& index_prefix);
 // ID; clusters with no members are empty ranges. Throws on cluster_id >= nlist.
 PostingLists build_ivf_posting_lists(const ClusterAssignments& assignments, uint32_t nlist);
 
-// [nlist+1 x 1] and [N x 1] uint32 bins.
+// Fills index.lists.codes from index.pq.codes in posting-list order. Throws
+// unless pq.codes has a row for every id in the lists.
+void set_ivf_posting_codes(IVFPQIndex& index);
+
+// [nlist+1 x 1] and [N x 1] uint32 bins; `codes` is not saved.
 void save_ivf_posting_lists(const std::string& index_prefix, const PostingLists& lists);
 PostingLists load_ivf_posting_lists(const std::string& index_prefix);
 

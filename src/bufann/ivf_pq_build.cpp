@@ -1,6 +1,7 @@
 #include "bufann/ivf_pq_build.h"
 
 #include <algorithm>
+#include <cstring>
 #include <limits>
 #include <memory>
 #include <numeric>
@@ -280,6 +281,24 @@ PostingLists build_ivf_posting_lists(const ClusterAssignments& assignments, uint
         lists.ids[next_free[cluster_id[i]]++] = uint32_t(i);
     }
     return lists;
+}
+
+void set_ivf_posting_codes(IVFPQIndex& index) {
+    const PostingLists& lists = index.lists;
+    const PQMetadata& pq = index.pq;
+    const size_t chunks = pq.chunks;
+    IVF_PQ_REQUIRE(chunks > 0 && pq.codes.size() % chunks == 0, "PQ codes are not whole rows of pq.chunks bytes");
+    const size_t rows = pq.codes.size() / chunks;
+    for (uint32_t id : lists.ids) {
+        IVF_PQ_REQUIRE(id < rows, "posting-list id " + std::to_string(id) + " has no PQ code (" +
+                                      std::to_string(rows) + " rows)");
+    }
+    std::vector<uint8_t> codes(lists.ids.size() * chunks);
+#pragma omp parallel for schedule(static, 65536)
+    for (int64_t i = 0; i < int64_t(lists.ids.size()); ++i) {
+        std::memcpy(codes.data() + size_t(i) * chunks, pq.codes.data() + size_t(lists.ids[i]) * chunks, chunks);
+    }
+    index.lists.codes = std::move(codes);
 }
 
 void save_ivf_posting_lists(const std::string& index_prefix, const PostingLists& lists) {

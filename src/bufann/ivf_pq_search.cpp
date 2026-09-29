@@ -52,6 +52,8 @@ void require_consistent(const IVFPQIndex& ix) {
     IVF_PQ_REQUIRE(ix.lists.offsets.size() == size_t(ix.meta.nlist) + 1 && ix.lists.offsets.front() == 0 &&
                        ix.lists.ids.size() == n_base,
                    "PostingLists are inconsistent with the index");
+    IVF_PQ_REQUIRE(ix.lists.codes.size() == n_base * ix.pq.chunks,
+                   "PostingLists codes do not cover the lists (see set_ivf_posting_codes)");
 }
 
 void size_scratch(IVFPQSearchScratch& s, const IVFPQIndex& index) {
@@ -122,8 +124,7 @@ IVFPQSearchResult search_from_centroid_dist(const IVFPQIndex& ix, const RawVecto
     scratch.pq_dist.clear();
     for (uint32_t part : scratch.probe_order) {
         for (uint32_t i = ix.lists.offsets[part]; i < ix.lists.offsets[part + 1]; ++i) {
-            const uint32_t id = ix.lists.ids[i];
-            add_candidate(id, pq.codes.data() + size_t(id) * pq.chunks);
+            add_candidate(ix.lists.ids[i], ix.lists.codes.data() + size_t(i) * pq.chunks);
         }
     }
 
