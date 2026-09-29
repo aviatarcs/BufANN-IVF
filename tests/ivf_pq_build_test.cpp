@@ -488,6 +488,65 @@ void patch(const std::string& path, uint64_t offset, T value) {
     f.write(reinterpret_cast<const char*>(&value), sizeof(value));
 }
 
+bool test_closest_centers_blocking() {
+    TestCase t("k-means nearest-centre blocks keep the distance matrix bounded and still find the nearest centres");
+    const size_t GB = size_t(1) << 30;
+    t.check(math_utils::closest_centers_block_rows(1 << 20, 16384, GB) == 16384,
+            "1M points x 16384 centres should take 16384-row blocks under 1 GiB");
+    t.check(math_utils::closest_centers_block_rows(10, 256, GB) == 10, "a small input should be one block");
+    t.check(math_utils::closest_centers_block_rows(size_t(1) << 30, 1, GB) == size_t(1) << 23,
+            "rows should stay capped at 2^23");
+    t.check(math_utils::closest_centers_block_rows(100, 1000, 1) == 1, "a tiny budget should still give one row");
+    t.check(math_utils::closest_centers_block_rows(0, 16, GB) == 1, "zero points should give one row, not zero");
+
+    // 1000 points in 7-row blocks (the last one 6 rows), checked against
+    // exact distances. Nearest-centre ties resolve within a few ulps of the
+    // norms in ||x||^2 + ||c||^2 - 2x.c.
+    const size_t n = 1000, dim = 8, nc = 37, rows = 7;
+    std::mt19937 gen(11);
+    std::uniform_real_distribution<float> u(-10.0f, 10.0f);
+    std::vector<float> x(n * dim), c(nc * dim);
+    for (float& v : x) v = u(gen);
+    for (float& v : c) v = u(gen);
+    for (size_t k : {size_t(1), size_t(3)}) {
+        std::vector<uint32_t> got(n * k);
+        std::vector<std::vector<size_t>> inverted(nc);
+        math_utils::compute_closest_centers(x.data(), n, dim, c.data(), nc, k, got.data(), inverted.data(), nullptr,
+                                            rows * nc * sizeof(float));
+        size_t wrong = 0, listed = 0;
+        for (size_t i = 0; i < n; ++i) {
+            std::vector<float> d(nc);
+            float scale = l2sq(x.data() + i * dim, dim);
+            for (size_t j = 0; j < nc; ++j) {
+                d[j] = sq_dist(x.data() + i * dim, c.data() + j * dim, dim);
+                scale = std::max(scale, l2sq(c.data() + j * dim, dim));
+            }
+            std::vector<float> sorted = d;
+            std::sort(sorted.begin(), sorted.end());
+            const float tol = 16 * std::numeric_limits<float>::epsilon() * 2 * scale;
+            std::vector<uint32_t> mine(got.begin() + i * k, got.begin() + (i + 1) * k);
+            for (size_t r = 0; r < k; ++r) {
+                std::vector<float> chosen;
+                for (uint32_t j : mine) chosen.push_back(d[j]);
+                std::sort(chosen.begin(), chosen.end());
+                wrong += chosen[r] > sorted[r] + tol;
+            }
+            std::sort(mine.begin(), mine.end());
+            wrong += std::adjacent_find(mine.begin(), mine.end()) != mine.end();
+            for (uint32_t j : mine) {
+                listed += std::binary_search(inverted[j].begin(), inverted[j].end(), i);
+            }
+        }
+        size_t total = 0;
+        for (const auto& l : inverted) total += l.size();
+        t.check(wrong == 0, "k=" + std::to_string(k) + ": " + std::to_string(wrong) +
+                                " points did not get their nearest centres across blocks");
+        t.check(listed == n * k && total == n * k,
+                "k=" + std::to_string(k) + ": inverted index does not list each point under its centres");
+    }
+    return t.done();
+}
+
 bool test_posting_codes_follow_lists() {
     TestCase t("posting-list codes are each listed id's PQ code, in list order");
     // Ids deliberately out of id order across and within partitions; code
@@ -661,6 +720,7 @@ int main() {
         all_pass &= test_assignment_error_paths(prefix, base_f32, meta);
         all_pass &= test_posting_lists_invert_assignments(prefix);
         all_pass &= test_posting_codes_follow_lists();
+        all_pass &= test_closest_centers_blocking();
         all_pass &= test_pq_pivots_and_codes<float>("float", prefix, base_f32, data_f32, 4);
         all_pass &= test_pq_error_paths(prefix, base_f32);
         all_pass &= test_index_file(prefix, base_f32, data_f32, meta);
