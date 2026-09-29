@@ -49,7 +49,7 @@ completes it, citing the commit subject.
       freeing the slot through it. Search drops tombstoned ids. (Add IVF-PQ
       delete; tombstoned base ids are dropped before selection and freed
       slots go through the grace period)
-- [ ] **Measure QPS-recall against nlist.** LindormVector (SIGMOD Companion
+- [x] **Measure QPS-recall against nlist.** LindormVector (SIGMOD Companion
       '26) finds the best nlist at 100M near 200K (~20 sqrt(N)); we use
       ~1.4 sqrt(N) at 9M (4096) and ~1.7 sqrt(N) at 90M (16384), and at
       9M / nprobe 64 a query scans ~140K codes while its centroid GEMM reads
@@ -60,6 +60,23 @@ completes it, citing the commit subject.
       and record QPS at recall 95/98/99, build time and RSS. Add the sweep
       as a script so it can be rerun. The items below that depend on this
       one are only worth doing if a larger nlist wins.
+      (Done in "Add the nlist sweep script and record the SIFT10M 9M
+      sweep". A larger nlist wins. Best q/s, single-query / batched
+      centroid search, 32 threads:
+
+      | nlist | build  | recall >= 95   | >= 98          | >= 99          |
+      |-------|--------|----------------|----------------|----------------|
+      | 4096  | 85 s   | 3909 / 3648    | 2106 / 1929    | 2106 / 1929    |
+      | 16384 | 310 s  | 5797 / 5990    | 3400 / 3415    | 3400 / 3415    |
+      | 32768 | 976 s  | 7256 / 8424    | 4828 / 5351    | 2934 / 3074    |
+      | 65536 | 3562 s | 4260 / 6442    | 3176 / 4378    | 3176 / 4378    |
+
+      32768 gives 2.3x (batched 2.8x) the q/s of 4096 at recall 98. At
+      65536 the single-query path has half the batched one's q/s; the two
+      differ only in the centroid search (a GEMV per query, 32 MB read,
+      against one GEMM per batch). Build peak RSS 4.5 / 3.4 /
+      4.2 / 6.2 GB; bench RSS 1.2-1.6 GB at every nlist. Logs:
+      `/var/tmp/bufann-ivf-evpeng/nlist/`.)
 - [ ] **Centroid search that scales with nlist.** The per-query centroid
       GEMV reads nlist x aligned_dim floats: 32 MB at 64K, ~125 GB/s at
       4K q/s. Search a proximity graph over the centroids (the in-repo
@@ -69,7 +86,9 @@ completes it, citing the commit subject.
       report probe-set recall and end-to-end QPS-recall. The paper's PCA
       compression of centroids during traversal pays at 768-1024 dims, not
       obviously at 128; measure before adding it. Depends on the nlist
-      measurement.
+      measurement, which found the GEMV halves single-query q/s at 65536
+      (5180 vs 8866 batched at recall 90), so the target is 65536 and up
+      at the batched path's q/s or better.
 - [ ] **Build time at large nlist.** Assignment of 9M to 32K centroids took
       378 s, ~200 GFLOP/s against a ~1.2 TFLOP/s peak; find where it goes
       before changing the algorithm. Then, if still needed, assign through
@@ -77,7 +96,9 @@ completes it, citing the commit subject.
       point from its previous centroid; the paper reports 5-10x with the
       same MSE. Oracle: brute-force assignment within the
       compute_closest_centers tolerance, and k-means MSE against the exact
-      run. Depends on the nlist measurement.
+      run. Depends on the nlist measurement: whole builds at 9M took 85,
+      310, 976 and 3562 s at nlist 4096 to 65536, ~3.4x per doubling of
+      nlist (the training sample grows with nlist, and so does each pass).
 - [ ] **nlist cost model.** For 90M+, where one build takes 41 min: sample
       m vectors, cluster them at each candidate nlist, take ~100 sample
       queries with exact neighbours within the sample, estimate nprobe as
@@ -91,8 +112,8 @@ completes it, citing the commit subject.
       32 x 8-bit for SIFT, and their tables fit SIMD registers (PQFastScan,
       blocks of 32 codes). Prototype the kernel on the SIFT10M codes against
       the scalar scan as oracle, then compare QPS-recall end to end. Small
-      lists (large nlist) leave partial blocks; measure with the nlist
-      chosen above if that has landed.
+      lists (large nlist) leave partial blocks; measure at nlist 32768
+      (~275 codes per list at 9M), the sweep's best.
 - [ ] **Re-rank reads under a cold heap.** The bench reads the heap through
       a warm page cache, while BufANN's numbers pay ~75 buffer-pool misses
       per query; the re-rank's up to rerank_m (100) random reads are our
