@@ -93,6 +93,7 @@ int run(int argc, char** argv) {
     if (gt_tags != nullptr && !std::equal(gt_ids, gt_ids + gt_rows * gt_k, gt_tags)) {
         throw diskann::ANNException("truthset tags differ from its ids; this index is searched by row id", -1);
     }
+    if (nq == 0) throw diskann::ANNException("query file holds no queries: " + query_file, -1);
     if (gt_rows < nq || gt_k < k) throw diskann::ANNException("truthset smaller than queries x k", -1);
     const size_t warmup = std::min(nq, size_t(std::stoul(get_arg(argc, argv, "--warmup", "1000"))));
 
@@ -101,6 +102,10 @@ int run(int argc, char** argv) {
     RawVectorHeap heap;
     heap.open_existing(ivf_raw_vectors_path(prefix), ix.heap_layout, ix.heap_next_slot, ix.heap_pages);
     const size_t n = ix.assignments.cluster_id.size();
+    if (dim != ix.meta.dim) {
+        throw diskann::ANNException("query dim " + std::to_string(dim) + " != index dim " +
+                                        std::to_string(ix.meta.dim), -1);
+    }
     std::printf("loaded %s: N %zu, nlist %u, %u PQ chunks in %.1f s; RSS %.0f MB; index file %.0f MB, "
                 "heap %.0f MB, PQ codes %.0f MB\n",
                 prefix.c_str(), n, ix.meta.nlist, ix.pq.chunks, seconds_since(t0), rss_mb(),
@@ -179,6 +184,9 @@ int main(int argc, char** argv) {
         if (data_type == "int8") return run<int8_t>(argc, argv);
         std::cerr << "ERROR: --data_type must be float, int8 or uint8" << std::endl;
         return 2;
+    } catch (const diskann::ANNException& e) {  // not a std::exception
+        std::cerr << "ERROR: " << e.message() << std::endl;
+        return 1;
     } catch (const std::exception& e) {
         std::cerr << "ERROR: " << e.what() << std::endl;
         return 1;
