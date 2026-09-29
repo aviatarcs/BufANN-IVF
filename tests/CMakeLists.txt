@@ -88,6 +88,10 @@ target_link_libraries(ivf_pq_build_index ${PROJECT_NAME} aio -ltcmalloc)
 add_executable(ivf_pq_mutation_bench ivf_pq_mutation_bench.cpp)
 target_link_libraries(ivf_pq_mutation_bench ${PROJECT_NAME} aio -ltcmalloc)
 
+# Query throughput, latency and recall of a persisted index, BufANN-query style.
+add_executable(ivf_pq_query_bench ivf_pq_query_bench.cpp)
+target_link_libraries(ivf_pq_query_bench ${PROJECT_NAME} aio -ltcmalloc)
+
 # IVF-PQ through the public BufANN API.
 add_executable(ivf_pq_api_test ivf_pq_api_test.cpp)
 target_link_libraries(ivf_pq_api_test ${PROJECT_NAME} aio -ltcmalloc)
