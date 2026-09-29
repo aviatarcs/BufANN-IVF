@@ -57,11 +57,14 @@ each of these steps.
    **Snapshotting takes the node offline for several minutes and kills
    everything running on it**, including tmux sessions and other Claude
    sessions. Do it only when the human says the node is free.
-2. **Dataset `bufann-ivf-data`.** It holds about 15 GB, laid out as:
+2. **Dataset `bufann-ivf-data`.** It holds about 145 GB, laid out as:
 
    ```
    SHA256SUMS                         sha256sum of every file, relative paths
-   sift10m/base.9M.bin                first 9M rows of /tmpdata/sift10m/base.10M.bin
+   bigann/base.1B.u8bin               SIFT1B, 128 GB
+   bigann/query.public.10K.u8bin
+   bigann/GT.public.1B.ibin           top-100 ground truth for the full 1B
+   sift10m/base.9M.bin                derived subsets, with their ground truth
    sift10m/query.10K.bin
    sift10m/sift10m_9000000_gt10.bin
    sift100m/base.90M.bin
@@ -69,7 +72,17 @@ each of these steps.
    sift100m/sift100m_90000000_gt100.bin
    ```
 
-   The files currently live on `evpeng-bufann`:
+   The `bigann/` files come from
+   `https://dl.fbaipublicfiles.com/billion-scale-ann-benchmarks/bigann/`
+   (about 35 minutes at the ~62 MB/s seen before). Download them directly
+   onto the staging node. The subsets are built from the first N rows of
+   SIFT1B, shuffled by `numpy.random.default_rng(0).permutation(N)`:
+   `sift10m` uses N = 10M and keeps the first 9M rows, and `sift100m` uses
+   N = 100M and keeps the first 90M. `query.10K.bin` is the same as
+   `query.public.10K.u8bin`.
+
+   Copy the subsets and their ground truth from `evpeng-bufann` rather than
+   rebuilding them, because the ground-truth tool is not in the repo:
 
    - `sift10m/base.9M.bin` is at `/tmpdata/ivf_bench/sift10m/base.9M.bin`.
    - `sift10m/query.10K.bin` is at `/tmpdata/sift10m/query.10K.bin`.
@@ -77,30 +90,38 @@ each of these steps.
      `/tmpdata/BufANN-CS395T/eval_tempfiles/sift10m/DiskANN/query/groundtruth/sift10m_9000000_gt10.bin`.
    - The three `sift100m/` files are in `/tmpdata/sift100m/`.
 
+   A new subset (another N, or a parameter the ground truth depends on)
+   needs its own ground truth, computed once and added to the dataset,
+   never computed on a bench node during a run.
+
    Choose one of these two dataset kinds:
 
-   - **Image-backed (preferred).** CloudLab copies it onto each node's local
-     disk when the experiment starts, so benchmarks never touch the network,
-     and any number of experiments can use it at once.
-   - **Long-term remote.** A remote dataset mounted read-only can be used by
-     several experiments at once. `cloudlab_node_prep.sh` copies it to local
-     disk before building.
+   - **Image-backed (preferred).** CloudLab loads it onto each node's local
+     NVMe when the experiment starts, so benchmarks never touch the network,
+     and any number of experiments can use it at once. The prep script
+     links to it in place.
+   - **Long-term remote.** A remote dataset (iSCSI) mounted read-only can be
+     used by several experiments at once. `cloudlab_node_prep.sh` copies it
+     to local disk before building, which takes about 145 GB of scratch and
+     some time at 1B scale.
 
    Either way, you fill it once, in a single-node experiment `ivfb-stage`
-   that has scratch space. The development node's `/tmpdata` is 97% full, so
-   do not stage there. Copy the files in through your own machine with
-   `scp -3 <dev>:<path> <stage>:<path>`, since the nodes hold no keys for
-   each other. Then run `sha256sum` to write `SHA256SUMS`, check it against
-   the same checksums computed on the development node, and create the
-   dataset from that blockstore. CloudLab's "Datasets" documentation has the
-   exact portal steps. Terminate `ivfb-stage` when you are done.
+   with at least 300 GB of scratch. Do not stage on the development node:
+   its `/tmpdata` is 97% full. Copy the subsets in through your own machine
+   with `scp -3 <dev>:<path> <stage>:<path>`, since the nodes hold no keys
+   for each other. Then run `sha256sum` to write `SHA256SUMS`, check the
+   subsets' sums against the same files on the development node, and create
+   the dataset from that blockstore. CloudLab's "Datasets" documentation has
+   the exact portal steps. Terminate `ivfb-stage` when you are done.
 3. **Profile `bufann-ivf-bench`.** Create it in the portal from the contents
    of `cloudlab/profile.py`. Its parameters are:
    - `image`: the image URN.
    - `hwtype`: `sm110p`.
    - `dataset`: the dataset URN.
    - `dataset_kind`: `image` or `remote`.
-   - `scratch_gb`: 400 GB, enough for a 90M index.
+   - `scratch_gb`: 3000 GB by default (see Sizing). The scratch volume and
+     an image-backed dataset go on the NVMe drives, never the SATA system
+     disk, so that I/O timings do not depend on where LVM placed a file.
 
    The profile has not been instantiated yet. If the portal rejects it, fix
    `profile.py` in a commit.
@@ -113,14 +134,39 @@ Before starting anything, write the batch into the ledger, one line per run:
 - **Git ref**: a branch or commit of `aviatarcs/BufANN-IVF`. The query
   bench and `nlist_sweep.sh` are on `agent/work`, not `main`.
 - **Command**, run from `/tmpdata/BufANN-IVF`. Dataset files are under
-  `/tmpdata/data`: the prep script copies `/dataset` there, because under
-  this profile `/dataset` is always a separate volume. Results go to
-  `/tmpdata/results`. For example:
+  `/tmpdata/data`, which the prep script makes a link to `/dataset` (or a
+  copy of it, for a remote dataset). Results go to `/tmpdata/results`. For
+  example:
 
   ```
   scripts/nlist_sweep.sh uint8 /tmpdata/data/sift10m/base.9M.bin /tmpdata/data/sift10m/query.10K.bin \
       /tmpdata/data/sift10m/sift10m_9000000_gt10.bin /tmpdata/results 32768
   ```
+
+### Sizing
+
+On the 9M index, each vector took about 42 B in the index file, 130 B in
+the raw-vector heap and 32 B in PQ codes (32 chunks). An `sm110p` has 125 GB
+of RAM and 4 x 894 GB of NVMe. Per index:
+
+| N    | Base   | Index files | Search RSS, approx.        |
+|------|--------|-------------|----------------------------|
+| 9M   | 1.2 GB | ~1.9 GB     | 0.7 GB                     |
+| 90M  | 12 GB  | ~19 GB      | 6.9 GB                     |
+| 1B   | 128 GB | ~205 GB     | ~77 GB + heap page cache   |
+
+- **Disk.** Check that a sweep's indexes, plus the dataset, plus ~20% fit
+  in `scratch_gb` before starting it. A sweep that keeps four 1B indexes
+  needs about 1 TB.
+- **RAM is the limit at 1B.** The search keeps two in-memory copies of the
+  PQ codes (see "One in-memory copy of the PQ codes" in `PLAN.md`), about
+  64 GB at 1B. The heap's page cache and the build's working set compete
+  for the remainder. Before the first 1B run, do a single build and query
+  at 1B and read its peak RSS from `/usr/bin/time -v`. If it does not fit,
+  report that to the human; do not switch to a larger node type on your
+  own, since that changes what is being compared.
+
+### Comparisons
 
 For comparisons, use one run per configuration and include the baseline
 configuration as a run of its own. Nodes of the same type still differ by a
@@ -198,5 +244,8 @@ difference. Report the spread across nodes, not only the means.
   it along with the tail of `run.log`.
 - **`node not idle`**: something else is using the node. `run.log` lists the
   top processes. Find out what is running before rerunning.
-- **Disk full**: raise `scratch_gb`. A 90M index takes about 20 GB, and a
-  data copy from a remote dataset takes another 15 GB.
+- **Disk full**: see Sizing, and raise `scratch_gb` (the NVMe drives hold
+  about 3.5 TB in total). A copy of a remote dataset takes about 145 GB.
+- **`exists and is not a link to the local dataset`**: `/tmpdata/data` is
+  left over from a remote-dataset run on the same node. Remove it and
+  rerun the prep.

@@ -19,8 +19,8 @@ pc.defineParameter("dataset_kind", "Dataset kind",
                    portal.ParameterType.STRING, "image",
                    [("image", "image-backed (loaded onto local disk)"),
                     ("remote", "long-term remote (iSCSI)")])
-pc.defineParameter("scratch_gb", "Local scratch at /tmpdata (GB)",
-                   portal.ParameterType.INTEGER, 400)
+pc.defineParameter("scratch_gb", "Local scratch at /tmpdata (GB), on the NVMe drives",
+                   portal.ParameterType.INTEGER, 3000)
 params = pc.bindParameters()
 if not params.image:
     pc.reportError(portal.ParameterError("set the bench image URN", ["image"]))
@@ -33,12 +33,16 @@ node = request.RawPC("node")
 node.hardware_type = params.hwtype
 node.disk_image = params.image
 
+# Off the system disk: on sm110p that is a SATA SSD, and a volume spanning
+# it and the NVMe drives makes I/O timings depend on extent placement.
 scratch = node.Blockstore("scratch", "/tmpdata")
 scratch.size = "%dGB" % params.scratch_gb
+scratch.placement = "nonsysvol"
 
 if params.dataset_kind == "image":
     data = node.Blockstore("dataset", "/dataset")
     data.dataset = params.dataset
+    data.placement = "nonsysvol"
 else:
     iface = node.addInterface("if-dataset")
     remote = request.RemoteBlockstore("dsnode", "/dataset")

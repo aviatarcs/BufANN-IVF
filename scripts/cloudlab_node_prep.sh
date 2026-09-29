@@ -8,10 +8,10 @@
 #
 #   scripts/cloudlab_node_prep.sh <dataset_dir> <ref>
 #
-# <dataset_dir> holds sift10m/, sift100m/ and SHA256SUMS (the layout is in
-# docs/cloudlab_bench.md). If it is on another filesystem than BENCH_ROOT
-# (a remote dataset), it is copied to $BENCH_ROOT/data first, so benchmarks
-# never read over the network. Safe to rerun.
+# <dataset_dir> holds the files listed in its SHA256SUMS (the layout is in
+# docs/cloudlab_bench.md). Benchmarks read it as $BENCH_ROOT/data: a copy if
+# it is network-backed (a remote dataset), so benchmarks never read over the
+# network, otherwise a link. Safe to rerun.
 #
 # Environment: BENCH_ROOT (default /tmpdata, the profile's local scratch),
 # EXPECT_NODETYPE (default sm110p), IDLE_LOAD (default 1.0),
@@ -52,13 +52,20 @@ commit=$(git -C "$SRC" rev-parse HEAD)
 
 step "datasets"
 [[ -f $DATASET/SHA256SUMS ]] || die "no SHA256SUMS in $DATASET"
-if [[ $(stat -c %d "$DATASET") != $(stat -c %d "$ROOT") ]]; then
-    step "copying $DATASET to $ROOT/data (another filesystem)"
-    mkdir -p "$ROOT/data"
-    rsync -a "$DATASET/" "$ROOT/data/"
-    DATA=$ROOT/data
+# $ROOT/data is where benchmarks read: a copy of a network-backed dataset
+# (remote datasets are iSCSI), otherwise a link to the local one, which at
+# 1B scale is too large to copy for nothing.
+DATA=$ROOT/data
+case $(findmnt -n -o FSTYPE -T "$DATASET") in nfs*|cifs|fuse*) network=1 ;; *) network= ;; esac
+lsblk -s -n -o TRAN "$(findmnt -n -o SOURCE -T "$DATASET")" 2>/dev/null | grep -q iscsi && network=1
+if [[ $network ]]; then
+    step "copying $DATASET to $DATA (network-backed)"
+    [[ -L $DATA ]] && rm "$DATA"
+    mkdir -p "$DATA"
+    rsync -a "$DATASET/" "$DATA/"
 else
-    DATA=$DATASET
+    [[ -e $DATA && ! -L $DATA ]] && die "$DATA exists and is not a link to the local dataset"
+    ln -sfn "$DATASET" "$DATA"
 fi
 (cd "$DATA" && sha256sum --quiet -c SHA256SUMS) || die "checksum mismatch in $DATA"
 
