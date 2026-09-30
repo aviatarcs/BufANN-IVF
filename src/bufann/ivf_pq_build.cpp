@@ -218,23 +218,25 @@ IVFMetadata train_ivf_centroids(const std::string& data_bin, uint32_t nlist,
         return std::chrono::duration<double>(std::chrono::steady_clock::now() - t).count();
     };
     auto t0 = std::chrono::steady_clock::now();
-    if (num_train <= kmeans::KMEANSPP_MAX_POINTS) {
-        kmeans::kmeanspp_selecting_pivots(train_data.data(), num_train, dim, centers.data(), nlist,
-                                          rng_seed);
+    // k-means++ reads its whole input once per centre picked, so seed from
+    // every stride-th row of the sample (it is in file order, so a prefix
+    // would not span the data), capped at what k-means++ supports; Lloyd's
+    // then runs on all of it.
+    const size_t seed_cap = std::min(kmeans::KMEANSPP_MAX_POINTS,
+                                     std::max(IVF_KMEANSPP_MIN_POINTS, size_t(nlist) * IVF_KMEANSPP_POINTS_PER_CENTROID));
+    const size_t stride = (num_train + seed_cap - 1) / seed_cap;
+    const size_t seed_rows = (num_train + stride - 1) / stride;
+    if (stride == 1) {
+        kmeans::kmeanspp_selecting_pivots(train_data.data(), num_train, dim, centers.data(), nlist, rng_seed);
     } else {
-        // At nlist >= 2^23 / IVF_TRAIN_POINTS_PER_CENTROID (131072) the sample
-        // outgrows k-means++, which would fall back to random pivots. Seed
-        // from every stride-th row instead, so the seeds span the whole
-        // sample (it is in file order); Lloyd's still runs on all of it.
-        const size_t stride = (num_train + kmeans::KMEANSPP_MAX_POINTS - 1) / kmeans::KMEANSPP_MAX_POINTS;
-        const size_t seed_rows = (num_train + stride - 1) / stride;
         std::vector<float> seed_data(seed_rows * dim);
         for (size_t r = 0; r < seed_rows; ++r) {
             std::copy_n(train_data.begin() + r * stride * dim, dim, seed_data.begin() + r * dim);
         }
         kmeans::kmeanspp_selecting_pivots(seed_data.data(), seed_rows, dim, centers.data(), nlist, rng_seed);
     }
-    diskann::cout << "k-means++ seeding took " << seconds_since(t0) << " s" << std::endl;
+    diskann::cout << "k-means++ seeding from " << seed_rows << " of the sampled points took " << seconds_since(t0)
+                  << " s" << std::endl;
     t0 = std::chrono::steady_clock::now();
     const bool graph = nlist >= IVF_ASSIGN_GRAPH_MIN_NLIST;
     const float residual =

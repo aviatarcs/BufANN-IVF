@@ -167,6 +167,40 @@ bool test_same_seed_reproduces_centroids(const std::string& base_bin, const IVFM
     return t.done();
 }
 
+// 80000 training points exceed IVF_KMEANSPP_MIN_POINTS, so k-means++ seeds
+// from every other row (the last one included) and Lloyd's refines on all
+// of them; every blob must still get its own centroid near its centre.
+bool test_training_seeds_from_a_strided_subset(const std::string& prefix) {
+    TestCase t("training on a sample larger than the k-means++ seeding cap recovers every blob");
+    const uint32_t blobs = 16, per_blob = 5001, dim = 8;  // 80016: the stride leaves a partial tail
+    const float spacing = 50.0f;
+    std::mt19937 gen(8);
+    std::normal_distribution<float> noise(0.0f, 1.0f);
+    std::vector<float> data;
+    for (uint32_t b = 0; b < blobs; ++b) {
+        for (uint32_t i = 0; i < per_blob; ++i) {
+            for (uint32_t d = 0; d < dim; ++d) data.push_back(float(b) * spacing + noise(gen));
+        }
+    }
+    const std::string bin = prefix + "_strided_seed.bin";
+    diskann::save_bin<float>(bin, data.data(), size_t(blobs) * per_blob, dim);
+    IVFMetadata meta = train_ivf_centroids<float>(bin, blobs, 1.0, NUM_K_MEANS_ITERS, TRAIN_SEED);
+    for (uint32_t b = 0; b < blobs; ++b) {
+        float best = std::numeric_limits<float>::max();
+        for (uint32_t c = 0; c < blobs; ++c) {
+            float s = 0.0f;
+            for (uint32_t d = 0; d < dim; ++d) {
+                const float diff = meta.centroids[size_t(c) * meta.aligned_dim + d] - float(b) * spacing;
+                s += diff * diff;
+            }
+            best = std::min(best, s);
+        }
+        t.check(best < 1.0f, "blob " + std::to_string(b) + " has no centroid near its centre");
+    }
+    ::unlink(bin.c_str());
+    return t.done();
+}
+
 bool test_training_error_paths(const std::string& base_bin) {
     TestCase t("training rejects nlist == 0, nlist > N, and too small a sample");
     t.expect_throw("nlist == 0", [&] { train_ivf_centroids<float>(base_bin, 0); });
@@ -920,6 +954,7 @@ int main() {
         all_pass &= test_seeded_primitives_are_deterministic(base_f32);
         all_pass &= test_same_seed_reproduces_centroids(base_f32, meta);
         all_pass &= test_training_error_paths(base_f32);
+        all_pass &= test_training_seeds_from_a_strided_subset(prefix);
         all_pass &= test_assign_clusters_and_load_heap<float>("float", prefix, base_f32, data_f32, meta);
         all_pass &= test_assignment_error_paths(prefix, base_f32, meta);
         all_pass &= test_graph_assignment(prefix);

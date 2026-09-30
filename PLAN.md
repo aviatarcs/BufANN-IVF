@@ -157,7 +157,10 @@ completes it, citing the commit subject.
       Lloyd's through the graph: done in "Run Lloyd's iterations through
       the centroid graph from nlist 32768 on" (2.1M x 32768 from the same
       init: 429 s -> 60 s, mean squared distance +0.006%; the 9M build
-      16:36 -> 8:31, recall within 0.1 points).
+      16:36 -> 8:31, recall within 0.1 points). k-means++: done in "Drop
+      k-means++'s two serial passes per pick" (374 -> 302 s) and "Seed
+      k-means++ from 4 points per centroid" (302 -> ~20 s; the 9M build
+      7:26 before it).
 - [ ] **nlist cost model.** For 90M+, where one build takes 41 min: sample
       m vectors, cluster them at each candidate nlist, take ~100 sample
       queries with exact neighbours within the sample, estimate nprobe as

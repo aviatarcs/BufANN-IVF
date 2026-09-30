@@ -18,6 +18,14 @@ namespace inplace {
 // Training points sampled per centroid; ~40 is the practical floor for k-means.
 const uint32_t IVF_TRAIN_POINTS_PER_CENTROID = 64;
 
+// k-means++ seeds from a strided subset of the training sample: this many
+// points per centroid, but at least IVF_KMEANSPP_MIN_POINTS. On 2.1M SIFT
+// points and 32768 centroids, seeding from 4, 8, 16 or all 64 per centroid
+// took 20, 36, 75 and 322 s, and after 15 Lloyd's iterations the mean
+// squared distances were within 0.02% of each other (47724 to 47733).
+const size_t IVF_KMEANSPP_POINTS_PER_CENTROID = 4;
+const size_t IVF_KMEANSPP_MIN_POINTS = 65536;
+
 // Cluster assignment and PQ encoding stream the base file in blocks of at
 // most IVF_ASSIGN_MAX_BLOCK_POINTS vectors, shrunk further so the per-block
 // [points x centers] float distance matrix stays under the byte budget.
@@ -51,7 +59,9 @@ std::string ivf_pq_pivots_path(const std::string& index_prefix);
 std::string ivf_pq_codes_path(const std::string& index_prefix);
 
 // Step 1. Trains `nlist` centroids on a random sample of `data_bin` (k-means++
-// init, Lloyd's refinement), zero-padded to aligned_dim. sampling_rate 0
+// init from a strided subset of it, Lloyd's refinement on all of it, through
+// the centroid graph from IVF_ASSIGN_GRAPH_MIN_NLIST), zero-padded to
+// aligned_dim. sampling_rate 0
 // derives the sample size from IVF_TRAIN_POINTS_PER_CENTROID. `seed` makes
 // the sample and the init deterministic.
 template<typename T>
