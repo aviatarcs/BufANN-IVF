@@ -2824,6 +2824,8 @@ void InPlaceGraphStore::warmup_bfs_pages(uint32_t entry_point, uint32_t num_page
                   << " pages over " << hop << " hops" << std::endl;
 }
 
+void drain_query_cache_hits(InPlaceIOStats& stats) { tls_registry().drain_into(stats); }
+
 void InPlaceGraphStore::reset_stats() {
     tls_registry().drain_into(_stats);
     _stats.reset();

@@ -7,8 +7,10 @@
 #include <algorithm>
 #include <cerrno>
 #include <cstring>
+#include <shared_mutex>
 #include <thread>
 
+#include "bufann/inplace_backend.h"
 #include "bufann/ivf_pq_require.h"
 
 namespace diskann {
@@ -63,7 +65,45 @@ void require_page_header(const void* page, const RawVectorHeapLayout& layout, ui
                        std::to_string(layout.elem_size) + " of this layout");
 }
 
+// A page pinned in a buffer pool for the scope of one access; unpinned on
+// the way out, exceptions included, so a failed header check leaks no pin.
+class PoolPin {
+public:
+    PoolPin(BufferPool& pool, uint32_t page_id, FrameRegion region)
+        : _pool(pool), _frame(&pool.pin(page_id, region)), _region(region) {}
+    ~PoolPin() { _pool.unpin_frame(_frame, _dirty, _region); }
+    PoolPin(const PoolPin&)            = delete;
+    PoolPin& operator=(const PoolPin&) = delete;
+
+    PageFrame& frame() { return *_frame; }
+    void mark_dirty() { _dirty = true; }
+
+private:
+    BufferPool& _pool;
+    PageFrame* _frame;
+    FrameRegion _region;
+    bool _dirty = false;
+};
+
 }  // namespace
+
+template<typename F>
+void RawVectorHeap::read_pool_page(uint32_t page_id, F fn) const {
+    PoolPin pin(*_pool, page_id, FrameRegion::QUERY);
+    std::shared_lock<std::shared_mutex> latch(pin.frame().data_lock);
+    require_page_header(pin.frame().data, _layout, page_id);
+    fn(static_cast<const char*>(pin.frame().data));
+}
+
+template<typename F>
+void RawVectorHeap::write_pool_page(uint32_t page_id, F fn) {
+    PoolPin pin(*_pool, page_id, FrameRegion::UPDATE);
+    {
+        std::unique_lock<std::shared_mutex> latch(pin.frame().data_lock);
+        fn(pin.frame().data);
+    }
+    pin.mark_dirty();
+}
 
 RawVectorHeap::RawVectorHeap(uint32_t max_readers) : _readers(max_readers) {
     IVF_PQ_REQUIRE(max_readers > 0, "raw-vector heap needs at least one reader registry entry");
@@ -127,7 +167,16 @@ void RawVectorHeap::set_layout(RawVectorHeapLayout layout) {
     _layout = layout;
 }
 
-void RawVectorHeap::open(const std::string& path, RawVectorHeapLayout layout) {
+void RawVectorHeap::open_buffer_pool(const std::string& path, RawVectorHeapCache cache, bool truncate) {
+    IVF_PQ_REQUIRE(_layout.page_size % 4096 == 0,
+                   "a raw-vector heap behind a buffer pool reads with O_DIRECT, so its page_size must be a "
+                   "multiple of 4096, not " + std::to_string(_layout.page_size));
+    auto pool = std::make_unique<BufferPool>();
+    pool->init(_layout.page_size, cache.buffer_pool_frames, path, cache.stats, 32, 100, truncate);
+    _pool = std::move(pool);
+}
+
+void RawVectorHeap::open(const std::string& path, RawVectorHeapLayout layout, RawVectorHeapCache cache) {
     close();
     set_layout(layout);
 
@@ -136,32 +185,50 @@ void RawVectorHeap::open(const std::string& path, RawVectorHeapLayout layout) {
                    "Refusing to overwrite existing non-empty raw-vector heap file "
                    "(use open_existing to resume it): " + path);
 
-    _fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
-    IVF_PQ_REQUIRE(_fd >= 0, "Failed to open raw-vector heap file: " + path);
+    if (cache.buffer_pool_frames > 0) {
+        open_buffer_pool(path, cache, /*truncate=*/true);
+    } else {
+        _fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
+        IVF_PQ_REQUIRE(_fd >= 0, "Failed to open raw-vector heap file: " + path);
+    }
     _allocated_pages = 0;
     _next_flat_slot = 0;
 }
 
 void RawVectorHeap::open_existing(const std::string& path, RawVectorHeapLayout layout,
-                                  uint32_t next_flat_slot, uint32_t allocated_pages) {
+                                  uint32_t next_flat_slot, uint32_t allocated_pages, RawVectorHeapCache cache) {
     close();
     set_layout(layout);
     IVF_PQ_REQUIRE(uint64_t(next_flat_slot) <= uint64_t(allocated_pages) * _layout.slots_per_page,
                    "slot cursor lies past the allocated pages");
 
-    _fd = ::open(path.c_str(), O_RDWR);
-    const int open_errno = errno;
-    IVF_PQ_REQUIRE(_fd >= 0,
-                   (open_errno == ENOENT ? "file not found: " : "Failed to open raw-vector heap file: ") + path);
+    int fd = -1;
+    if (cache.buffer_pool_frames > 0) {
+        // BufferPool::init opens with O_CREAT, which would leave an empty
+        // heap at a mistyped path; a path that vanishes after this check
+        // becomes an empty file that the size check below refuses.
+        struct stat st;
+        const int stat_errno = ::stat(path.c_str(), &st) == 0 ? 0 : errno;
+        IVF_PQ_REQUIRE(stat_errno == 0,
+                       (stat_errno == ENOENT ? "file not found: " : "Failed to stat raw-vector heap file: ") + path);
+        open_buffer_pool(path, cache, /*truncate=*/false);
+        fd = _pool->heap_fd();
+    } else {
+        _fd = ::open(path.c_str(), O_RDWR);
+        const int open_errno = errno;
+        IVF_PQ_REQUIRE(_fd >= 0,
+                       (open_errno == ENOENT ? "file not found: " : "Failed to open raw-vector heap file: ") + path);
+        fd = _fd;
+    }
 
-    // Everything from here on is checked through _fd, not the path: the size
+    // Everything from here on is checked through fd, not the path: the size
     // of whatever the path names now is no evidence about the file this heap
     // will read. The headers carry the geometry, so a file written with
     // another page_size or elem_size is refused even when its byte count and
     // page ids happen to line up with this layout.
     try {
         struct stat st;
-        IVF_PQ_REQUIRE(::fstat(_fd, &st) == 0, "Failed to stat raw-vector heap file: " + path);
+        IVF_PQ_REQUIRE(::fstat(fd, &st) == 0, "Failed to stat raw-vector heap file: " + path);
         const uint64_t expected_bytes = uint64_t(allocated_pages) * _layout.page_size;
         IVF_PQ_REQUIRE(uint64_t(st.st_size) == expected_bytes,
                        "raw-vector heap " + path + " is " + std::to_string(st.st_size) + " bytes, not the " +
@@ -183,12 +250,20 @@ void RawVectorHeap::open_existing(const std::string& path, RawVectorHeapLayout l
 // reopen cannot leave the previous file's cursor for allocate_slot to hand
 // out or for an index header to record.
 void RawVectorHeap::close() {
+    if (_pool) {
+        _pool->flush_all_dirty();
+        _pool.reset();
+    }
     if (_fd >= 0) {
         ::close(_fd);
         _fd = -1;
     }
     _allocated_pages.store(0);
     _next_flat_slot.store(0);
+}
+
+void RawVectorHeap::flush() {
+    if (_pool) _pool->flush_all_dirty();
 }
 
 // pread/pwrite may transfer fewer bytes than asked (a signal, or a network
@@ -217,6 +292,10 @@ void RawVectorHeap::require_allocated(uint32_t flat_slot) const {
 }
 
 void RawVectorHeap::require_page_header_on_disk(uint32_t page_id) const {
+    if (_pool) {
+        read_pool_page(page_id, [](const char*) {});
+        return;
+    }
     char header[RAW_VECTOR_PAGE_HEADER_BYTES];
     read_at(_layout.page_offset(page_id), header, sizeof(header), "read raw-vector page header");
     require_page_header(header, _layout, page_id);
@@ -240,11 +319,20 @@ uint32_t RawVectorHeap::allocate_slot(RawVectorFreeList& free_list) {
                    "addressable by RawVectorRID");
     // Extend the file before publishing the slot, so a reader that sees the
     // new cursor also sees the page.
+    // Through a buffer pool the new page is only in its frame (read from
+    // past the end of the file, as zeros) until it is written back.
     while (allocated_pages() <= _layout.page_of(flat)) {
-        std::vector<char> page(_layout.page_size, 0);
-        stamp_page_header(page.data(), _layout, allocated_pages());
-        write_at(_layout.page_offset(allocated_pages()), page.data(), _layout.page_size,
-                 "extend raw-vector heap file");
+        const uint32_t page_id = allocated_pages();
+        if (_pool) {
+            write_pool_page(page_id, [&](char* page) {
+                std::memset(page, 0, _layout.page_size);
+                stamp_page_header(page, _layout, page_id);
+            });
+        } else {
+            std::vector<char> page(_layout.page_size, 0);
+            stamp_page_header(page.data(), _layout, page_id);
+            write_at(_layout.page_offset(page_id), page.data(), _layout.page_size, "extend raw-vector heap file");
+        }
         _allocated_pages.fetch_add(1);
     }
     _next_flat_slot.store(flat + 1);
@@ -255,6 +343,15 @@ uint32_t RawVectorHeap::allocate_slot(RawVectorFreeList& free_list) {
 // is fully described.
 void RawVectorHeap::write_vector(uint32_t flat_slot, uint32_t owner, const void* data) {
     require_allocated(flat_slot);
+    if (_pool) {
+        const uint32_t index = _layout.index_in_page(flat_slot);
+        write_pool_page(_layout.page_of(flat_slot), [&](char* page) {
+            std::memcpy(page + _layout.owner_offset_in_page(index), &owner, RAW_VECTOR_OWNER_BYTES);
+            std::memcpy(page + _layout.slot_offset_in_page(index), data, _layout.elem_size);
+            page[_layout.bitmap_byte_in_page(index)] |= _layout.bitmap_mask(index);
+        });
+        return;
+    }
     write_at(_layout.owner_offset(flat_slot), &owner, RAW_VECTOR_OWNER_BYTES, "write raw vector owner");
     write_at(_layout.slot_offset(flat_slot), data, _layout.elem_size, "write raw vector");
     set_occupancy_bit(flat_slot, true);
@@ -268,6 +365,14 @@ uint32_t RawVectorHeap::read_vector(uint32_t flat_slot, void* out) const {
     const uint32_t page_id = _layout.page_of(flat_slot);
     const uint32_t index = _layout.index_in_page(flat_slot);
     const uint32_t slot_in_page = _layout.slot_offset_in_page(index);
+    if (_pool) {
+        uint32_t owner;
+        read_pool_page(page_id, [&](const char* page) {
+            std::memcpy(out, page + slot_in_page, _layout.elem_size);
+            std::memcpy(&owner, page + _layout.owner_offset_in_page(index), RAW_VECTOR_OWNER_BYTES);
+        });
+        return owner;
+    }
     thread_local std::vector<char> prefix;
     prefix.resize(size_t(slot_in_page) + _layout.elem_size);
     read_at(_layout.page_offset(page_id), prefix.data(), prefix.size(), "read raw vector");
@@ -278,8 +383,53 @@ uint32_t RawVectorHeap::read_vector(uint32_t flat_slot, void* out) const {
     return owner;
 }
 
+// Pins at most kPinBatchMax pages per batch and, so that concurrent readers
+// cannot pin a small pool full, at most 1/64 of its frames. If
+// pin_batch throws (no frame left to evict), the pins it took are not
+// returned; the pool was too small for the readers either way.
+void RawVectorHeap::read_vectors(const uint32_t* flat_slots, size_t n, char* out, uint32_t* owners) const {
+    for (size_t i = 0; i < n; ++i) require_allocated(flat_slots[i]);
+    if (!_pool) {
+        for (size_t i = 0; i < n; ++i) owners[i] = read_vector(flat_slots[i], out + i * _layout.elem_size);
+        return;
+    }
+    const size_t batch = std::clamp<size_t>(_pool->num_frames() / 64, 1, BufferPool::kPinBatchMax);
+    uint32_t page_ids[BufferPool::kPinBatchMax];
+    PageFrame* frames[BufferPool::kPinBatchMax];
+    for (size_t first = 0; first < n; first += batch) {
+        const size_t m = std::min(batch, n - first);
+        for (size_t j = 0; j < m; ++j) page_ids[j] = _layout.page_of(flat_slots[first + j]);
+        _pool->pin_batch(page_ids, frames, m, FrameRegion::QUERY);
+        struct UnpinAll {
+            BufferPool& pool;
+            PageFrame** frames;
+            size_t m;
+            ~UnpinAll() {
+                for (size_t j = 0; j < m; ++j) pool.unpin_frame(frames[j], false, FrameRegion::QUERY);
+            }
+        } unpin{*_pool, frames, m};
+        for (size_t j = 0; j < m; ++j) {
+            const size_t i = first + j;
+            const uint32_t index = _layout.index_in_page(flat_slots[i]);
+            std::shared_lock<std::shared_mutex> latch(frames[j]->data_lock);
+            require_page_header(frames[j]->data, _layout, page_ids[j]);
+            std::memcpy(out + i * _layout.elem_size, frames[j]->data + _layout.slot_offset_in_page(index),
+                        _layout.elem_size);
+            std::memcpy(&owners[i], frames[j]->data + _layout.owner_offset_in_page(index), RAW_VECTOR_OWNER_BYTES);
+        }
+    }
+}
+
 bool RawVectorHeap::is_slot_occupied(uint32_t flat_slot) const {
     require_allocated(flat_slot);
+    if (_pool) {
+        const uint32_t index = _layout.index_in_page(flat_slot);
+        bool occupied = false;
+        read_pool_page(_layout.page_of(flat_slot), [&](const char* page) {
+            occupied = (uint8_t(page[_layout.bitmap_byte_in_page(index)]) & _layout.bitmap_mask(index)) != 0;
+        });
+        return occupied;
+    }
     std::lock_guard<std::mutex> lg(bitmap_mutex(flat_slot));
     uint8_t byte = 0;
     read_at(_layout.bitmap_byte_offset(flat_slot), &byte, 1, "read occupancy bitmap");
@@ -289,6 +439,13 @@ bool RawVectorHeap::is_slot_occupied(uint32_t flat_slot) const {
 void RawVectorHeap::read_page_directory(uint32_t page_id, uint8_t* bitmap, uint32_t* owners) const {
     IVF_PQ_REQUIRE(page_id < allocated_pages(),
                    "raw-vector page " + std::to_string(page_id) + " is past the allocated pages");
+    if (_pool) {
+        read_pool_page(page_id, [&](const char* page) {
+            std::memcpy(bitmap, page + RAW_VECTOR_PAGE_HEADER_BYTES, _layout.bitmap_bytes);
+            std::memcpy(owners, page + _layout.owners_offset, size_t(_layout.slots_per_page) * RAW_VECTOR_OWNER_BYTES);
+        });
+        return;
+    }
     std::vector<char> prefix(_layout.slots_offset);
     std::lock_guard<std::mutex> lg(_bitmap_mtx[page_id % RAW_VECTOR_BITMAP_LOCK_STRIPES]);
     read_at(_layout.page_offset(page_id), prefix.data(), prefix.size(), "read page directory");
@@ -326,6 +483,14 @@ size_t RawVectorHeap::reclaim_locked(RawVectorFreeList& free_list) {
 }
 
 void RawVectorHeap::set_occupancy_bit(uint32_t flat_slot, bool occupied) {
+    if (_pool) {
+        const uint32_t index = _layout.index_in_page(flat_slot);
+        write_pool_page(_layout.page_of(flat_slot), [&](char* page) {
+            uint8_t& byte = reinterpret_cast<uint8_t&>(page[_layout.bitmap_byte_in_page(index)]);
+            byte = occupied ? (byte | _layout.bitmap_mask(index)) : (byte & ~_layout.bitmap_mask(index));
+        });
+        return;
+    }
     uint64_t offset = _layout.bitmap_byte_offset(flat_slot);
     uint8_t mask = _layout.bitmap_mask(_layout.index_in_page(flat_slot));
 
@@ -340,6 +505,14 @@ void RawVectorHeap::write_pages(uint32_t first_page_id, const void* pages, uint3
     for (uint32_t p = 0; p < num_pages; ++p) {
         require_page_header(static_cast<const char*>(pages) + size_t(p) * _layout.page_size, _layout,
                             first_page_id + p);
+    }
+    if (_pool) {
+        for (uint32_t p = 0; p < num_pages; ++p) {
+            write_pool_page(first_page_id + p, [&](char* page) {
+                std::memcpy(page, static_cast<const char*>(pages) + size_t(p) * _layout.page_size, _layout.page_size);
+            });
+        }
+        return;
     }
     write_at(_layout.page_offset(first_page_id), pages, size_t(num_pages) * _layout.page_size,
              "bulk-write raw-vector heap pages");
