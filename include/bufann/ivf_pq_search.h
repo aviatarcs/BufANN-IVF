@@ -39,7 +39,8 @@ struct IVFPQSearchScratch {
     std::vector<uint32_t> shortlist;    // ids kept for the re-rank
     std::vector<uint32_t> shortlist_slot;  // their heap slots, parallel to shortlist
     std::vector<float> exact_dist;      // parallel to shortlist
-    std::vector<char> raw_vector;       // [heap elem_size]
+    std::vector<char> raw_vectors;      // [shortlist x heap elem_size]
+    std::vector<uint32_t> owners;       // parallel to shortlist
     std::vector<float> vector;          // [dim]
     IVFCentroidGraphScratch graph;      // ivf_pq_search_graph only
 };

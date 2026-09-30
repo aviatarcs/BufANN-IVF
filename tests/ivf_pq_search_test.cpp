@@ -4,11 +4,14 @@
 // nprobe = nlist top-k, and the argument/consistency guards. Runs on float
 // and uint8 bases so the raw-vector type conversion is covered.
 
+#include "bufann/inplace_backend.h"
 #include "bufann/ivf_pq_build.h"
 #include "bufann/ivf_pq_index_file.h"
 #include "bufann/ivf_pq_search.h"
 #include "ivf_pq_test_util.h"
 #include "utils.h"
+
+#include <omp.h>
 
 #include <algorithm>
 #include <cmath>
@@ -131,6 +134,44 @@ bool test_matches_reference(const std::string& tag, const Built& b, const std::v
     std::cout << "  compared " << compared << " searches, skipped " << skipped << " with a tied probe boundary"
               << std::endl;
     t.check(skipped < compared / 20, "too many tied probe boundaries for the comparison to mean anything");
+    return t.done();
+}
+
+// The index searched through a buffer pool of 128 frames over its heap file
+// (fewer than the f32 heap's pages, so re-rank reads evict and re-read pages,
+// two per batch) must return what the reference returns through the page
+// cache, single queries and a batch over 4 threads alike.
+template<typename T>
+bool test_buffer_pool_matches_reference(const std::string& tag, const Built& b, const std::string& prefix,
+                                        const std::vector<float>& queries) {
+    TestCase t(tag + ": searching through a 128-frame buffer pool matches the reference through the page cache");
+    InPlaceIOStats stats;
+    RawVectorHeap pooled;
+    const uint32_t frames = 128;
+    pooled.open_existing(ivf_raw_vectors_path(prefix), b.index.heap_layout, b.index.heap_next_slot,
+                         b.index.heap_pages, RawVectorHeapCache{frames, &stats});
+    IVFPQSearchScratch scratch;
+    const int threads = omp_get_max_threads();
+    omp_set_num_threads(4);  // 4 x 2 pinned pages cannot fill a 32-frame shard
+    for (uint32_t nprobe : {1u, 8u, NLIST}) {
+        std::vector<IVFPQSearchResult> batch =
+            ivf_pq_search_batch<T>(b.index, pooled, queries.data(), NQ, K, nprobe, RERANK_M);
+        for (uint32_t q = 0; q < NQ; ++q) {
+            const float* query = queries.data() + size_t(q) * DIM;
+            IVFPQSearchResult want = reference_search<T>(b.index, b.heap, query, K, nprobe, RERANK_M);
+            IVFPQSearchResult got = ivf_pq_search<T>(b.index, pooled, query, K, nprobe, RERANK_M, scratch);
+            t.check(same_within_ties(got, want),
+                    "query " + std::to_string(q) + " nprobe " + std::to_string(nprobe) + " differs");
+            if (!probe_boundary_is_tied(b.index, query, nprobe)) {
+                t.check(same_within_ties(batch[q], want),
+                        "batched query " + std::to_string(q) + " nprobe " + std::to_string(nprobe) + " differs");
+            }
+        }
+    }
+    omp_set_num_threads(threads);
+    t.check(b.index.heap_pages <= frames || stats.evictions.load() > 0,
+            "the heap outgrew the pool but nothing was evicted");
+    pooled.close();
     return t.done();
 }
 
@@ -385,6 +426,8 @@ int main() {
         all_pass &= test_inactive_rid_is_dropped<uint8_t>("u8", *u, queries);
         all_pass &= test_graph_matches_reference<float>("f32", *f, queries);
         all_pass &= test_graph_matches_reference<uint8_t>("u8", *u, queries);
+        all_pass &= test_buffer_pool_matches_reference<float>("f32", *f, prefix_f, queries);
+        all_pass &= test_buffer_pool_matches_reference<uint8_t>("u8", *u, prefix_u, queries);
         all_pass &= test_scratch_follows_index(*f, *u, queries);
         all_pass &= test_guards(*f, queries);
 

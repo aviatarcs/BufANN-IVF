@@ -104,7 +104,10 @@ std::unique_ptr<IVFPQBackend> ivf_pq_backend_load(const std::string& index_prefi
         throw std::runtime_error("bufann_load: index stores " + std::to_string(ix.heap_layout.elem_size / config.dim) +
                                  "-byte elements, not the " + std::to_string(sizeof(T)) + "-byte T requested");
     }
-    backend->heap.open_existing(ivf_raw_vectors_path(index_prefix), ix.heap_layout, ix.heap_next_slot, ix.heap_pages);
+    // The heap is served through a buffer pool of config.buffer_pool_frames,
+    // the budget the graph backend gets, not the unbounded page cache.
+    backend->heap.open_existing(ivf_raw_vectors_path(index_prefix), ix.heap_layout, ix.heap_next_slot, ix.heap_pages,
+                                RawVectorHeapCache{config.buffer_pool_frames, nullptr});
     ivf_pq_recover_deletes(backend->index, backend->heap, backend->delta);
     return backend;
     });

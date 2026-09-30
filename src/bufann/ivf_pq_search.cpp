@@ -182,13 +182,19 @@ IVFPQSearchResult search_probes(const IVFPQIndex& ix, const RawVectorHeap& heap,
         return result;
     }
 
-    scratch.raw_vector.resize(heap.layout().elem_size);
-    const T* raw = reinterpret_cast<const T*>(scratch.raw_vector.data());
+    // One call for the whole shortlist, so a buffer pool reads the pages it
+    // misses concurrently, as BufANN's beam search and LindormVector's batch get do.
+    const size_t elem_size = heap.layout().elem_size;
+    scratch.raw_vectors.resize(scratch.shortlist.size() * elem_size);
+    scratch.owners.resize(scratch.shortlist.size());
+    heap.read_vectors(scratch.shortlist_slot.data(), scratch.shortlist.size(), scratch.raw_vectors.data(),
+                      scratch.owners.data());
     for (size_t i = 0; i < scratch.shortlist.size(); ++i) {
-        const uint32_t owner = heap.read_vector(scratch.shortlist_slot[i], scratch.raw_vector.data());
+        const uint32_t owner = scratch.owners[i];
         IVF_PQ_REQUIRE(owner == scratch.shortlist[i], "raw-vector slot " + std::to_string(scratch.shortlist_slot[i]) +
                                                           " holds vector " + std::to_string(owner) + ", not " +
                                                           std::to_string(scratch.shortlist[i]));
+        const T* raw = reinterpret_cast<const T*>(scratch.raw_vectors.data() + i * elem_size);
         for (uint32_t d = 0; d < dim; ++d) scratch.vector[d] = float(raw[d]);
         scratch.exact_dist[i] = sq_dist(query, scratch.vector.data(), dim);
     }
