@@ -46,11 +46,23 @@ namespace math_utils {
   // those
   // values
 
+  // compute_closest_centers works in blocks of points, each with a
+  // [rows x num_centers] float distance matrix. Uncapped, a block was up to
+  // 2^23 rows: 64 GB for IVF k-means on 1M points x 16384 centroids.
+  const size_t CLOSEST_CENTERS_MAX_MATRIX_BYTES = size_t(1) << 30;
+
+  // Rows per block: at most 2^23 and num_points, and few enough that the
+  // matrix fits max_matrix_bytes, but never below one row.
+  size_t closest_centers_block_rows(size_t num_points, size_t num_centers,
+                                    size_t max_matrix_bytes);
+
   void compute_closest_centers(float* data, size_t num_points, size_t dim,
                                float* pivot_data, size_t num_centers, size_t k,
                                uint32_t*            closest_centers_ivf,
                                std::vector<size_t>* inverted_index = NULL,
-                               float*               pts_norms_squared = NULL);
+                               float*               pts_norms_squared = NULL,
+                               size_t max_matrix_bytes =
+                                   CLOSEST_CENTERS_MAX_MATRIX_BYTES);
 
   // if to_subtract is 1, will subtract nearest center from each row. Else will
   // add. Output will be in data_load iself.
@@ -63,6 +75,10 @@ namespace math_utils {
 }  // namespace math_utils
 
 namespace kmeans {
+  // kmeanspp_selecting_pivots falls back to random pivots above this many
+  // points.
+  const size_t KMEANSPP_MAX_POINTS = size_t(1) << 23;
+
 
   // run Lloyds one iteration
   // Given data in row major num_points * dim, and centers in row major

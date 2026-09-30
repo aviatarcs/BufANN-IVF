@@ -1,6 +1,7 @@
 #include "bufann/ivf_pq_build.h"
 
 #include <algorithm>
+#include <cstring>
 #include <limits>
 #include <memory>
 #include <numeric>
@@ -145,8 +146,22 @@ IVFMetadata train_ivf_centroids(const std::string& data_bin, uint32_t nlist,
                   << " sampled points (dim " << dim << ")" << std::endl;
 
     std::vector<float> centers(size_t(nlist) * dim);
-    kmeans::kmeanspp_selecting_pivots(train_data.data(), num_train, dim, centers.data(), nlist,
-                                      rng_seed);
+    if (num_train <= kmeans::KMEANSPP_MAX_POINTS) {
+        kmeans::kmeanspp_selecting_pivots(train_data.data(), num_train, dim, centers.data(), nlist,
+                                          rng_seed);
+    } else {
+        // At nlist >= 2^23 / IVF_TRAIN_POINTS_PER_CENTROID (131072) the sample
+        // outgrows k-means++, which would fall back to random pivots. Seed
+        // from every stride-th row instead, so the seeds span the whole
+        // sample (it is in file order); Lloyd's still runs on all of it.
+        const size_t stride = (num_train + kmeans::KMEANSPP_MAX_POINTS - 1) / kmeans::KMEANSPP_MAX_POINTS;
+        const size_t seed_rows = (num_train + stride - 1) / stride;
+        std::vector<float> seed_data(seed_rows * dim);
+        for (size_t r = 0; r < seed_rows; ++r) {
+            std::copy_n(train_data.begin() + r * stride * dim, dim, seed_data.begin() + r * dim);
+        }
+        kmeans::kmeanspp_selecting_pivots(seed_data.data(), seed_rows, dim, centers.data(), nlist, rng_seed);
+    }
     kmeans::run_lloyds(train_data.data(), num_train, dim, centers.data(), nlist, max_kmeans_reps,
                        NULL, NULL);
 
@@ -280,6 +295,24 @@ PostingLists build_ivf_posting_lists(const ClusterAssignments& assignments, uint
         lists.ids[next_free[cluster_id[i]]++] = uint32_t(i);
     }
     return lists;
+}
+
+void set_ivf_posting_codes(IVFPQIndex& index) {
+    const PostingLists& lists = index.lists;
+    const PQMetadata& pq = index.pq;
+    const size_t chunks = pq.chunks;
+    IVF_PQ_REQUIRE(chunks > 0 && pq.codes.size() % chunks == 0, "PQ codes are not whole rows of pq.chunks bytes");
+    const size_t rows = pq.codes.size() / chunks;
+    for (uint32_t id : lists.ids) {
+        IVF_PQ_REQUIRE(id < rows, "posting-list id " + std::to_string(id) + " has no PQ code (" +
+                                      std::to_string(rows) + " rows)");
+    }
+    std::vector<uint8_t> codes(lists.ids.size() * chunks);
+#pragma omp parallel for schedule(static, 65536)
+    for (int64_t i = 0; i < int64_t(lists.ids.size()); ++i) {
+        std::memcpy(codes.data() + size_t(i) * chunks, pq.codes.data() + size_t(lists.ids[i]) * chunks, chunks);
+    }
+    index.lists.codes = std::move(codes);
 }
 
 void save_ivf_posting_lists(const std::string& index_prefix, const PostingLists& lists) {

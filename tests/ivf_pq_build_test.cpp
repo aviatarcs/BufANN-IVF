@@ -488,6 +488,94 @@ void patch(const std::string& path, uint64_t offset, T value) {
     f.write(reinterpret_cast<const char*>(&value), sizeof(value));
 }
 
+bool test_closest_centers_blocking() {
+    TestCase t("k-means nearest-centre blocks keep the distance matrix bounded and still find the nearest centres");
+    const size_t GB = size_t(1) << 30;
+    t.check(math_utils::closest_centers_block_rows(1 << 20, 16384, GB) == 16384,
+            "1M points x 16384 centres should take 16384-row blocks under 1 GiB");
+    t.check(math_utils::closest_centers_block_rows(10, 256, GB) == 10, "a small input should be one block");
+    t.check(math_utils::closest_centers_block_rows(size_t(1) << 30, 1, GB) == size_t(1) << 23,
+            "rows should stay capped at 2^23");
+    t.check(math_utils::closest_centers_block_rows(100, 1000, 1) == 1, "a tiny budget should still give one row");
+    t.check(math_utils::closest_centers_block_rows(0, 16, GB) == 1, "zero points should give one row, not zero");
+
+    // 1000 points in 7-row blocks (the last one 6 rows), checked against
+    // exact distances. Nearest-centre ties resolve within a few ulps of the
+    // norms in ||x||^2 + ||c||^2 - 2x.c.
+    const size_t n = 1000, dim = 8, nc = 37, rows = 7;
+    std::mt19937 gen(11);
+    std::uniform_real_distribution<float> u(-10.0f, 10.0f);
+    std::vector<float> x(n * dim), c(nc * dim);
+    for (float& v : x) v = u(gen);
+    for (float& v : c) v = u(gen);
+    for (size_t k : {size_t(1), size_t(3)}) {
+        std::vector<uint32_t> got(n * k);
+        std::vector<std::vector<size_t>> inverted(nc);
+        math_utils::compute_closest_centers(x.data(), n, dim, c.data(), nc, k, got.data(), inverted.data(), nullptr,
+                                            rows * nc * sizeof(float));
+        size_t wrong = 0, listed = 0;
+        for (size_t i = 0; i < n; ++i) {
+            std::vector<float> d(nc);
+            float scale = l2sq(x.data() + i * dim, dim);
+            for (size_t j = 0; j < nc; ++j) {
+                d[j] = sq_dist(x.data() + i * dim, c.data() + j * dim, dim);
+                scale = std::max(scale, l2sq(c.data() + j * dim, dim));
+            }
+            std::vector<float> sorted = d;
+            std::sort(sorted.begin(), sorted.end());
+            const float tol = 16 * std::numeric_limits<float>::epsilon() * 2 * scale;
+            std::vector<uint32_t> mine(got.begin() + i * k, got.begin() + (i + 1) * k);
+            for (size_t r = 0; r < k; ++r) {
+                std::vector<float> chosen;
+                for (uint32_t j : mine) chosen.push_back(d[j]);
+                std::sort(chosen.begin(), chosen.end());
+                wrong += chosen[r] > sorted[r] + tol;
+            }
+            std::sort(mine.begin(), mine.end());
+            wrong += std::adjacent_find(mine.begin(), mine.end()) != mine.end();
+            for (uint32_t j : mine) {
+                listed += std::binary_search(inverted[j].begin(), inverted[j].end(), i);
+            }
+        }
+        size_t total = 0;
+        for (const auto& l : inverted) total += l.size();
+        t.check(wrong == 0, "k=" + std::to_string(k) + ": " + std::to_string(wrong) +
+                                " points did not get their nearest centres across blocks");
+        t.check(listed == n * k && total == n * k,
+                "k=" + std::to_string(k) + ": inverted index does not list each point under its centres");
+    }
+    return t.done();
+}
+
+bool test_posting_codes_follow_lists() {
+    TestCase t("posting-list codes are each listed id's PQ code, in list order");
+    // Ids deliberately out of id order across and within partitions; code
+    // row r is filled with r * 7 + c so each byte names its row and chunk.
+    IVFPQIndex ix;
+    ix.lists.offsets = {0, 3, 3, 6};
+    ix.lists.ids = {4, 0, 5, 2, 1, 3};
+    ix.pq.chunks = 3;
+    ix.pq.codes.resize(6 * 3);
+    for (uint32_t r = 0; r < 6; ++r) {
+        for (uint32_t c = 0; c < 3; ++c) ix.pq.codes[r * 3 + c] = uint8_t(r * 7 + c);
+    }
+    set_ivf_posting_codes(ix);
+    t.check(ix.lists.codes.size() == ix.lists.ids.size() * 3, "posting codes have the wrong size");
+    size_t wrong = 0;
+    for (size_t i = 0; i < ix.lists.ids.size() && ix.lists.codes.size() == 18; ++i) {
+        for (uint32_t c = 0; c < 3; ++c) wrong += ix.lists.codes[i * 3 + c] != uint8_t(ix.lists.ids[i] * 7 + c);
+    }
+    t.check(wrong == 0, std::to_string(wrong) + " posting-code bytes are not their listed id's code");
+
+    IVFPQIndex no_row = ix;
+    no_row.lists.ids[4] = 6;  // one past the last code row
+    t.expect_throw("listed id with no PQ code row", [&] { set_ivf_posting_codes(no_row); });
+    IVFPQIndex no_chunks = ix;
+    no_chunks.pq.chunks = 0;
+    t.expect_throw("zero PQ chunks", [&] { set_ivf_posting_codes(no_chunks); });
+    return t.done();
+}
+
 bool test_index_file(const std::string& prefix, const std::string& base_bin, const std::vector<float>& data,
                      const IVFMetadata& meta) {
     TestCase t("combined index file round-trips, reopens the heap, replaces atomically, and rejects corruption");
@@ -529,6 +617,22 @@ bool test_index_file(const std::string& prefix, const std::string& base_bin, con
                 loaded.heap_layout.slots_per_page == ix.heap_layout.slots_per_page &&
                 loaded.heap_pages == ix.heap_pages && loaded.heap_next_slot == ix.heap_next_slot,
             "loaded index differs from what was written");
+
+    // The loader lays the codes out by posting list; checked against the
+    // codes file as upstream wrote it, row = vector id.
+    {
+        uint8_t* file_codes = nullptr;
+        size_t rows = 0, chunks = 0;
+        diskann::load_bin<uint8_t>(ivf_pq_codes_path(pre), file_codes, rows, chunks);
+        size_t wrong = loaded.lists.codes.size() == rows * chunks ? 0 : 1;
+        for (size_t i = 0; wrong == 0 && i < loaded.lists.ids.size(); ++i) {
+            wrong += !std::equal(file_codes + size_t(loaded.lists.ids[i]) * chunks,
+                                 file_codes + size_t(loaded.lists.ids[i] + 1) * chunks,
+                                 loaded.lists.codes.begin() + i * chunks);
+        }
+        delete[] file_codes;
+        t.check(wrong == 0, "loaded posting-list codes are not the codes file's rows in list order");
+    }
 
     // What the loaded header says about the heap is enough to reopen it, and
     // every RID then reads back the base vector it was assigned for.
@@ -615,6 +719,8 @@ int main() {
         all_pass &= test_assign_clusters_and_load_heap<float>("float", prefix, base_f32, data_f32, meta);
         all_pass &= test_assignment_error_paths(prefix, base_f32, meta);
         all_pass &= test_posting_lists_invert_assignments(prefix);
+        all_pass &= test_posting_codes_follow_lists();
+        all_pass &= test_closest_centers_blocking();
         all_pass &= test_pq_pivots_and_codes<float>("float", prefix, base_f32, data_f32, 4);
         all_pass &= test_pq_error_paths(prefix, base_f32);
         all_pass &= test_index_file(prefix, base_f32, data_f32, meta);

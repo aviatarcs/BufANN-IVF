@@ -49,7 +49,117 @@ completes it, citing the commit subject.
       freeing the slot through it. Search drops tombstoned ids. (Add IVF-PQ
       delete; tombstoned base ids are dropped before selection and freed
       slots go through the grace period)
-- [ ] **Posting-list rebuild.** Fold `PostingListDelta` and `DynamicPQCodes`
+- [x] **Measure QPS-recall against nlist.** LindormVector (SIGMOD Companion
+      '26) finds the best nlist at 100M near 200K (~20 sqrt(N)); we use
+      ~1.4 sqrt(N) at 9M (4096) and ~1.7 sqrt(N) at 90M (16384), and at
+      9M / nprobe 64 a query scans ~140K codes while its centroid GEMM reads
+      2 MB, so the scan is the cost a finer partition cuts. Build SIFT10M 9M
+      at nlist 4096, 16384, 32768 and 65536 with the default training sample
+      (64 points per centroid; the earlier sweep's ad-hoc build trained 32K
+      and 64K on 16 and 5), run `ivf_pq_query_bench` over nprobe for each,
+      and record QPS at recall 95/98/99, build time and RSS. Add the sweep
+      as a script so it can be rerun. The items below that depend on this
+      one are only worth doing if a larger nlist wins.
+      (Done in "Add the nlist sweep script and record the SIFT10M 9M
+      sweep". A larger nlist wins. Best q/s, single-query / batched
+      centroid search, 32 threads:
+
+      | nlist | build  | recall >= 95   | >= 98          | >= 99          |
+      |-------|--------|----------------|----------------|----------------|
+      | 4096  | 85 s   | 3909 / 3648    | 2106 / 1929    | 2106 / 1929    |
+      | 16384 | 310 s  | 5797 / 5990    | 3400 / 3415    | 3400 / 3415    |
+      | 32768 | 976 s  | 7256 / 8424    | 4828 / 5351    | 2934 / 3074    |
+      | 65536 | 3562 s | 4260 / 6442    | 3176 / 4378    | 3176 / 4378    |
+
+      32768 gives 2.3x (batched 2.8x) the q/s of 4096 at recall 98. At
+      65536 the single-query path has half the batched one's q/s; the two
+      differ only in the centroid search (a GEMV per query, 32 MB read,
+      against one GEMM per batch). Build peak RSS 4.5 / 3.4 /
+      4.2 / 6.2 GB; bench RSS 1.2-1.6 GB at every nlist. Logs:
+      `/var/tmp/bufann-ivf-evpeng/nlist/`.)
+- [x] **Centroid search that scales with nlist.** The per-query centroid
+      GEMV reads nlist x aligned_dim floats: 32 MB at 64K, ~125 GB/s at
+      4K q/s. Search a proximity graph over the centroids (the in-repo
+      in-memory Vamana; the paper uses HNSW, refines its bottom layer and
+      reinserts zero in-degree nodes) for a multiple of nprobe candidates,
+      re-rank them exactly, keep nprobe. Oracle: the exact GEMM probe set;
+      report probe-set recall and end-to-end QPS-recall. The paper's PCA
+      compression of centroids during traversal pays at 768-1024 dims, not
+      obviously at 128; measure before adding it. Depends on the nlist
+      measurement, which found the GEMV halves single-query q/s at 65536
+      (5180 vs 8866 batched at recall 90), so the target is 65536 and up
+      at the batched path's q/s or better.
+      (Done in "Search the IVF centroids through a proximity graph". A
+      Vamana graph of its own (R 32, build L 100, alpha 1.2) rather than
+      the in-repo Index, which builds only from a file, seeds its build
+      from random_device, sets the global OpenMP thread count and
+      allocates hash sets per query. Built after load in 0.47 s at 32768
+      and 1.24 s at 65536; the beam's distances are exact, so it is its
+      own re-rank. SIFT10M 9M, 32 threads, beam 2 x nprobe, single-query
+      q/s against the exact path's single / batched, recall unchanged to
+      0.02 points, probe-set recall >= 0.998:
+
+      | nlist | nprobe | recall | exact single / batched | graph  |
+      |-------|--------|--------|------------------------|--------|
+      | 32768 | 128    | 96.26  | 7163 / 7782            | 10341  |
+      | 32768 | 256    | 98.55  | 4788 / 5271            | 5978   |
+      | 65536 | 64     | 88.91  | 5508 / 9746            | 23285  |
+      | 65536 | 256    | 97.57  | 4196 / 6462            | 8496   |
+      | 65536 | 512    | 99.11  | 3135 / 4374            | 4823   |
+
+      Best at recall >= 95 / 98 / 99 moves from 8424 / 5351 / 3074
+      (32768, batched) to 10341 / 5978 (32768, graph) / 4823 (65536,
+      graph). A 4 x beam costs 8-17% q/s for no recall. PCA not tried:
+      the graph visits a few hundred 128-d centroids, not the cost.
+      Logs: `/var/tmp/bufann-ivf-evpeng/nlist/bench_graph_n*.log`.)
+- [ ] **Graph centroid search in the backend.** The backend and the batched
+      path still use the exact GEMM/GEMV. Build the graph when the backend
+      loads an index (or persist it in the index file if load time
+      matters at 90M+), rebuild it with the centroids, and expose
+      centroid_L (as a multiple of nprobe, default 2) next to nprobe.
+      Test through the public API against the exact path at a full beam.
+- [ ] **nlist sweep with graph search.** With the per-query centroid cost
+      gone, the sweep's optimum may move up: rerun
+      `GRAPH_BEAMS=2 scripts/nlist_sweep.sh` at 9M over nlist 32768,
+      65536 and 131072 (~20 sqrt(N) is 60K) with nprobes between the
+      powers of two, and at 90M; build time (59 min at 65536) is then
+      the cost, so this and the build-time item inform each other.
+- [ ] **Build time at large nlist.** Assignment of 9M to 32K centroids took
+      378 s, ~200 GFLOP/s against a ~1.2 TFLOP/s peak; find where it goes
+      before changing the algorithm. Then, if still needed, assign through
+      the centroid graph (k-means and the final assignment), seeding each
+      point from its previous centroid; the paper reports 5-10x with the
+      same MSE. Oracle: brute-force assignment within the
+      compute_closest_centers tolerance, and k-means MSE against the exact
+      run. Depends on the nlist measurement: whole builds at 9M took 85,
+      310, 976 and 3562 s at nlist 4096 to 65536, ~3.4x per doubling of
+      nlist (the training sample grows with nlist, and so does each pass).
+- [ ] **nlist cost model.** For 90M+, where one build takes 41 min: sample
+      m vectors, cluster them at each candidate nlist, take ~100 sample
+      queries with exact neighbours within the sample, estimate nprobe as
+      the centroids no farther than the farthest one holding a true
+      neighbour, scan cost from the codes in those lists scaled by N/m and a
+      measured per-code time, plus measured centroid-search time; pick the
+      minimum (paper section 4.1). Validate against the 9M measurements.
+      Depends on the nlist measurement.
+- [ ] **4-bit fast-scan PQ.** The scan does one scalar table lookup per
+      chunk per code. 64 x 4-bit sub-quantizers are the same 32 B/vector as
+      32 x 8-bit for SIFT, and their tables fit SIMD registers (PQFastScan,
+      blocks of 32 codes). Prototype the kernel on the SIFT10M codes against
+      the scalar scan as oracle, then compare QPS-recall end to end. Small
+      lists (large nlist) leave partial blocks; measure at nlist 32768
+      (~275 codes per list at 9M), the sweep's best.
+- [ ] **Re-rank reads under a cold heap.** The bench reads the heap through
+      a warm page cache, while BufANN's numbers pay ~75 buffer-pool misses
+      per query; the re-rank's up to rerank_m (100) random reads are our
+      counterpart of the paper's batch get. Add a cold-heap mode to the
+      bench (O_DIRECT or a bounded cache), issue a query's re-rank reads
+      concurrently (the aligned async reader DiskANN already has) instead of
+      one pread at a time, and sweep rerank_m for recall.
+- [ ] **Posting-list rebuild.** With a large nlist, lists are short enough
+      to rebuild one at a time (copy, fold its delta, publish the list's
+      pointer, reclaim after a grace period) rather than folding the whole
+      index; decide the granularity after the nlist measurement. Fold `PostingListDelta` and `DynamicPQCodes`
       into fresh `PostingLists`/`PQMetadata` off to the side, publish with
       one atomic pointer store in `IVFPQSearchConfig`, reclaim the old
       structures after a grace period. Searches must run throughout; test
@@ -59,6 +169,13 @@ completes it, citing the commit subject.
       load through the heap's occupancy bitmap, `ivf_pq_recover_deletes`);
       the backend's inserted-tag maps must survive the fold or be persisted
       with it.
+- [ ] **One in-memory copy of the PQ codes.** Search reads the posting-order
+      `PostingLists::codes`; `PQMetadata::codes` (by id) is kept only for the
+      index-file writer and the tests' oracles, doubling the codes' memory
+      (32 B/vector at 32 chunks: +2.7 GB at 90M). Persist the codes in
+      posting order (bump the index version), drop the by-id copy after load,
+      and have the rebuild produce posting-order codes directly. Depends on
+      the rebuild above.
 
 ## Not planned
 

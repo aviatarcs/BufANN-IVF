@@ -1,6 +1,7 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT license.
 
+#include <algorithm>
 #include <limits>
 #include <malloc.h>
 #include <math_utils.h>
@@ -93,8 +94,10 @@ namespace math_utils {
                 (MKL_INT) dim, centers, (MKL_INT) dim, 1.0f, dist_matrix,
                 (MKL_INT) num_centers);
 
+    // Unchunked static schedule: a block may now be only a few thousand
+    // rows, and 8192-row chunks left most threads idle on its argmin.
     if (k == 1) {
-#pragma omp parallel for schedule(static, 8192)
+#pragma omp parallel for schedule(static)
       for (int64_t i = 0; i < (_s64) num_points; i++) {
         float  min = std::numeric_limits<float>::max();
         float* current = dist_matrix + (i * num_centers);
@@ -106,7 +109,7 @@ namespace math_utils {
         }
       }
     } else {
-#pragma omp parallel for schedule(static, 8192)
+#pragma omp parallel for schedule(static)
       for (int64_t i = 0; i < (_s64) num_points; i++) {
         std::priority_queue<PivotContainer> top_k_queue;
         float* current = dist_matrix + (i * num_centers);
@@ -125,6 +128,14 @@ namespace math_utils {
     delete[] ones_b;
   }
 
+  size_t closest_centers_block_rows(size_t num_points, size_t num_centers,
+                                    size_t max_matrix_bytes) {
+    const size_t fit =
+        max_matrix_bytes / (std::max<size_t>(num_centers, 1) * sizeof(float));
+    return std::max<size_t>(
+        1, std::min({(size_t) 1 << 23, num_points, fit}));
+  }
+
   // Given data in num_points * new_dim row major
   // Pivots stored in full_pivot_data as num_centers * new_dim row major
   // Calculate the k closest pivot for each point and store it in vector
@@ -139,7 +150,8 @@ namespace math_utils {
                                float* pivot_data, size_t num_centers, size_t k,
                                uint32_t*            closest_centers_ivf,
                                std::vector<size_t>* inverted_index,
-                               float*               pts_norms_squared) {
+                               float*               pts_norms_squared,
+                               size_t               max_matrix_bytes) {
     if (k > num_centers) {
       diskann::cout << "ERROR: k (" << k << ") > num_center(" << num_centers
                     << ")" << std::endl;
@@ -152,13 +164,9 @@ namespace math_utils {
     if (!is_norm_given_for_pts)
       pts_norms_squared = new float[num_points];
 
-    size_t PAR_BLOCK_SIZE = std::min((size_t) 1 << 23, num_points);
-    //	    (num_points > 1 << 20) ? 1 << 13 : (num_points / 16);
-
-    //	size_t PAR_BLOCK_SIZE = num_points;
-    size_t N_BLOCKS = (num_points % PAR_BLOCK_SIZE) == 0
-                          ? (num_points / PAR_BLOCK_SIZE)
-                          : (num_points / PAR_BLOCK_SIZE) + 1;
+    size_t PAR_BLOCK_SIZE =
+        closest_centers_block_rows(num_points, num_centers, max_matrix_bytes);
+    size_t N_BLOCKS = (num_points + PAR_BLOCK_SIZE - 1) / PAR_BLOCK_SIZE;
 
     if (!is_norm_given_for_pts)
       math_utils::compute_vecs_l2sq(pts_norms_squared, data, num_points, dim);
@@ -390,7 +398,7 @@ namespace kmeans {
   void kmeanspp_selecting_pivots(float* data, size_t num_points, size_t dim,
                                  float* pivot_data, size_t num_centers,
                                  uint32_t seed) {
-    if (num_points > 1 << 23) {
+    if (num_points > KMEANSPP_MAX_POINTS) {
       diskann::cout << "ERROR: n_pts " << num_points
                     << " currently not supported for k-means++, maximum is "
                        "8388608. Falling back to random pivot "

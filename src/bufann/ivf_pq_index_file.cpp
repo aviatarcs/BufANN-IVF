@@ -247,6 +247,7 @@ IVFPQIndex load_ivf_pq_index(const std::string& index_prefix) {
     index.heap_pages = uint32_t(h.raw_vectors_bytes / h.raw_vector_page_size);
     index.heap_next_slot = uint32_t(h.raw_vector_next_slot);
     require_consistent(index);
+    set_ivf_posting_codes(index);
 
     const std::string heap_path = ivf_raw_vectors_path(index_prefix);
     IVF_PQ_REQUIRE(file_exists(heap_path) && get_file_size(heap_path) == h.raw_vectors_bytes,

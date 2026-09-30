@@ -2,7 +2,8 @@
 // lookup over their posting lists -> exact re-rank of the top rerank_m from
 // the raw-vector heap. A batch computes every query's centroid distances
 // with one GEMM and then handles the queries in parallel; a single query is
-// a batch of one.
+// a batch of one. ivf_pq_search_graph instead finds the partitions through a
+// proximity graph over the centroids (ivf_pq_centroid_graph.h).
 
 #pragma once
 
@@ -10,6 +11,7 @@
 #include <vector>
 
 #include "bufann/ivf_pq.h"
+#include "bufann/ivf_pq_centroid_graph.h"
 #include "bufann/ivf_pq_raw_vector_heap.h"
 
 namespace diskann {
@@ -39,6 +41,7 @@ struct IVFPQSearchScratch {
     std::vector<float> exact_dist;      // parallel to shortlist
     std::vector<char> raw_vector;       // [heap elem_size]
     std::vector<float> vector;          // [dim]
+    IVFCentroidGraphScratch graph;      // ivf_pq_search_graph only
 };
 
 // T is the raw vector element type the heap holds (float, uint8_t, int8_t);
@@ -56,6 +59,18 @@ template<typename T>
 IVFPQSearchResult ivf_pq_search(const IVFPQIndex& index, const RawVectorHeap& heap, const float* query,
                                 uint32_t k, uint32_t nprobe, uint32_t rerank_m,
                                 IVFPQSearchScratch& scratch, const IVFPQDelta* delta = nullptr);
+
+// As ivf_pq_search, but the probed partitions are the nprobe nearest
+// centroids that a search of `graph` with a beam of centroid_L >= nprobe
+// finds (nprobe clamped to nlist), in place of the exact nearest nprobe from
+// a GEMV over every centroid. It visits a few hundred centroids instead of
+// all nlist, and may miss a partition the GEMV would probe. `graph` must be
+// built from index.meta; only its nlist is checked.
+template<typename T>
+IVFPQSearchResult ivf_pq_search_graph(const IVFPQIndex& index, const IVFCentroidGraph& graph,
+                                      const RawVectorHeap& heap, const float* query, uint32_t k, uint32_t nprobe,
+                                      uint32_t centroid_L, uint32_t rerank_m, IVFPQSearchScratch& scratch,
+                                      const IVFPQDelta* delta = nullptr);
 
 // Allocates a scratch per call; for one-off queries.
 template<typename T>
