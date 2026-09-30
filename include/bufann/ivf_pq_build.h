@@ -8,6 +8,7 @@
 #include <string>
 
 #include "bufann/ivf_pq.h"
+#include "bufann/ivf_pq_centroid_graph.h"
 #include "bufann/ivf_pq_raw_vector_heap.h"
 #include "defaults.h"
 
@@ -22,6 +23,15 @@ const uint32_t IVF_TRAIN_POINTS_PER_CENTROID = 64;
 // [points x centers] float distance matrix stays under the byte budget.
 const size_t IVF_ASSIGN_MAX_BLOCK_POINTS = size_t(1) << 20;
 const size_t IVF_ASSIGN_DIST_MATRIX_BYTES = size_t(256) << 20;
+
+// From this nlist on, the build assigns vectors through a centroid graph
+// with a beam of IVF_ASSIGN_GRAPH_L instead of the exact GEMM. Measured on
+// SIFT: the GEMM path costs ~15 ns per centroid per point per thread and
+// the graph ~245 us per point at L 64, so they cross near nlist 16K; at
+// 90M and nlist 131072 the graph puts 0.15% of vectors in a near but not
+// nearest list (0.71% at L 32, 0.03% at L 128) and takes ~8x less time.
+const uint32_t IVF_ASSIGN_GRAPH_MIN_NLIST = 32768;
+const uint32_t IVF_ASSIGN_GRAPH_L = 64;
 
 const uint32_t IVF_BULK_LOAD_PAGES_PER_FLUSH = 256;
 
@@ -61,11 +71,15 @@ IVFMetadata load_ivf_centroids(const std::string& index_prefix, uint32_t dim);
 // centroid and bulk-loads the raw vectors into `heap`, which must be freshly
 // opened with elem_size == meta.dim * sizeof(T). Vector i lands in flat slot
 // i; the RID table is materialized anyway because inserts later break that.
+// With `graph` (built from `meta`), each vector goes to the nearest centroid
+// a beam search of width graph_L finds, which is usually but not always the
+// nearest; without it, the exact nearest by GEMM.
 template<typename T>
 void assign_ivf_clusters(const std::string& data_bin, const IVFMetadata& meta,
                          RawVectorHeap& heap, ClusterAssignments& assignments,
                          RawVectorRIDTable& rid_table,
-                         size_t max_block_points = IVF_ASSIGN_MAX_BLOCK_POINTS);
+                         size_t max_block_points = IVF_ASSIGN_MAX_BLOCK_POINTS,
+                         const IVFCentroidGraph* graph = nullptr, uint32_t graph_L = IVF_ASSIGN_GRAPH_L);
 
 // [N x 1] uint32 bins.
 void save_ivf_cluster_assignments(const std::string& index_prefix,

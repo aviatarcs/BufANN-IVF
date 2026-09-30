@@ -1,7 +1,8 @@
 // Tests for the IVF-PQ build steps on a synthetic-blob base: centroid
 // training (shape, padding, blob recovery, seeding, save/load), cluster
 // assignment + raw-vector bulk load (exact nearest-centroid agreement,
-// RID/heap contents, multi-block streaming, sidecar round-trips, error paths),
+// RID/heap contents, multi-block streaming, sidecar round-trips, error paths;
+// through the centroid graph against brute force on 2048 centroids),
 // posting-list construction (exact inverse of the assignments), PQ (codes
 // are the nearest pivots; PQ distances rank blobs correctly), and the
 // combined index file (round-trip, atomic replace, corruption detection).
@@ -242,6 +243,81 @@ bool test_assign_clusters_and_load_heap(const std::string& tag, const std::strin
     ::unlink(heap_path.c_str());
     ::unlink(ivf_cluster_ids_path(prefix).c_str());
     ::unlink(ivf_rid_table_path(prefix).c_str());
+    return t.done();
+}
+
+// Assignment through the centroid graph, on enough centroids (2048, drawn
+// as blobs rather than trained) for the graph to matter. A beam of nlist
+// must give the brute-force nearest centroid, a narrow beam a near one
+// almost always; the heap and RIDs must be the GEMM path's, byte for byte.
+bool test_graph_assignment(const std::string& prefix) {
+    TestCase t("assignment through the centroid graph: exact at a full beam, near at a narrow one");
+    const uint32_t nlist = 2048, dim = 20, n = 20000;
+    IVFMetadata meta;
+    meta.nlist = nlist, meta.dim = dim, meta.aligned_dim = 24;
+    const std::vector<float> centres = draw_blobs<float>(nlist, 3, dim, 64);
+    meta.centroids.assign(size_t(nlist) * meta.aligned_dim, 0.0f);
+    for (uint32_t c = 0; c < nlist; ++c) {
+        std::copy_n(centres.begin() + size_t(c) * dim, dim, meta.centroids.begin() + size_t(c) * meta.aligned_dim);
+    }
+    set_ivf_centroid_norms(meta);
+    const std::vector<float> base = draw_blobs<float>(n, 4, dim, 64);
+    const std::string base_bin = prefix + "_graph_base.bin", heap_path = ivf_raw_vectors_path(prefix) + ".graph";
+    diskann::save_bin<float>(base_bin, const_cast<float*>(base.data()), n, dim);
+    const IVFCentroidGraph graph = build_ivf_centroid_graph(meta);
+
+    auto assign = [&](const IVFCentroidGraph* g, uint32_t L, ClusterAssignments& a, RawVectorRIDTable& r,
+                      std::vector<char>& heap_bytes) {
+        ::unlink(heap_path.c_str());
+        RawVectorHeap heap;
+        heap.open(heap_path, compute_raw_vector_heap_layout(4096, dim * sizeof(float)));
+        assign_ivf_clusters<float>(base_bin, meta, heap, a, r, 777, g, L);
+        heap.close();
+        std::ifstream in(heap_path, std::ios::binary);
+        heap_bytes.assign(std::istreambuf_iterator<char>(in), {});
+    };
+    ClusterAssignments exact, full, narrow;
+    RawVectorRIDTable exact_rid, full_rid, narrow_rid;
+    std::vector<char> exact_heap, full_heap, narrow_heap;
+    assign(nullptr, 0, exact, exact_rid, exact_heap);
+    assign(&graph, nlist, full, full_rid, full_heap);
+    assign(&graph, 8, narrow, narrow_rid, narrow_heap);
+
+    size_t full_off = 0, narrow_farther = 0;
+    for (uint32_t i = 0; i < n; ++i) {
+        const float* p = base.data() + size_t(i) * dim;
+        const float best = dist_to_centroid(p, meta, nearest_centroid(p, meta));
+        full_off += !close(dist_to_centroid(p, meta, full.cluster_id[i]), best);
+        narrow_farther += narrow.cluster_id[i] >= nlist || !close(dist_to_centroid(p, meta, narrow.cluster_id[i]), best);
+    }
+    t.check(full_off == 0, std::to_string(full_off) + " vectors not at the nearest centroid with a beam of nlist");
+    std::cout << "  beam 8: " << narrow_farther << " of " << n << " vectors at a farther centroid" << std::endl;
+    t.check(narrow_farther < n / 100, "beam 8 put " + std::to_string(narrow_farther) + " vectors off the nearest");
+    t.check(narrow_farther > 0, "beam 8 found every nearest centroid; the narrow case tests nothing");
+    auto same_rids = [](const RawVectorRIDTable& a, const RawVectorRIDTable& b) {
+        return a.rid.size() == b.rid.size() && std::equal(a.rid.begin(), a.rid.end(), b.rid.begin(),
+                                                          [](RawVectorRID x, RawVectorRID y) { return x.packed == y.packed; });
+    };
+    t.check(full_heap == exact_heap && narrow_heap == exact_heap, "heap file differs from the GEMM path's");
+    t.check(same_rids(full_rid, exact_rid) && same_rids(narrow_rid, exact_rid), "RID table differs from the GEMM path's");
+
+    auto rejects = [&](const std::string& what, const IVFCentroidGraph& g, uint32_t L) {
+        t.expect_throw(what, [&] {
+            ClusterAssignments a;
+            RawVectorRIDTable r;
+            std::vector<char> bytes;
+            assign(&g, L, a, r, bytes);
+        });
+    };
+    rejects("graph_L == 0", graph, 0);
+    IVFCentroidGraph other = graph;
+    other.nlist -= 1;
+    rejects("graph for another nlist", other, 16);
+    IVFCentroidGraph short_table = graph;
+    short_table.neighbors.pop_back();
+    rejects("graph neighbour table short by one", short_table, 16);
+    ::unlink(heap_path.c_str());
+    ::unlink(base_bin.c_str());
     return t.done();
 }
 
@@ -718,6 +794,7 @@ int main() {
         all_pass &= test_training_error_paths(base_f32);
         all_pass &= test_assign_clusters_and_load_heap<float>("float", prefix, base_f32, data_f32, meta);
         all_pass &= test_assignment_error_paths(prefix, base_f32, meta);
+        all_pass &= test_graph_assignment(prefix);
         all_pass &= test_posting_lists_invert_assignments(prefix);
         all_pass &= test_posting_codes_follow_lists();
         all_pass &= test_closest_centers_blocking();

@@ -206,9 +206,16 @@ IVFMetadata load_ivf_centroids(const std::string& index_prefix, uint32_t dim) {
 template<typename T>
 void assign_ivf_clusters(const std::string& data_bin, const IVFMetadata& meta,
                          RawVectorHeap& heap, ClusterAssignments& assignments,
-                         RawVectorRIDTable& rid_table, size_t max_block_points) {
+                         RawVectorRIDTable& rid_table, size_t max_block_points,
+                         const IVFCentroidGraph* graph, uint32_t graph_L) {
     IVF_PQ_REQUIRE(max_block_points > 0, "max_block_points must be greater than zero");
     require_valid(meta);
+    // Checked here, not left to the search: a throw inside the OpenMP loop
+    // below would terminate the process.
+    IVF_PQ_REQUIRE(graph == nullptr || (graph_L > 0 && graph->nlist == meta.nlist && graph->degree > 0 &&
+                                        graph->entry < graph->nlist &&
+                                        graph->neighbors.size() == size_t(graph->nlist) * graph->degree),
+                   "assignment graph must match the centroids' nlist, with graph_L > 0");
     size_t npts = 0, file_dim = 0;
     get_bin_metadata(data_bin, npts, file_dim);
     IVF_PQ_REQUIRE(file_dim == meta.dim, "base file dimensionality does not match the centroids");
@@ -223,7 +230,8 @@ void assign_ivf_clusters(const std::string& data_bin, const IVFMetadata& meta,
     std::vector<float> centroids(size_t(meta.nlist) * dim);
     copy_rows(meta.centroids.data(), meta.aligned_dim, centroids.data(), dim, meta.nlist, dim);
 
-    size_t block_size = streaming_block_size(npts, meta.nlist, max_block_points);
+    size_t block_size = graph != nullptr ? std::max<size_t>(1, std::min(max_block_points, npts))
+                                         : streaming_block_size(npts, meta.nlist, max_block_points);
     std::vector<T> block(block_size * dim);
     std::vector<float> block_float(block_size * dim);
     std::vector<uint32_t> block_closest(block_size);
@@ -232,16 +240,32 @@ void assign_ivf_clusters(const std::string& data_bin, const IVFMetadata& meta,
     rid_table.rid.resize(npts);
     RawVectorHeapBulkWriter writer(heap, IVF_BULK_LOAD_PAGES_PER_FLUSH);
 
-    diskann::cout << "Assigning " << npts << " vectors to " << meta.nlist
-                  << " IVF centroids in blocks of " << block_size << std::endl;
+    diskann::cout << "Assigning " << npts << " vectors to " << meta.nlist << " IVF centroids in blocks of "
+                  << block_size << (graph != nullptr ? " through the centroid graph, beam " + std::to_string(graph_L)
+                                                     : std::string(" by GEMM"))
+                  << std::endl;
 
     cached_ifstream reader(data_bin, BASE_FILE_READ_CACHE_BYTES, BIN_FILE_HEADER_BYTES);
     for (size_t start = 0; start < npts; start += block_size) {
         size_t cur = std::min(block_size, npts - start);
         reader.read(reinterpret_cast<char*>(block.data()), cur * elem_size);
         diskann::convert_types<T, float>(block.data(), block_float.data(), cur, dim);
-        math_utils::compute_closest_centers(block_float.data(), cur, dim, centroids.data(),
-                                            meta.nlist, 1, block_closest.data());
+        if (graph != nullptr) {
+#pragma omp parallel
+            {
+                IVFCentroidGraphScratch scratch;
+                std::vector<uint32_t> nearest;
+#pragma omp for schedule(dynamic, 256)
+                for (int64_t i = 0; i < int64_t(cur); ++i) {
+                    search_ivf_centroid_graph(meta, *graph, block_float.data() + size_t(i) * dim, graph_L, 1,
+                                              scratch, nearest);
+                    block_closest[size_t(i)] = nearest[0];
+                }
+            }
+        } else {
+            math_utils::compute_closest_centers(block_float.data(), cur, dim, centroids.data(), meta.nlist, 1,
+                                                block_closest.data());
+        }
         std::copy_n(block_closest.data(), cur, assignments.cluster_id.begin() + start);
 
         for (size_t i = 0; i < cur; ++i) {
@@ -430,11 +454,14 @@ template IVFMetadata train_ivf_centroids<int8_t>(const std::string&, uint32_t, d
                                                  std::optional<uint32_t>);
 
 template void assign_ivf_clusters<float>(const std::string&, const IVFMetadata&, RawVectorHeap&,
-                                         ClusterAssignments&, RawVectorRIDTable&, size_t);
+                                         ClusterAssignments&, RawVectorRIDTable&, size_t,
+                                         const IVFCentroidGraph*, uint32_t);
 template void assign_ivf_clusters<uint8_t>(const std::string&, const IVFMetadata&, RawVectorHeap&,
-                                           ClusterAssignments&, RawVectorRIDTable&, size_t);
+                                           ClusterAssignments&, RawVectorRIDTable&, size_t,
+                                           const IVFCentroidGraph*, uint32_t);
 template void assign_ivf_clusters<int8_t>(const std::string&, const IVFMetadata&, RawVectorHeap&,
-                                          ClusterAssignments&, RawVectorRIDTable&, size_t);
+                                          ClusterAssignments&, RawVectorRIDTable&, size_t,
+                                          const IVFCentroidGraph*, uint32_t);
 
 template void train_ivf_pq_pivots<float>(const std::string&, const std::string&, uint32_t, double,
                                          uint32_t, std::optional<uint32_t>);

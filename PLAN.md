@@ -151,6 +151,9 @@ completes it, citing the commit subject.
       matching the 5 h 23 min measured. Order: final assignment through
       the graph (largest at 90M, and exact-checkable), then Lloyd's, then
       k-means++ (parallel sums, or seeding from a subsample).
+      Final assignment through the graph: done in "Assign vectors through
+      the centroid graph from nlist 32768 on" (138 -> 35 s at 9M/32768,
+      recall within 0.02 points; ~8x at 90M/131072 by extrapolation).
 - [ ] **nlist cost model.** For 90M+, where one build takes 41 min: sample
       m vectors, cluster them at each candidate nlist, take ~100 sample
       queries with exact neighbours within the sample, estimate nprobe as

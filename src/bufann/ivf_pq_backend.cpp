@@ -64,7 +64,12 @@ std::unique_ptr<IVFPQBackend> ivf_pq_backend_build(const std::string& data_bin, 
     {
         RawVectorHeap heap;
         heap.open(ivf_raw_vectors_path(index_prefix), ix.heap_layout);
-        assign_ivf_clusters<T>(data_bin, ix.meta, heap, ix.assignments, ix.rid_table);
+        // The graph is rebuilt, not kept: search does not use it yet.
+        IVFCentroidGraph graph;
+        const bool use_graph = config.ivf_nlist >= IVF_ASSIGN_GRAPH_MIN_NLIST;
+        if (use_graph) graph = build_ivf_centroid_graph(ix.meta);
+        assign_ivf_clusters<T>(data_bin, ix.meta, heap, ix.assignments, ix.rid_table, IVF_ASSIGN_MAX_BLOCK_POINTS,
+                               use_graph ? &graph : nullptr);
         ix.heap_pages = heap.allocated_pages();
         ix.heap_next_slot = heap.next_flat_slot();
     }
