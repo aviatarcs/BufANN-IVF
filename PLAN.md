@@ -185,6 +185,20 @@ completes it, citing the commit subject.
       pool size and miss accounting, then compare at 9M and 90M. This is
       what makes the IVF-PQ vs BufANN numbers like for like; it subsumes
       the cold-heap item's bench mode below.
+      Serving is done ("Let the raw-vector heap serve its pages through
+      BufANN's buffer pool", "Re-rank from one batched heap read ..."):
+      `ivf_pq_query_bench --buffer_pool_frames` (default 262144, BufANN's
+      1 GB; 0 = page cache) reports hits, misses/query and I/O time under
+      bufann_driver's field names, and a query's re-rank pages are fetched
+      with one pin_batch. Still open: the 9M and 90M comparison on a quiet
+      node. Two things to settle first. (1) The budget: 1 GB is 87% of
+      the 9M heap (300000 pages) but ~28% of BufANN's 9M graph, and
+      IVF-PQ's in-memory part (codes twice, lists) is ~720 MB at 9M, so
+      compare at equal total RSS as well as equal pool size. (2) Warmup:
+      a 4-thread smoke run with a 1000-query warmup showed 22.2 / 13.5
+      misses/query at nprobe 16 / 64 (recall unchanged at 88.248 /
+      97.987), mostly first touches, so both systems should use the same
+      warmup (or preload) before misses are compared.
 - [ ] **Re-rank reads under a cold heap.** The bench reads the heap through
       a warm page cache, while BufANN's numbers pay ~75 buffer-pool misses
       per query; the re-rank's up to rerank_m (100) random reads are our
