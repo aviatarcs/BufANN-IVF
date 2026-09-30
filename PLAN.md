@@ -199,6 +199,22 @@ completes it, citing the commit subject.
       misses/query at nprobe 16 / 64 (recall unchanged at 88.248 /
       97.987), mostly first touches, so both systems should use the same
       warmup (or preload) before misses are compared.
+      9M, done on a quiet node: both through the pool (O_DIRECT) on the
+      same volume (/tmpdata; /var/tmp is the SATA system disk, which
+      capped IVF-PQ at ~95K reads/s in a first run), the same 1000-row
+      base-sampled warmup file, one process per setting, 32 threads,
+      10K queries. IVF-PQ nlist 65536, graph beam 2 x nprobe, rerank 100.
+      Best q/s at recall >= 90 / 95 / 98 / 99 / 99.5:
+      BufANN (1 GB pool, RSS ~1590 MB) 11513 / 6827 / 5338 / 3088 / 2360;
+      IVF-PQ, 1 GB pool (RSS 1.9-2.1 GB) 12724 / 9545 / 5819 / 4654 / 3300;
+      IVF-PQ, 160000 frames (RSS 1.47-1.68 GB) 9775 / 8384 / 5473 / 4417 /
+      3214. IVF-PQ misses a constant 23.4 (47.5) pages per query, BufANN
+      23 to 143 growing with L; IVF-PQ's I/O share falls from ~50-80% at
+      low nprobe to 4-6% at nprobe 768, where the PQ scan is the cost.
+      Logs: `/var/tmp/bufann-ivf-evpeng/cmp10m/` (bufann_L*, nvme_ivf_*).
+      One run in ~40 aborted on an ANNException thrown inside the search's
+      OpenMP loop (160000 frames, nprobe 128); reruns passed. Still open:
+      that abort, and 90M.
 - [ ] **Re-rank reads under a cold heap.** The bench reads the heap through
       a warm page cache, while BufANN's numbers pay ~75 buffer-pool misses
       per query; the re-rank's up to rerank_m (100) random reads are our
