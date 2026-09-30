@@ -124,6 +124,13 @@ completes it, citing the commit subject.
       65536 and 131072 (~20 sqrt(N) is 60K) with nprobes between the
       powers of two, and at 90M; build time (59 min at 65536) is then
       the cost, so this and the build-time item inform each other.
+      First points, beam 2 x nprobe, best q/s at recall >= 95 / 98 / 99
+      (nprobe): 9M at 65536 10773 (192) / 6209 (384) / 4871 (512), ahead
+      of 32768's 10472 / 6001 / 4231 everywhere; 90M at 16384 1919 (48) /
+      763 (128) / 518 (192); 90M at 131072 (built in 5 h 23 min, peak RSS
+      12.5 GB) 3042 (192) / 1637 (384) / 869 (768). At 90M the scan is the
+      cost: recall 99 scans ~530K codes per query (768 lists of ~690)
+      against ~70K at 9M. Logs: `/var/tmp/bufann-ivf-evpeng/final/`.
 - [ ] **Build time at large nlist.** Assignment of 9M to 32K centroids took
       378 s, ~200 GFLOP/s against a ~1.2 TFLOP/s peak; find where it goes
       before changing the algorithm. Then, if still needed, assign through
