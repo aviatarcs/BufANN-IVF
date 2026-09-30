@@ -321,6 +321,87 @@ bool test_graph_assignment(const std::string& prefix) {
     return t.done();
 }
 
+// Graph Lloyd's from fixed initial centres. A beam of nlist makes every
+// assignment exact, so one iteration must give the centres a brute-force
+// iteration in the test does. Over several iterations it is compared with
+// upstream's kmeans::run_lloyds by the sum of squared distances, for a full
+// and a narrow beam: upstream's GEMM expansion breaks near-ties within a few
+// ulps of the norms differently, and it zeroes empty clusters, so the
+// centres themselves drift apart. The returned
+// residual is over assigned, not nearest, centres, so it bounds the
+// recomputed one from above.
+bool test_graph_lloyds() {
+    TestCase t("graph Lloyd's: a brute-force iteration at a full beam, near exact Lloyd's error at a narrow one");
+    const uint32_t nlist = 512, dim = 20, reps = 8;
+    const size_t n = 40000;
+    std::vector<float> data = draw_blobs<float>(uint32_t(n), 5, dim, 64);
+    std::vector<float> init(data.begin(), data.begin() + size_t(nlist) * dim);
+    auto sse = [&](const std::vector<float>& centers) {
+        double s = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            float best = std::numeric_limits<float>::max();
+            for (uint32_t c = 0; c < nlist; ++c) best = std::min(best, sq_dist(data.data() + i * dim, centers.data() + size_t(c) * dim, dim));
+            s += best;
+        }
+        return s;
+    };
+    // One iteration by brute force: nearest centre by direct squared
+    // distance, then the mean in double (independent of the code under test).
+    std::vector<float> want1(init.size(), 0.0f), full1 = init;
+    {
+        std::vector<double> sum(init.size(), 0.0);
+        std::vector<size_t> count(nlist, 0);
+        for (size_t i = 0; i < n; ++i) {
+            std::vector<float> d(nlist);
+            for (uint32_t c = 0; c < nlist; ++c) d[c] = sq_dist(data.data() + i * dim, init.data() + size_t(c) * dim, dim);
+            const uint32_t best = top_k(d, 1)[0];
+            ++count[best];
+            for (uint32_t k = 0; k < dim; ++k) sum[size_t(best) * dim + k] += data[i * dim + k];
+        }
+        for (uint32_t c = 0; c < nlist; ++c) {
+            for (uint32_t k = 0; k < dim; ++k) {
+                want1[size_t(c) * dim + k] = count[c] ? float(sum[size_t(c) * dim + k] / double(count[c])) : init[size_t(c) * dim + k];
+            }
+        }
+    }
+    run_ivf_graph_lloyds(data.data(), n, dim, full1.data(), nlist, 1, nlist);
+    size_t differ = 0;
+    for (size_t i = 0; i < want1.size(); ++i) {
+        differ += std::fabs(want1[i] - full1[i]) > 1e-3f * (1.0f + std::fabs(want1[i]));
+    }
+    t.check(differ == 0, std::to_string(differ) + " centre coordinates differ from one brute-force Lloyd's iteration");
+
+    std::vector<float> exact = init, full = init, narrow = init;
+    kmeans::run_lloyds(data.data(), n, dim, exact.data(), nlist, reps, NULL, NULL);
+    run_ivf_graph_lloyds(data.data(), n, dim, full.data(), nlist, reps, nlist);
+    const float narrow_residual = run_ivf_graph_lloyds(data.data(), n, dim, narrow.data(), nlist, reps, 8);
+    const double e = sse(exact), f = sse(full), w = sse(narrow), i0 = sse(init);
+    std::cout << "  sum of squared distances: initial " << i0 << ", exact " << e << ", beam nlist " << f
+              << ", beam 8 " << w << std::endl;
+    t.check(f <= 1.001 * e && w <= 1.01 * e, "graph Lloyd's is worse than exact Lloyd's beyond tolerance");
+    t.check(e < 0.9 * i0, "Lloyd's barely improved on the initial centres; the comparison tests nothing");
+    t.check(w <= narrow_residual * (1.0 + 1e-5), "returned residual is below the nearest-centre error");
+    t.expect_throw("L == 0", [&] { run_ivf_graph_lloyds(data.data(), n, dim, narrow.data(), nlist, reps, 0); });
+
+    // Two identical initial centres: ties go to one, so the other's cluster
+    // is empty and it must keep its centre, not become NaN or zero. Compared
+    // bit for bit: under -Ofast a NaN compares equal to anything and
+    // std::isfinite is folded to true.
+    std::vector<float> dup = init;
+    std::copy_n(dup.begin(), dim, dup.begin() + dim);
+    run_ivf_graph_lloyds(data.data(), n, dim, dup.data(), nlist, 1, nlist);
+    const size_t row_bytes = dim * sizeof(float);
+    const bool kept = std::memcmp(dup.data() + dim, init.data(), row_bytes) == 0 ||
+                      std::memcmp(dup.data(), init.data(), row_bytes) == 0;
+    const bool finite = std::all_of(dup.begin(), dup.end(), [](float v) {
+        uint32_t bits;
+        std::memcpy(&bits, &v, sizeof(bits));
+        return ((bits >> 23) & 0xFFu) != 0xFFu;
+    });
+    t.check(kept && finite, "an empty cluster's centre was not kept");
+    return t.done();
+}
+
 bool test_assignment_error_paths(const std::string& prefix, const std::string& base_bin,
                                  const IVFMetadata& meta) {
     TestCase t("assignment rejects mismatched heap/base, used heap, zero block, bad metadata");
@@ -795,6 +876,7 @@ int main() {
         all_pass &= test_assign_clusters_and_load_heap<float>("float", prefix, base_f32, data_f32, meta);
         all_pass &= test_assignment_error_paths(prefix, base_f32, meta);
         all_pass &= test_graph_assignment(prefix);
+        all_pass &= test_graph_lloyds();
         all_pass &= test_posting_lists_invert_assignments(prefix);
         all_pass &= test_posting_codes_follow_lists();
         all_pass &= test_closest_centers_blocking();

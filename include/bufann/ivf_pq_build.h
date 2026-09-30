@@ -32,6 +32,9 @@ const size_t IVF_ASSIGN_DIST_MATRIX_BYTES = size_t(256) << 20;
 // nearest list (0.71% at L 32, 0.03% at L 128) and takes ~8x less time.
 const uint32_t IVF_ASSIGN_GRAPH_MIN_NLIST = 32768;
 const uint32_t IVF_ASSIGN_GRAPH_L = 64;
+// Lloyd's iterations from that nlist on go through the graph too; each
+// point's beam starts at its previous centre, so it can be narrower.
+const uint32_t IVF_LLOYDS_GRAPH_L = 32;
 
 const uint32_t IVF_BULK_LOAD_PAGES_PER_FLUSH = 256;
 
@@ -57,6 +60,16 @@ IVFMetadata train_ivf_centroids(const std::string& data_bin,
                                 double sampling_rate = 0.0,
                                 uint32_t max_kmeans_reps = NUM_K_MEANS_ITERS,
                                 std::optional<uint32_t> seed = std::nullopt);
+
+// Lloyd's iterations over `data` ([n x dim]) from the `nlist` centres in
+// `centers` ([nlist x dim], updated in place), with kmeans::run_lloyds'
+// stopping rule, but each point's nearest centre is the one a beam search of
+// width L finds in a graph over the current centres (rebuilt every
+// iteration), started from the point's previous centre. An empty cluster
+// keeps its centre. Returns the final sum of squared distances from each
+// point to its assigned centre.
+float run_ivf_graph_lloyds(const float* data, size_t n, uint32_t dim, float* centers, uint32_t nlist,
+                           uint32_t max_reps, uint32_t L);
 
 // Fills meta.centroid_l2sq from meta.centroids. Every producer of an
 // IVFMetadata calls this; search relies on the norms matching the centroids.

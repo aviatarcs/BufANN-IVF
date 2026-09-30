@@ -154,6 +154,10 @@ completes it, citing the commit subject.
       Final assignment through the graph: done in "Assign vectors through
       the centroid graph from nlist 32768 on" (138 -> 35 s at 9M/32768,
       recall within 0.02 points; ~8x at 90M/131072 by extrapolation).
+      Lloyd's through the graph: done in "Run Lloyd's iterations through
+      the centroid graph from nlist 32768 on" (2.1M x 32768 from the same
+      init: 429 s -> 60 s, mean squared distance +0.006%; the 9M build
+      16:36 -> 8:31, recall within 0.1 points).
 - [ ] **nlist cost model.** For 90M+, where one build takes 41 min: sample
       m vectors, cluster them at each candidate nlist, take ~100 sample
       queries with exact neighbours within the sample, estimate nprobe as

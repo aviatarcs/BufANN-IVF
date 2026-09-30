@@ -177,17 +177,19 @@ IVFCentroidGraph build_ivf_centroid_graph(const IVFMetadata& meta, const IVFCent
 
 void search_ivf_centroid_graph(const IVFMetadata& meta, const IVFCentroidGraph& graph, const float* query,
                                uint32_t L, uint32_t n, IVFCentroidGraphScratch& scratch,
-                               std::vector<uint32_t>& out) {
+                               std::vector<uint32_t>& out, uint32_t start) {
     IVF_PQ_REQUIRE(graph.nlist == meta.nlist && graph.degree > 0 && graph.entry < graph.nlist &&
                        graph.neighbors.size() == size_t(graph.nlist) * graph.degree,
                    "centroid graph does not match the index's nlist");
     IVF_PQ_REQUIRE(n > 0 && L >= n, "centroid graph search needs 0 < n <= L");
+    IVF_PQ_REQUIRE(start == IVF_CENTROID_GRAPH_NONE || start < graph.nlist, "search start is not a centroid");
     const uint32_t* all = graph.neighbors.data();
     auto neighbors_of = [&](uint32_t c, std::vector<uint32_t>& nbrs) {
         const uint32_t* list = all + size_t(c) * graph.degree;
         nbrs.assign(list, std::find(list, list + graph.degree, IVF_CENTROID_GRAPH_NONE));
     };
-    beam_search(meta, graph.entry, query, L, scratch, neighbors_of, nullptr);
+    beam_search(meta, start == IVF_CENTROID_GRAPH_NONE ? graph.entry : start, query, L, scratch, neighbors_of,
+                nullptr);
     out.clear();
     for (size_t i = 0; i < scratch.beam.size() && out.size() < n; ++i) out.push_back(scratch.beam[i].id);
 }
