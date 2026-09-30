@@ -75,6 +75,10 @@ namespace math_utils {
 }  // namespace math_utils
 
 namespace kmeans {
+  // kmeanspp_selecting_pivots falls back to random pivots above this many
+  // points.
+  const size_t KMEANSPP_MAX_POINTS = size_t(1) << 23;
+
 
   // run Lloyds one iteration
   // Given data in row major num_points * dim, and centers in row major

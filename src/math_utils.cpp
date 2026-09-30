@@ -398,7 +398,7 @@ namespace kmeans {
   void kmeanspp_selecting_pivots(float* data, size_t num_points, size_t dim,
                                  float* pivot_data, size_t num_centers,
                                  uint32_t seed) {
-    if (num_points > 1 << 23) {
+    if (num_points > KMEANSPP_MAX_POINTS) {
       diskann::cout << "ERROR: n_pts " << num_points
                     << " currently not supported for k-means++, maximum is "
                        "8388608. Falling back to random pivot "

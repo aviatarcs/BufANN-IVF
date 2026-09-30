@@ -146,8 +146,22 @@ IVFMetadata train_ivf_centroids(const std::string& data_bin, uint32_t nlist,
                   << " sampled points (dim " << dim << ")" << std::endl;
 
     std::vector<float> centers(size_t(nlist) * dim);
-    kmeans::kmeanspp_selecting_pivots(train_data.data(), num_train, dim, centers.data(), nlist,
-                                      rng_seed);
+    if (num_train <= kmeans::KMEANSPP_MAX_POINTS) {
+        kmeans::kmeanspp_selecting_pivots(train_data.data(), num_train, dim, centers.data(), nlist,
+                                          rng_seed);
+    } else {
+        // At nlist >= 2^23 / IVF_TRAIN_POINTS_PER_CENTROID (131072) the sample
+        // outgrows k-means++, which would fall back to random pivots. Seed
+        // from every stride-th row instead, so the seeds span the whole
+        // sample (it is in file order); Lloyd's still runs on all of it.
+        const size_t stride = (num_train + kmeans::KMEANSPP_MAX_POINTS - 1) / kmeans::KMEANSPP_MAX_POINTS;
+        const size_t seed_rows = (num_train + stride - 1) / stride;
+        std::vector<float> seed_data(seed_rows * dim);
+        for (size_t r = 0; r < seed_rows; ++r) {
+            std::copy_n(train_data.begin() + r * stride * dim, dim, seed_data.begin() + r * dim);
+        }
+        kmeans::kmeanspp_selecting_pivots(seed_data.data(), seed_rows, dim, centers.data(), nlist, rng_seed);
+    }
     kmeans::run_lloyds(train_data.data(), num_train, dim, centers.data(), nlist, max_kmeans_reps,
                        NULL, NULL);
 
