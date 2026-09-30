@@ -321,6 +321,53 @@ bool test_graph_assignment(const std::string& prefix) {
     return t.done();
 }
 
+// k-means++ against a serial reference written here: the same generator
+// draws (initial point, then one dart per pick), a full prefix-sum scan per
+// dart, and the same retry on an already picked point. The pivots must be
+// the same points, across several of the implementation's 8192-point blocks.
+bool test_kmeanspp_matches_reference() {
+    TestCase t("k-means++ picks the same pivots as a serial reference");
+    const uint32_t dim = 12, centers = 300;
+    const size_t n = 30000;  // four blocks, the last partial
+    std::vector<float> data = draw_blobs<float>(uint32_t(n), 9, dim, 40);
+    std::vector<float> got(size_t(centers) * dim);
+    kmeans::kmeanspp_selecting_pivots(data.data(), n, dim, got.data(), centers, 17);
+
+    std::vector<float> want(size_t(centers) * dim);
+    std::mt19937 gen(17);
+    std::uniform_real_distribution<> unit(0, 1);
+    std::uniform_int_distribution<size_t> first(0, n - 1);
+    std::vector<size_t> picked{first(gen)};
+    std::vector<double> d(n);
+    for (size_t i = 0; i < n; ++i) d[i] = sq_dist(data.data() + i * dim, data.data() + picked[0] * dim, dim);
+    while (picked.size() < centers) {
+        double dart = unit(gen), sum = 0;
+        for (double v : d) sum += v;
+        dart *= sum;
+        size_t pick = n - 1;
+        double prefix = 0;
+        for (size_t i = 0; i < n; ++i) {
+            if (dart >= prefix && dart < prefix + d[i]) {
+                pick = i;
+                break;
+            }
+            prefix += d[i];
+        }
+        if (std::find(picked.begin(), picked.end(), pick) != picked.end()) continue;
+        picked.push_back(pick);
+        for (size_t i = 0; i < n; ++i) {
+            d[i] = std::min(d[i], double(sq_dist(data.data() + i * dim, data.data() + pick * dim, dim)));
+        }
+    }
+    for (uint32_t c = 0; c < centers; ++c) std::copy_n(data.begin() + picked[c] * dim, dim, want.begin() + size_t(c) * dim);
+    size_t differ = 0;
+    for (uint32_t c = 0; c < centers; ++c) {
+        differ += std::memcmp(got.data() + size_t(c) * dim, want.data() + size_t(c) * dim, dim * sizeof(float)) != 0;
+    }
+    t.check(differ == 0, std::to_string(differ) + " of " + std::to_string(centers) + " pivots differ from the reference");
+    return t.done();
+}
+
 // Graph Lloyd's from fixed initial centres. A beam of nlist makes every
 // assignment exact, so one iteration must give the centres a brute-force
 // iteration in the test does. Over several iterations it is compared with
@@ -877,6 +924,7 @@ int main() {
         all_pass &= test_assignment_error_paths(prefix, base_f32, meta);
         all_pass &= test_graph_assignment(prefix);
         all_pass &= test_graph_lloyds();
+        all_pass &= test_kmeanspp_matches_reference();
         all_pass &= test_posting_lists_invert_assignments(prefix);
         all_pass &= test_posting_codes_follow_lists();
         all_pass &= test_closest_centers_blocking();
