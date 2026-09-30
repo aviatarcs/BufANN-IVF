@@ -922,6 +922,78 @@ bool test_buffer_pool_evicts_and_writes_back() {
     return t.done();
 }
 
+// 32 threads batch-read random slots through a pool smaller than the heap,
+// so pages are loaded, hit and evicted under one another. BufferPool once let
+// pin_batch keep a pin on a frame an evictor had just claimed: the batch then
+// got another page's bytes (caught by the page header check, 4 runs in 5) or
+// deadlocked against the evictor waiting for its pin to drain. A watchdog
+// fails the test rather than let a deadlock hang the suite.
+bool test_buffer_pool_concurrent_batches_under_eviction() {
+    TestCase t("32 threads batch-reading through a pool of 16384 frames over 20000 pages get only their own pages");
+    std::string path = temp_path("ivf_heap_pool_stress");
+    RawVectorHeapLayout layout = compute_raw_vector_heap_layout(PAGE, 128);
+    const uint32_t pages = 20000, n = pages * layout.slots_per_page;
+    ::unlink(path.c_str());
+    {
+        RawVectorHeap heap;
+        heap.open(path, layout);
+        RawVectorHeapBulkWriter writer(heap, 256);
+        std::vector<char> v(128, 0);
+        for (uint32_t i = 0; i < n; ++i) {
+            std::memcpy(v.data(), &i, 4);
+            writer.append(i, v.data());
+        }
+        writer.finish();
+    }
+    RawVectorHeap heap;
+    heap.open_existing(path, layout, n, pages, RawVectorHeapCache{16384, nullptr});
+
+    std::atomic<bool> stop{false}, finished{false};
+    std::atomic<uint64_t> batches{0}, wrong{0}, thrown{0};
+    std::thread watchdog([&] {
+        for (int i = 0; i < 600 && !finished.load(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        if (!finished.load()) {
+            std::cout << "  FAIL: batch readers still running 55 s after being stopped (deadlock)" << std::endl;
+            std::_Exit(1);
+        }
+    });
+    std::vector<std::thread> readers;
+    for (uint32_t r = 0; r < 32; ++r) {
+        readers.emplace_back([&, r] {
+            std::mt19937 rng(r);
+            std::vector<uint32_t> slots(100), owners(100);
+            std::vector<char> out(100 * 128);
+            while (!stop.load()) {
+                for (uint32_t& s : slots) s = rng() % n;
+                try {
+                    heap.read_vectors(slots.data(), slots.size(), out.data(), owners.data());
+                } catch (const diskann::ANNException&) {
+                    thrown.fetch_add(1);
+                    continue;
+                }
+                for (size_t i = 0; i < slots.size(); ++i) {
+                    uint32_t id;
+                    std::memcpy(&id, out.data() + i * 128, 4);
+                    wrong += owners[i] != slots[i] || id != slots[i];
+                }
+                batches.fetch_add(1);
+            }
+        });
+    }
+    std::this_thread::sleep_for(std::chrono::seconds(5));
+    stop.store(true);
+    for (auto& th : readers) th.join();
+    finished.store(true);
+    watchdog.join();
+
+    t.check(thrown.load() == 0, std::to_string(thrown.load()) + " batches were handed another page");
+    t.check(wrong.load() == 0, std::to_string(wrong.load()) + " slots read back another vector's bytes");
+    t.check(batches.load() > 1000, "only " + std::to_string(batches.load()) + " batches ran");
+    heap.close();
+    ::unlink(path.c_str());
+    return t.done();
+}
+
 bool test_buffer_pool_needs_direct_io_pages() {
     TestCase t("a buffer-pool heap refuses a page_size O_DIRECT cannot read, and creates no file doing so");
     std::string path = temp_path("ivf_heap_pool_page");
@@ -969,6 +1041,7 @@ int main() {
     }
     g_cache = RawVectorHeapCache{};
     all_pass &= test_buffer_pool_evicts_and_writes_back();
+    all_pass &= test_buffer_pool_concurrent_batches_under_eviction();
     all_pass &= test_buffer_pool_needs_direct_io_pages();
     return all_pass ? 0 : 1;
 }

@@ -634,8 +634,20 @@ uint32_t BufferPool::evict_one(ShardState& shard, FrameRegion preferred,
             uint8_t expected_ready = static_cast<uint8_t>(FrameState::READY);
             if (!f.state.compare_exchange_strong(expected_ready,
                                                  static_cast<uint8_t>(FrameState::EVICTING),
-                                                 std::memory_order_acq_rel,
+                                                 std::memory_order_seq_cst,
                                                  std::memory_order_relaxed)) {
+                return {INVALID_PAGE, INVALID_PAGE, false};
+            }
+            // A pinner increments pin_count and then reads the state, so one
+            // that pinned between the check above and this CAS saw READY and
+            // may hold the frame for as long as it likes: pin_batch keeps its
+            // pins while it waits for other pages, possibly for pages this
+            // thread is loading, and finish_evict's wait for pins to drain
+            // would then never end. Such a pin is visible here (seq_cst
+            // against the pinner's locked increment); give the frame back.
+            // A pinner arriving after the CAS reads EVICTING and lets go.
+            if (f.pin_count.load(std::memory_order_seq_cst) > 0) {
+                store_frame_state(f, FrameState::READY);
                 return {INVALID_PAGE, INVALID_PAGE, false};
             }
 
@@ -893,6 +905,7 @@ void BufferPool::pin_batch(const uint32_t* page_ids, PageFrame** out_frames,
         while (true) {
             PageFrame* hit_frame = nullptr;
             uint32_t   loading_idx = INVALID_PAGE;
+            bool       retry = false;
             shard.page_table.if_contains(page_id, [&](const auto& kv) {
                 auto& f = _frames[kv.second];
                 f.pin_count.fetch_add(1, std::memory_order_acq_rel);
@@ -900,19 +913,27 @@ void BufferPool::pin_batch(const uint32_t* page_ids, PageFrame** out_frames,
                     f.update_pin_count.fetch_add(1, std::memory_order_acq_rel);
                 }
                 FrameState st = load_frame_state(f);
-                if (frame_state_allows_pin(f, st, hint) &&
-                    f.page_id.load(std::memory_order_acquire) == page_id) {
+                const bool ours = f.page_id.load(std::memory_order_acquire) == page_id;
+                if (frame_state_allows_pin(f, st, hint) && ours) {
                     f.ref_bit.store(1, std::memory_order_release);
                     if (hint == FrameRegion::QUERY) {
                         publish_resident_frame(page_id, kv.second);
                     }
                     hit_frame = &f;
+                } else if (st == FrameState::LOADING && ours) {
+                    // Another thread is loading this page: keep the pin,
+                    // taken while the frame was this page's and before it
+                    // could become READY and evictable, and wait later.
+                    loading_idx = kv.second;
                 } else {
+                    // Evicting, flushing for an UPDATE pin, or not yet
+                    // labelled with the page: retry rather than hold a pin
+                    // on a frame that may be about to hold another page.
                     if (hint != FrameRegion::QUERY) {
                         f.update_pin_count.fetch_sub(1, std::memory_order_acq_rel);
                     }
                     f.pin_count.fetch_sub(1, std::memory_order_acq_rel);
-                    loading_idx = kv.second;
+                    retry = true;
                 }
             });
             if (hit_frame) {
@@ -920,14 +941,12 @@ void BufferPool::pin_batch(const uint32_t* page_ids, PageFrame** out_frames,
                 break;
             }
             if (loading_idx != INVALID_PAGE) {
-                // Another thread is loading this page; take a pin and wait later.
-                auto& f = _frames[loading_idx];
-                f.pin_count.fetch_add(1, std::memory_order_acq_rel);
-                if (hint != FrameRegion::QUERY) {
-                    f.update_pin_count.fetch_add(1, std::memory_order_acq_rel);
-                }
-                entries[u] = Entry{ &f, loading_idx, K_WAIT_OTHER, false };
+                entries[u] = Entry{ &_frames[loading_idx], loading_idx, K_WAIT_OTHER, false };
                 break;
+            }
+            if (retry) {
+                std::this_thread::yield();
+                continue;
             }
             // Slow path: claim a frame, race to insert.
             bool used_eviction = false;
