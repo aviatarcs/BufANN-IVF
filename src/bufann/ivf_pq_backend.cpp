@@ -1,6 +1,7 @@
 #include "bufann/ivf_pq_backend.h"
 
 #include <algorithm>
+#include <chrono>
 #include <mutex>
 #include <shared_mutex>
 #include <stdexcept>
@@ -45,8 +46,16 @@ std::unique_ptr<IVFPQBackend> ivf_pq_backend_build(const std::string& data_bin, 
                                                    const BufANNConfig& config) {
     require_ivf_pq_config(config, "bufann_build");
     return as_std_exception([&] {
+    auto t0 = std::chrono::steady_clock::now();
+    auto step_done = [&](const char* step) {
+        const auto now = std::chrono::steady_clock::now();
+        diskann::cout << "IVF-PQ build: " << step << " took " << std::chrono::duration<double>(now - t0).count()
+                      << " s" << std::endl;
+        t0 = now;
+    };
     IVFPQIndex ix;
     ix.meta = train_ivf_centroids<T>(data_bin, config.ivf_nlist);
+    step_done("centroid training");
     if (ix.meta.dim != config.dim) {
         throw std::runtime_error("bufann_build: data dim " + std::to_string(ix.meta.dim) + " != config.dim " +
                                  std::to_string(config.dim));
@@ -59,12 +68,18 @@ std::unique_ptr<IVFPQBackend> ivf_pq_backend_build(const std::string& data_bin, 
         ix.heap_pages = heap.allocated_pages();
         ix.heap_next_slot = heap.next_flat_slot();
     }
+    step_done("assignment and heap write");
     ix.lists = build_ivf_posting_lists(ix.assignments, config.ivf_nlist);
     train_ivf_pq_pivots<T>(data_bin, index_prefix, config.ivf_pq_chunks);
+    step_done("posting lists and PQ training");
     encode_ivf_pq_codes<T>(data_bin, index_prefix, config.ivf_pq_chunks);
+    step_done("PQ encoding");
     ix.pq = load_ivf_pq(index_prefix);
     write_ivf_pq_index(index_prefix, ix);
-    return ivf_pq_backend_load<T>(index_prefix, config);
+    step_done("index file write");
+    auto backend = ivf_pq_backend_load<T>(index_prefix, config);
+    step_done("load");
+    return backend;
     });
 }
 

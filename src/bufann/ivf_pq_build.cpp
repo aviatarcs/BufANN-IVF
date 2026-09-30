@@ -1,6 +1,7 @@
 #include "bufann/ivf_pq_build.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -146,6 +147,10 @@ IVFMetadata train_ivf_centroids(const std::string& data_bin, uint32_t nlist,
                   << " sampled points (dim " << dim << ")" << std::endl;
 
     std::vector<float> centers(size_t(nlist) * dim);
+    auto seconds_since = [](std::chrono::steady_clock::time_point t) {
+        return std::chrono::duration<double>(std::chrono::steady_clock::now() - t).count();
+    };
+    auto t0 = std::chrono::steady_clock::now();
     if (num_train <= kmeans::KMEANSPP_MAX_POINTS) {
         kmeans::kmeanspp_selecting_pivots(train_data.data(), num_train, dim, centers.data(), nlist,
                                           rng_seed);
@@ -162,8 +167,11 @@ IVFMetadata train_ivf_centroids(const std::string& data_bin, uint32_t nlist,
         }
         kmeans::kmeanspp_selecting_pivots(seed_data.data(), seed_rows, dim, centers.data(), nlist, rng_seed);
     }
+    diskann::cout << "k-means++ seeding took " << seconds_since(t0) << " s" << std::endl;
+    t0 = std::chrono::steady_clock::now();
     kmeans::run_lloyds(train_data.data(), num_train, dim, centers.data(), nlist, max_kmeans_reps,
                        NULL, NULL);
+    diskann::cout << "Lloyd's iterations took " << seconds_since(t0) << " s" << std::endl;
 
     IVFMetadata meta;
     meta.nlist = nlist;

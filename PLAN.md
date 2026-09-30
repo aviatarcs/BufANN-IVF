@@ -141,6 +141,16 @@ completes it, citing the commit subject.
       run. Depends on the nlist measurement: whole builds at 9M took 85,
       310, 976 and 3562 s at nlist 4096 to 65536, ~3.4x per doubling of
       nlist (the training sample grows with nlist, and so does each pass).
+      Where it goes (9M, nlist 32768, 996 s, phase timers in the build
+      log): k-means++ seeding 376 s, 15 Lloyd's iterations 440 s,
+      assignment and heap write 138 s, PQ training and encoding 38 s.
+      k-means++ does two serial passes over the sample per centroid
+      picked, so it grows with nlist x sample (~16x from 32768 to 131072);
+      Lloyd's and the assignment run their GEMMs at ~550-600 GFLOP/s and
+      grow with nlist x points. Scaled to 90M at 131072 each is ~1.5-2 h,
+      matching the 5 h 23 min measured. Order: final assignment through
+      the graph (largest at 90M, and exact-checkable), then Lloyd's, then
+      k-means++ (parallel sums, or seeding from a subsample).
 - [ ] **nlist cost model.** For 90M+, where one build takes 41 min: sample
       m vectors, cluster them at each candidate nlist, take ~100 sample
       queries with exact neighbours within the sample, estimate nprobe as
