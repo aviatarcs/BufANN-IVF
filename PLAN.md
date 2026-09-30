@@ -173,6 +173,15 @@ completes it, citing the commit subject.
       the scalar scan as oracle, then compare QPS-recall end to end. Small
       lists (large nlist) leave partial blocks; measure at nlist 32768
       (~275 codes per list at 9M), the sweep's best.
+- [ ] **Raw-vector heap through BufANN's buffer pool.** The heap is read
+      with plain pread, so the query bench serves re-rank reads from an
+      unbounded OS page cache (the 9M heap, 1.2 GB, is fully cached after
+      warmup) while BufANN's runs pay 75 misses per query against a 1 GB
+      pool (262144 frames; I/O is 70% of its latency). Serve the heap's
+      pages through BufANN's buffer pool so both are measured at the same
+      pool size and miss accounting, then compare at 9M and 90M. This is
+      what makes the IVF-PQ vs BufANN numbers like for like; it subsumes
+      the cold-heap item's bench mode below.
 - [ ] **Re-rank reads under a cold heap.** The bench reads the heap through
       a warm page cache, while BufANN's numbers pay ~75 buffer-pool misses
       per query; the re-rank's up to rerank_m (100) random reads are our
