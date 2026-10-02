@@ -41,3 +41,9 @@ Design Document.pdf`. IVF-PQ code lives in `include/bufann/ivf_pq*.h`,
 `PLAN.md` is the task queue, `REVIEW.md` the reviewer's findings;
 `.claude/prompts/` holds the worker and reviewer prompts; `scripts/worker.sh`
 and `scripts/reviewer.sh` run them in loops.
+
+## CloudLab benchmarks
+
+Isolated benchmark runs, one bare-metal node per run: `docs/cloudlab_bench.md`
+(runbook for the session managing the experiments), `cloudlab/profile.py`,
+`scripts/cloudlab_node_prep.sh`.
