@@ -57,7 +57,7 @@ struct BufANNConfig {
     // --- threading ---
     uint32_t build_threads = 8;
 
-    // --- buffer pool ---
+    // --- buffer pool (IVF-PQ: its raw-vector heap's pages; 0 frames = OS page cache) ---
     uint32_t page_size                  = 4096;
     uint32_t buffer_pool_frames         = 16384;
     uint32_t flush_budget_pages_per_cycle = 32;

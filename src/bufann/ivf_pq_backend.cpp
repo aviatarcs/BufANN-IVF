@@ -1,6 +1,7 @@
 #include "bufann/ivf_pq_backend.h"
 
 #include <algorithm>
+#include <chrono>
 #include <mutex>
 #include <shared_mutex>
 #include <stdexcept>
@@ -45,8 +46,16 @@ std::unique_ptr<IVFPQBackend> ivf_pq_backend_build(const std::string& data_bin, 
                                                    const BufANNConfig& config) {
     require_ivf_pq_config(config, "bufann_build");
     return as_std_exception([&] {
+    auto t0 = std::chrono::steady_clock::now();
+    auto step_done = [&](const char* step) {
+        const auto now = std::chrono::steady_clock::now();
+        diskann::cout << "IVF-PQ build: " << step << " took " << std::chrono::duration<double>(now - t0).count()
+                      << " s" << std::endl;
+        t0 = now;
+    };
     IVFPQIndex ix;
     ix.meta = train_ivf_centroids<T>(data_bin, config.ivf_nlist);
+    step_done("centroid training");
     if (ix.meta.dim != config.dim) {
         throw std::runtime_error("bufann_build: data dim " + std::to_string(ix.meta.dim) + " != config.dim " +
                                  std::to_string(config.dim));
@@ -55,16 +64,27 @@ std::unique_ptr<IVFPQBackend> ivf_pq_backend_build(const std::string& data_bin, 
     {
         RawVectorHeap heap;
         heap.open(ivf_raw_vectors_path(index_prefix), ix.heap_layout);
-        assign_ivf_clusters<T>(data_bin, ix.meta, heap, ix.assignments, ix.rid_table);
+        // The graph is rebuilt, not kept: search does not use it yet.
+        IVFCentroidGraph graph;
+        const bool use_graph = config.ivf_nlist >= IVF_ASSIGN_GRAPH_MIN_NLIST;
+        if (use_graph) graph = build_ivf_centroid_graph(ix.meta);
+        assign_ivf_clusters<T>(data_bin, ix.meta, heap, ix.assignments, ix.rid_table, IVF_ASSIGN_MAX_BLOCK_POINTS,
+                               use_graph ? &graph : nullptr);
         ix.heap_pages = heap.allocated_pages();
         ix.heap_next_slot = heap.next_flat_slot();
     }
+    step_done("assignment and heap write");
     ix.lists = build_ivf_posting_lists(ix.assignments, config.ivf_nlist);
     train_ivf_pq_pivots<T>(data_bin, index_prefix, config.ivf_pq_chunks);
+    step_done("posting lists and PQ training");
     encode_ivf_pq_codes<T>(data_bin, index_prefix, config.ivf_pq_chunks);
+    step_done("PQ encoding");
     ix.pq = load_ivf_pq(index_prefix);
     write_ivf_pq_index(index_prefix, ix);
-    return ivf_pq_backend_load<T>(index_prefix, config);
+    step_done("index file write");
+    auto backend = ivf_pq_backend_load<T>(index_prefix, config);
+    step_done("load");
+    return backend;
     });
 }
 
@@ -84,7 +104,10 @@ std::unique_ptr<IVFPQBackend> ivf_pq_backend_load(const std::string& index_prefi
         throw std::runtime_error("bufann_load: index stores " + std::to_string(ix.heap_layout.elem_size / config.dim) +
                                  "-byte elements, not the " + std::to_string(sizeof(T)) + "-byte T requested");
     }
-    backend->heap.open_existing(ivf_raw_vectors_path(index_prefix), ix.heap_layout, ix.heap_next_slot, ix.heap_pages);
+    // The heap is served through a buffer pool of config.buffer_pool_frames,
+    // the budget the graph backend gets, not the unbounded page cache.
+    backend->heap.open_existing(ivf_raw_vectors_path(index_prefix), ix.heap_layout, ix.heap_next_slot, ix.heap_pages,
+                                RawVectorHeapCache{config.buffer_pool_frames, nullptr});
     ivf_pq_recover_deletes(backend->index, backend->heap, backend->delta);
     return backend;
     });

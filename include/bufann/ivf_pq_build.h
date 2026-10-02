@@ -8,6 +8,7 @@
 #include <string>
 
 #include "bufann/ivf_pq.h"
+#include "bufann/ivf_pq_centroid_graph.h"
 #include "bufann/ivf_pq_raw_vector_heap.h"
 #include "defaults.h"
 
@@ -17,11 +18,31 @@ namespace inplace {
 // Training points sampled per centroid; ~40 is the practical floor for k-means.
 const uint32_t IVF_TRAIN_POINTS_PER_CENTROID = 64;
 
+// k-means++ seeds from a strided subset of the training sample: this many
+// points per centroid, but at least IVF_KMEANSPP_MIN_POINTS. On 2.1M SIFT
+// points and 32768 centroids, seeding from 4, 8, 16 or all 64 per centroid
+// took 20, 36, 75 and 322 s, and after 15 Lloyd's iterations the mean
+// squared distances were within 0.02% of each other (47724 to 47733).
+const size_t IVF_KMEANSPP_POINTS_PER_CENTROID = 4;
+const size_t IVF_KMEANSPP_MIN_POINTS = 65536;
+
 // Cluster assignment and PQ encoding stream the base file in blocks of at
 // most IVF_ASSIGN_MAX_BLOCK_POINTS vectors, shrunk further so the per-block
 // [points x centers] float distance matrix stays under the byte budget.
 const size_t IVF_ASSIGN_MAX_BLOCK_POINTS = size_t(1) << 20;
 const size_t IVF_ASSIGN_DIST_MATRIX_BYTES = size_t(256) << 20;
+
+// From this nlist on, the build assigns vectors through a centroid graph
+// with a beam of IVF_ASSIGN_GRAPH_L instead of the exact GEMM. Measured on
+// SIFT: the GEMM path costs ~15 ns per centroid per point per thread and
+// the graph ~245 us per point at L 64, so they cross near nlist 16K; at
+// 90M and nlist 131072 the graph puts 0.15% of vectors in a near but not
+// nearest list (0.71% at L 32, 0.03% at L 128) and takes ~8x less time.
+const uint32_t IVF_ASSIGN_GRAPH_MIN_NLIST = 32768;
+const uint32_t IVF_ASSIGN_GRAPH_L = 64;
+// Lloyd's iterations from that nlist on go through the graph too; each
+// point's beam starts at its previous centre, so it can be narrower.
+const uint32_t IVF_LLOYDS_GRAPH_L = 32;
 
 const uint32_t IVF_BULK_LOAD_PAGES_PER_FLUSH = 256;
 
@@ -38,7 +59,9 @@ std::string ivf_pq_pivots_path(const std::string& index_prefix);
 std::string ivf_pq_codes_path(const std::string& index_prefix);
 
 // Step 1. Trains `nlist` centroids on a random sample of `data_bin` (k-means++
-// init, Lloyd's refinement), zero-padded to aligned_dim. sampling_rate 0
+// init from a strided subset of it, Lloyd's refinement on all of it, through
+// the centroid graph from IVF_ASSIGN_GRAPH_MIN_NLIST), zero-padded to
+// aligned_dim. sampling_rate 0
 // derives the sample size from IVF_TRAIN_POINTS_PER_CENTROID. `seed` makes
 // the sample and the init deterministic.
 template<typename T>
@@ -47,6 +70,16 @@ IVFMetadata train_ivf_centroids(const std::string& data_bin,
                                 double sampling_rate = 0.0,
                                 uint32_t max_kmeans_reps = NUM_K_MEANS_ITERS,
                                 std::optional<uint32_t> seed = std::nullopt);
+
+// Lloyd's iterations over `data` ([n x dim]) from the `nlist` centres in
+// `centers` ([nlist x dim], updated in place), with kmeans::run_lloyds'
+// stopping rule, but each point's nearest centre is the one a beam search of
+// width L finds in a graph over the current centres (rebuilt every
+// iteration), started from the point's previous centre. An empty cluster
+// keeps its centre. Returns the final sum of squared distances from each
+// point to its assigned centre.
+float run_ivf_graph_lloyds(const float* data, size_t n, uint32_t dim, float* centers, uint32_t nlist,
+                           uint32_t max_reps, uint32_t L);
 
 // Fills meta.centroid_l2sq from meta.centroids. Every producer of an
 // IVFMetadata calls this; search relies on the norms matching the centroids.
@@ -61,11 +94,15 @@ IVFMetadata load_ivf_centroids(const std::string& index_prefix, uint32_t dim);
 // centroid and bulk-loads the raw vectors into `heap`, which must be freshly
 // opened with elem_size == meta.dim * sizeof(T). Vector i lands in flat slot
 // i; the RID table is materialized anyway because inserts later break that.
+// With `graph` (built from `meta`), each vector goes to the nearest centroid
+// a beam search of width graph_L finds, which is usually but not always the
+// nearest; without it, the exact nearest by GEMM.
 template<typename T>
 void assign_ivf_clusters(const std::string& data_bin, const IVFMetadata& meta,
                          RawVectorHeap& heap, ClusterAssignments& assignments,
                          RawVectorRIDTable& rid_table,
-                         size_t max_block_points = IVF_ASSIGN_MAX_BLOCK_POINTS);
+                         size_t max_block_points = IVF_ASSIGN_MAX_BLOCK_POINTS,
+                         const IVFCentroidGraph* graph = nullptr, uint32_t graph_L = IVF_ASSIGN_GRAPH_L);
 
 // [N x 1] uint32 bins.
 void save_ivf_cluster_assignments(const std::string& index_prefix,

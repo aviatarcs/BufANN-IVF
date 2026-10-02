@@ -1,6 +1,7 @@
 #include "bufann/ivf_pq_build.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -120,6 +121,73 @@ std::vector<uint32_t> load_u32_column(const std::string& path) {
 
 }  // namespace
 
+float run_ivf_graph_lloyds(const float* data, size_t n, uint32_t dim, float* centers, uint32_t nlist,
+                           uint32_t max_reps, uint32_t L) {
+    IVF_PQ_REQUIRE(n > 0 && dim > 0 && nlist > 0 && L > 0, "graph Lloyd's needs n, dim, nlist and L > 0");
+    IVFMetadata view;
+    view.nlist = nlist;
+    view.dim = dim;
+    view.aligned_dim = dim;
+    auto sq_dist = [dim](const float* a, const float* b) {
+        float s = 0.0f;
+        for (uint32_t d = 0; d < dim; ++d) s += (a[d] - b[d]) * (a[d] - b[d]);
+        return s;
+    };
+    std::vector<uint32_t> assign(n, IVF_CENTROID_GRAPH_NONE), offsets(size_t(nlist) + 1), members(n);
+    float residual = std::numeric_limits<float>::max();
+    for (uint32_t it = 0; it < max_reps; ++it) {
+        view.centroids.assign(centers, centers + size_t(nlist) * dim);
+        const IVFCentroidGraph graph = build_ivf_centroid_graph(view);
+#pragma omp parallel
+        {
+            IVFCentroidGraphScratch scratch;
+            std::vector<uint32_t> nearest;
+#pragma omp for schedule(dynamic, 256)
+            for (int64_t i = 0; i < int64_t(n); ++i) {
+                search_ivf_centroid_graph(view, graph, data + size_t(i) * dim, L, 1, scratch, nearest,
+                                          assign[size_t(i)]);
+                assign[size_t(i)] = nearest[0];
+            }
+        }
+        // Members of each cluster, grouped by a counting sort, so the new
+        // centres are summed in parallel over clusters.
+        std::fill(offsets.begin(), offsets.end(), 0u);
+        for (size_t i = 0; i < n; ++i) ++offsets[assign[i] + 1];
+        std::partial_sum(offsets.begin(), offsets.end(), offsets.begin());
+        {
+            std::vector<uint32_t> cursor(offsets.begin(), offsets.end() - 1);
+            for (size_t i = 0; i < n; ++i) members[cursor[assign[i]]++] = uint32_t(i);
+        }
+#pragma omp parallel
+        {
+            std::vector<double> sum(dim);
+#pragma omp for schedule(dynamic, 64)
+            for (int64_t c = 0; c < int64_t(nlist); ++c) {
+                const uint32_t begin = offsets[size_t(c)], end = offsets[size_t(c) + 1];
+                if (begin == end) continue;
+                std::fill(sum.begin(), sum.end(), 0.0);
+                for (uint32_t m = begin; m < end; ++m) {
+                    const float* p = data + size_t(members[m]) * dim;
+                    for (uint32_t d = 0; d < dim; ++d) sum[d] += p[d];
+                }
+                for (uint32_t d = 0; d < dim; ++d) centers[size_t(c) * dim + d] = float(sum[d] / double(end - begin));
+            }
+        }
+        double total = 0.0;
+#pragma omp parallel for reduction(+ : total) schedule(static, 8192)
+        for (int64_t i = 0; i < int64_t(n); ++i) {
+            total += sq_dist(data + size_t(i) * dim, centers + size_t(assign[size_t(i)]) * dim);
+        }
+        const float old_residual = residual;
+        residual = float(total);
+        if ((it != 0 && double(old_residual - residual) / residual < 0.00001) ||
+            residual < std::numeric_limits<float>::epsilon()) {
+            break;
+        }
+    }
+    return residual;
+}
+
 void set_ivf_centroid_norms(IVFMetadata& meta) {
     meta.centroid_l2sq.resize(meta.nlist);
     for (uint32_t c = 0; c < meta.nlist; ++c) {
@@ -146,24 +214,38 @@ IVFMetadata train_ivf_centroids(const std::string& data_bin, uint32_t nlist,
                   << " sampled points (dim " << dim << ")" << std::endl;
 
     std::vector<float> centers(size_t(nlist) * dim);
-    if (num_train <= kmeans::KMEANSPP_MAX_POINTS) {
-        kmeans::kmeanspp_selecting_pivots(train_data.data(), num_train, dim, centers.data(), nlist,
-                                          rng_seed);
+    auto seconds_since = [](std::chrono::steady_clock::time_point t) {
+        return std::chrono::duration<double>(std::chrono::steady_clock::now() - t).count();
+    };
+    auto t0 = std::chrono::steady_clock::now();
+    // k-means++ reads its whole input once per centre picked, so seed from
+    // every stride-th row of the sample (it is in file order, so a prefix
+    // would not span the data), capped at what k-means++ supports; Lloyd's
+    // then runs on all of it.
+    const size_t seed_cap = std::min(kmeans::KMEANSPP_MAX_POINTS,
+                                     std::max(IVF_KMEANSPP_MIN_POINTS, size_t(nlist) * IVF_KMEANSPP_POINTS_PER_CENTROID));
+    const size_t stride = (num_train + seed_cap - 1) / seed_cap;
+    const size_t seed_rows = (num_train + stride - 1) / stride;
+    if (stride == 1) {
+        kmeans::kmeanspp_selecting_pivots(train_data.data(), num_train, dim, centers.data(), nlist, rng_seed);
     } else {
-        // At nlist >= 2^23 / IVF_TRAIN_POINTS_PER_CENTROID (131072) the sample
-        // outgrows k-means++, which would fall back to random pivots. Seed
-        // from every stride-th row instead, so the seeds span the whole
-        // sample (it is in file order); Lloyd's still runs on all of it.
-        const size_t stride = (num_train + kmeans::KMEANSPP_MAX_POINTS - 1) / kmeans::KMEANSPP_MAX_POINTS;
-        const size_t seed_rows = (num_train + stride - 1) / stride;
         std::vector<float> seed_data(seed_rows * dim);
         for (size_t r = 0; r < seed_rows; ++r) {
             std::copy_n(train_data.begin() + r * stride * dim, dim, seed_data.begin() + r * dim);
         }
         kmeans::kmeanspp_selecting_pivots(seed_data.data(), seed_rows, dim, centers.data(), nlist, rng_seed);
     }
-    kmeans::run_lloyds(train_data.data(), num_train, dim, centers.data(), nlist, max_kmeans_reps,
-                       NULL, NULL);
+    diskann::cout << "k-means++ seeding from " << seed_rows << " of the sampled points took " << seconds_since(t0)
+                  << " s" << std::endl;
+    t0 = std::chrono::steady_clock::now();
+    const bool graph = nlist >= IVF_ASSIGN_GRAPH_MIN_NLIST;
+    const float residual =
+        graph ? run_ivf_graph_lloyds(train_data.data(), num_train, uint32_t(dim), centers.data(), nlist,
+                                     max_kmeans_reps, IVF_LLOYDS_GRAPH_L)
+              : kmeans::run_lloyds(train_data.data(), num_train, dim, centers.data(), nlist, max_kmeans_reps, NULL,
+                                   NULL);
+    diskann::cout << "Lloyd's iterations" << (graph ? " through the centroid graph" : "") << " took "
+                  << seconds_since(t0) << " s, mean squared distance " << residual / double(num_train) << std::endl;
 
     IVFMetadata meta;
     meta.nlist = nlist;
@@ -198,9 +280,16 @@ IVFMetadata load_ivf_centroids(const std::string& index_prefix, uint32_t dim) {
 template<typename T>
 void assign_ivf_clusters(const std::string& data_bin, const IVFMetadata& meta,
                          RawVectorHeap& heap, ClusterAssignments& assignments,
-                         RawVectorRIDTable& rid_table, size_t max_block_points) {
+                         RawVectorRIDTable& rid_table, size_t max_block_points,
+                         const IVFCentroidGraph* graph, uint32_t graph_L) {
     IVF_PQ_REQUIRE(max_block_points > 0, "max_block_points must be greater than zero");
     require_valid(meta);
+    // Checked here, not left to the search: a throw inside the OpenMP loop
+    // below would terminate the process.
+    IVF_PQ_REQUIRE(graph == nullptr || (graph_L > 0 && graph->nlist == meta.nlist && graph->degree > 0 &&
+                                        graph->entry < graph->nlist &&
+                                        graph->neighbors.size() == size_t(graph->nlist) * graph->degree),
+                   "assignment graph must match the centroids' nlist, with graph_L > 0");
     size_t npts = 0, file_dim = 0;
     get_bin_metadata(data_bin, npts, file_dim);
     IVF_PQ_REQUIRE(file_dim == meta.dim, "base file dimensionality does not match the centroids");
@@ -215,7 +304,8 @@ void assign_ivf_clusters(const std::string& data_bin, const IVFMetadata& meta,
     std::vector<float> centroids(size_t(meta.nlist) * dim);
     copy_rows(meta.centroids.data(), meta.aligned_dim, centroids.data(), dim, meta.nlist, dim);
 
-    size_t block_size = streaming_block_size(npts, meta.nlist, max_block_points);
+    size_t block_size = graph != nullptr ? std::max<size_t>(1, std::min(max_block_points, npts))
+                                         : streaming_block_size(npts, meta.nlist, max_block_points);
     std::vector<T> block(block_size * dim);
     std::vector<float> block_float(block_size * dim);
     std::vector<uint32_t> block_closest(block_size);
@@ -224,16 +314,32 @@ void assign_ivf_clusters(const std::string& data_bin, const IVFMetadata& meta,
     rid_table.rid.resize(npts);
     RawVectorHeapBulkWriter writer(heap, IVF_BULK_LOAD_PAGES_PER_FLUSH);
 
-    diskann::cout << "Assigning " << npts << " vectors to " << meta.nlist
-                  << " IVF centroids in blocks of " << block_size << std::endl;
+    diskann::cout << "Assigning " << npts << " vectors to " << meta.nlist << " IVF centroids in blocks of "
+                  << block_size << (graph != nullptr ? " through the centroid graph, beam " + std::to_string(graph_L)
+                                                     : std::string(" by GEMM"))
+                  << std::endl;
 
     cached_ifstream reader(data_bin, BASE_FILE_READ_CACHE_BYTES, BIN_FILE_HEADER_BYTES);
     for (size_t start = 0; start < npts; start += block_size) {
         size_t cur = std::min(block_size, npts - start);
         reader.read(reinterpret_cast<char*>(block.data()), cur * elem_size);
         diskann::convert_types<T, float>(block.data(), block_float.data(), cur, dim);
-        math_utils::compute_closest_centers(block_float.data(), cur, dim, centroids.data(),
-                                            meta.nlist, 1, block_closest.data());
+        if (graph != nullptr) {
+#pragma omp parallel
+            {
+                IVFCentroidGraphScratch scratch;
+                std::vector<uint32_t> nearest;
+#pragma omp for schedule(dynamic, 256)
+                for (int64_t i = 0; i < int64_t(cur); ++i) {
+                    search_ivf_centroid_graph(meta, *graph, block_float.data() + size_t(i) * dim, graph_L, 1,
+                                              scratch, nearest);
+                    block_closest[size_t(i)] = nearest[0];
+                }
+            }
+        } else {
+            math_utils::compute_closest_centers(block_float.data(), cur, dim, centroids.data(), meta.nlist, 1,
+                                                block_closest.data());
+        }
         std::copy_n(block_closest.data(), cur, assignments.cluster_id.begin() + start);
 
         for (size_t i = 0; i < cur; ++i) {
@@ -422,11 +528,14 @@ template IVFMetadata train_ivf_centroids<int8_t>(const std::string&, uint32_t, d
                                                  std::optional<uint32_t>);
 
 template void assign_ivf_clusters<float>(const std::string&, const IVFMetadata&, RawVectorHeap&,
-                                         ClusterAssignments&, RawVectorRIDTable&, size_t);
+                                         ClusterAssignments&, RawVectorRIDTable&, size_t,
+                                         const IVFCentroidGraph*, uint32_t);
 template void assign_ivf_clusters<uint8_t>(const std::string&, const IVFMetadata&, RawVectorHeap&,
-                                           ClusterAssignments&, RawVectorRIDTable&, size_t);
+                                           ClusterAssignments&, RawVectorRIDTable&, size_t,
+                                           const IVFCentroidGraph*, uint32_t);
 template void assign_ivf_clusters<int8_t>(const std::string&, const IVFMetadata&, RawVectorHeap&,
-                                          ClusterAssignments&, RawVectorRIDTable&, size_t);
+                                          ClusterAssignments&, RawVectorRIDTable&, size_t,
+                                          const IVFCentroidGraph*, uint32_t);
 
 template void train_ivf_pq_pivots<float>(const std::string&, const std::string&, uint32_t, double,
                                          uint32_t, std::optional<uint32_t>);

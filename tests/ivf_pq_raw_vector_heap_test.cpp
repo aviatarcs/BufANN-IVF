@@ -2,8 +2,11 @@
 // reuse, the free-slot grace period (deterministically and against racing
 // readers), concurrent bitmap updates, slot-space limit, the fresh-open guard,
 // reopening a closed heap (and refusing a bad one or a wrong geometry),
-// page-header verification on read, and the bulk writer.
+// page-header verification on read, and the bulk writer. The suite runs once
+// through the page cache and once through a buffer pool; the tests after it
+// concern the buffer pool alone, eviction and write-back among them.
 
+#include "bufann/inplace_backend.h"
 #include "bufann/ivf_pq_raw_vector_heap.h"
 #include "ivf_pq_test_util.h"
 
@@ -25,6 +28,10 @@ namespace {
 
 const uint32_t PAGE = 4096;
 const uint32_t ELEM = 512;  // dim=128 fp32: 7 slots per page, 1 bitmap byte, 28 owner bytes
+
+// Every heap a test opens is opened with this: the page cache on the first
+// pass of the suite, a buffer pool on the second.
+RawVectorHeapCache g_cache;
 
 std::vector<char> pattern(uint32_t i, uint32_t elem_size = ELEM) {
     return std::vector<char>(elem_size, static_cast<char>(i % 251 + 1));
@@ -90,7 +97,7 @@ bool test_on_disk_format() {
     TestCase t("on-disk page format: header, LSB-first bitmap, slot placement");
     std::string path = temp_path("ivf_heap_format");
     RawVectorHeap heap;
-    heap.open(path, compute_raw_vector_heap_layout(PAGE, ELEM));
+    heap.open(path, compute_raw_vector_heap_layout(PAGE, ELEM), g_cache);
     RawVectorFreeList free_list;
     for (uint32_t i = 0; i < 8; ++i) heap.allocate_slot(free_list);  // pages 0 and 1
     heap.write_vector(0, 10, pattern(10).data());
@@ -126,7 +133,7 @@ bool test_allocate_write_read_free_reuse() {
     TestCase t("allocate/write/read/free/reuse across multiple pages, owners and the page directory");
     std::string path = temp_path("ivf_heap_basic");
     RawVectorHeap heap;
-    heap.open(path, compute_raw_vector_heap_layout(PAGE, ELEM));
+    heap.open(path, compute_raw_vector_heap_layout(PAGE, ELEM), g_cache);
     RawVectorFreeList free_list;
 
     const uint32_t n = 50;
@@ -192,7 +199,7 @@ bool test_free_waits_for_readers_registered_before_it() {
     TestCase t("freed slots are reused only after the readers that predate the free have left");
     std::string path = temp_path("ivf_heap_grace");
     RawVectorHeap heap;
-    heap.open(path, compute_raw_vector_heap_layout(PAGE, ELEM));
+    heap.open(path, compute_raw_vector_heap_layout(PAGE, ELEM), g_cache);
     RawVectorFreeList free_list;
     std::vector<uint32_t> s(4);
     for (uint32_t& slot : s) slot = heap.allocate_slot(free_list);
@@ -231,7 +238,7 @@ bool test_free_waits_for_readers_registered_before_it() {
     // Every guard takes a registry entry; a reader that finds them all taken
     // waits for one to be released rather than failing.
     RawVectorHeap small(2);
-    small.open(path + "_small", compute_raw_vector_heap_layout(PAGE, ELEM));
+    small.open(path + "_small", compute_raw_vector_heap_layout(PAGE, ELEM), g_cache);
     {
         RawVectorHeap::ReadGuard one(small);
         auto two = std::make_unique<RawVectorHeap::ReadGuard>(small);
@@ -265,7 +272,7 @@ bool test_reader_never_sees_a_reused_slot() {
     std::string path = temp_path("ivf_heap_race");
     const uint32_t elem = 16;
     RawVectorHeap heap;
-    heap.open(path, compute_raw_vector_heap_layout(PAGE, elem));
+    heap.open(path, compute_raw_vector_heap_layout(PAGE, elem), g_cache);
     RawVectorFreeList free_list;
 
     const uint32_t n = 64;
@@ -349,7 +356,7 @@ bool test_concurrent_bitmap_updates() {
     for (int run = 0; run < 200; ++run) {
         ::unlink(path.c_str());
         RawVectorHeap heap;
-        heap.open(path, layout);
+        heap.open(path, layout, g_cache);
         RawVectorFreeList free_list;
         std::vector<uint32_t> slots(layout.slots_per_page);
         for (uint32_t& s : slots) {
@@ -386,7 +393,7 @@ bool test_rejects_slots_past_the_rid_slot_space() {
     TestCase t("allocate_slot hands out the last addressable slot, then refuses");
     std::string path = temp_path("ivf_heap_full");
     RawVectorHeap heap;
-    heap.open(path, compute_raw_vector_heap_layout(PAGE, PAGE - RAW_VECTOR_PAGE_HEADER_BYTES - 1 - RAW_VECTOR_OWNER_BYTES));  // 1 slot per page
+    heap.open(path, compute_raw_vector_heap_layout(PAGE, PAGE - RAW_VECTOR_PAGE_HEADER_BYTES - 1 - RAW_VECTOR_OWNER_BYTES), g_cache);  // 1 slot per page
     RawVectorFreeList free_list;
 
     // Page count already past the cursor, so neither call extends the file.
@@ -405,13 +412,13 @@ bool test_open_refuses_existing_nonempty_file() {
     std::string path = temp_path("ivf_heap_reopen");
     RawVectorHeapLayout layout = compute_raw_vector_heap_layout(PAGE, ELEM);
     RawVectorHeap heap;
-    heap.open(path, layout);
+    heap.open(path, layout, g_cache);
     RawVectorFreeList free_list;
     heap.write_vector(heap.allocate_slot(free_list), 1, pattern(1).data());
     heap.close();
 
     RawVectorHeap again;
-    t.expect_throw("reopening a non-empty heap", [&] { again.open(path, layout); });
+    t.expect_throw("reopening a non-empty heap", [&] { again.open(path, layout, g_cache); });
     ::unlink(path.c_str());
     return t.done();
 }
@@ -427,7 +434,7 @@ void patch_bytes(const std::string& path, uint64_t offset, const std::vector<cha
 void write_closed_heap(const std::string& path, const RawVectorHeapLayout& layout, uint32_t n) {
     ::unlink(path.c_str());
     RawVectorHeap heap;
-    heap.open(path, layout);
+    heap.open(path, layout, g_cache);
     RawVectorFreeList free_list;
     for (uint32_t i = 0; i < n; ++i) {
         heap.write_vector(heap.allocate_slot(free_list), i, pattern(i).data());
@@ -443,7 +450,7 @@ bool test_reopen_resumes_the_heap() {
     const uint32_t n = 5 * spp + 3;  // six pages, the last one partial
     {
         RawVectorHeap heap;
-        heap.open(path, layout);
+        heap.open(path, layout, g_cache);
         RawVectorHeapBulkWriter writer(heap, 2);
         for (uint32_t i = 0; i < n; ++i) writer.append(i, pattern(i).data());
         writer.finish();
@@ -451,7 +458,7 @@ bool test_reopen_resumes_the_heap() {
     std::vector<char> before = read_whole_file(path);
 
     RawVectorHeap heap;
-    heap.open_existing(path, layout, n, 6);
+    heap.open_existing(path, layout, n, 6, g_cache);
     t.check(heap.next_flat_slot() == n && heap.allocated_pages() == 6, "cursor not restored");
     std::vector<char> got(ELEM);
     uint32_t bad = 0;
@@ -475,7 +482,7 @@ bool test_reopen_resumes_the_heap() {
     std::vector<char> f = read_whole_file(path);
     t.check(f.size() == 7 * PAGE && page_header_is(f, 6), "page grown after reopen lacks its header");
 
-    heap.open_existing(path, layout, m, 7);
+    heap.open_existing(path, layout, m, 7, g_cache);
     heap.read_vector(m - 1, got.data());
     t.check(got == pattern(m - 1), "vector written after the first reopen did not survive a second");
     heap.close();
@@ -492,50 +499,51 @@ bool test_reopen_rejects_bad_file() {
     std::vector<char> good = read_whole_file(path);
     RawVectorHeap heap;
 
-    t.expect_throw("missing file", [&] { heap.open_existing(path + ".missing", layout, n, pages); });
-    t.expect_throw("cursor past the pages", [&] { heap.open_existing(path, layout, n + 1, pages); });
-    t.expect_throw("fewer pages than the file", [&] { heap.open_existing(path, layout, n - spp, pages - 1); });
-    t.expect_throw("more pages than the file", [&] { heap.open_existing(path, layout, n, pages + 1); });
+    t.expect_throw("missing file", [&] { heap.open_existing(path + ".missing", layout, n, pages, g_cache); });
+    t.check(::access((path + ".missing").c_str(), F_OK) != 0, "refusing a missing file created it");
+    t.expect_throw("cursor past the pages", [&] { heap.open_existing(path, layout, n + 1, pages, g_cache); });
+    t.expect_throw("fewer pages than the file", [&] { heap.open_existing(path, layout, n - spp, pages - 1, g_cache); });
+    t.expect_throw("more pages than the file", [&] { heap.open_existing(path, layout, n, pages + 1, g_cache); });
     RawVectorHeapLayout inconsistent = layout;
     inconsistent.slots_per_page += 1;
-    t.expect_throw("inconsistent layout", [&] { heap.open_existing(path, inconsistent, n, pages); });
+    t.expect_throw("inconsistent layout", [&] { heap.open_existing(path, inconsistent, n, pages, g_cache); });
 
     // Same byte count as two double-size pages, but the header at the second
     // double-size page is page 2's, not page 1's.
     RawVectorHeapLayout doubled = compute_raw_vector_heap_layout(2 * PAGE, ELEM);
-    t.expect_throw("different page_size", [&] { heap.open_existing(path, doubled, 0, 2); });
+    t.expect_throw("different page_size", [&] { heap.open_existing(path, doubled, 0, 2, g_cache); });
     // Geometries under which the file's size and its first and last page ids
     // both line up, so only the geometry in the page header tells them apart:
     // the whole file as one page (first == last == page 0), and the same
     // pages holding elements twice the size.
     RawVectorHeapLayout one_page = compute_raw_vector_heap_layout(pages * PAGE, ELEM);
-    t.expect_throw("whole file as a single page", [&] { heap.open_existing(path, one_page, 0, 1); });
+    t.expect_throw("whole file as a single page", [&] { heap.open_existing(path, one_page, 0, 1, g_cache); });
     RawVectorHeapLayout wider = compute_raw_vector_heap_layout(PAGE, 2 * ELEM);
     t.expect_throw("same pages, different elem_size",
-                   [&] { heap.open_existing(path, wider, pages * wider.slots_per_page, pages); });
+                   [&] { heap.open_existing(path, wider, pages * wider.slots_per_page, pages, g_cache); });
 
     t.expect_throw("page 0 without a header", [&] {
         patch_bytes(path, 0, std::vector<char>(RAW_VECTOR_PAGE_HEADER_BYTES, 0));
-        heap.open_existing(path, layout, n, pages);
+        heap.open_existing(path, layout, n, pages, g_cache);
     });
     t.expect_throw("page 0 recording another elem_size", [&] {
         patch_bytes(path, 0, page_header_bytes(0, PAGE, ELEM + 4));
-        heap.open_existing(path, layout, n, pages);
+        heap.open_existing(path, layout, n, pages, g_cache);
     });
     patch_bytes(path, 0, page_header_bytes(0));
     t.expect_throw("last page carrying another page's id", [&] {
         patch_bytes(path, size_t(pages - 1) * PAGE, page_header_bytes(pages));
-        heap.open_existing(path, layout, n, pages);
+        heap.open_existing(path, layout, n, pages, g_cache);
     });
     patch_bytes(path, size_t(pages - 1) * PAGE, page_header_bytes(pages - 1));
 
     t.expect_throw("truncated by a byte", [&] {
         ::truncate(path.c_str(), off_t(good.size() - 1));
-        heap.open_existing(path, layout, n, pages);
+        heap.open_existing(path, layout, n, pages, g_cache);
     });
     t.expect_throw("extended by a byte", [&] {
         ::truncate(path.c_str(), off_t(good.size() + 1));
-        heap.open_existing(path, layout, n, pages);
+        heap.open_existing(path, layout, n, pages, g_cache);
     });
     ::truncate(path.c_str(), off_t(good.size()));
     patch_bytes(path, good.size() - 1, {good.back()});
@@ -543,7 +551,7 @@ bool test_reopen_rejects_bad_file() {
     // A rejected open leaves nothing allocated; the restored file opens.
     t.check(heap.allocated_pages() == 0 && heap.next_flat_slot() == 0, "rejected open left a cursor");
     t.check(read_whole_file(path) == good, "corruptions were not undone");
-    heap.open_existing(path, layout, n, pages);
+    heap.open_existing(path, layout, n, pages, g_cache);
     std::vector<char> got(ELEM);
     heap.read_vector(n - 1, got.data());
     t.check(got == pattern(n - 1), "restored file does not read back");
@@ -567,21 +575,21 @@ bool test_rejected_reopen_after_use_leaves_nothing_behind() {
     RawVectorFreeList free_list;
 
     RawVectorHeap heap;
-    heap.open_existing(path, layout, n, pages);
+    heap.open_existing(path, layout, n, pages, g_cache);
     t.check(heap.next_flat_slot() == n && heap.allocated_pages() == pages, "cursor not restored");
     heap.close();
     t.check(heap.next_flat_slot() == 0 && heap.allocated_pages() == 0, "close() left the cursor");
 
-    t.expect_throw("missing file", [&] { heap.open_existing(path + ".missing", layout, n, pages); });
+    t.expect_throw("missing file", [&] { heap.open_existing(path + ".missing", layout, n, pages, g_cache); });
     t.check(heap.next_flat_slot() == 0 && heap.allocated_pages() == 0, "rejected reopen left the cursor");
     t.expect_throw("allocate_slot after a rejected reopen", [&] { heap.allocate_slot(free_list); });
 
     // Rejected after the fd was opened: the heap must be closed again, so the
     // allocation attempt neither succeeds nor writes a page into the file.
-    heap.open_existing(path, layout, n, pages);
+    heap.open_existing(path, layout, n, pages, g_cache);
     t.expect_throw("last page carrying another page's id", [&] {
         patch_bytes(path, size_t(pages - 1) * PAGE, page_header_bytes(pages));
-        heap.open_existing(path, layout, n, pages);
+        heap.open_existing(path, layout, n, pages, g_cache);
     });
     t.check(heap.next_flat_slot() == 0 && heap.allocated_pages() == 0, "rejected reopen left the cursor");
     t.expect_throw("allocate_slot after a rejected reopen", [&] { heap.allocate_slot(free_list); });
@@ -590,7 +598,7 @@ bool test_rejected_reopen_after_use_leaves_nothing_behind() {
     patch_bytes(path, size_t(pages - 1) * PAGE, page_header_bytes(pages - 1));
     t.check(read_whole_file(path) == good, "a rejected reopen or the allocation after it changed the file");
 
-    heap.open_existing(path, layout, n, pages);
+    heap.open_existing(path, layout, n, pages, g_cache);
     t.check(heap.allocate_slot(free_list) == n, "allocation after the restored reopen skipped a slot");
     heap.close();
     ::unlink(path.c_str());
@@ -642,9 +650,12 @@ bool test_reopen_sizes_the_file_it_opened() {
     RawVectorHeap heap;
     std::vector<char> got(ELEM);
     uint32_t accepted = 0, refused = 0, wrong = 0;
-    for (uint32_t attempt = 0; attempt < 20000; ++attempt) {
+    // A buffer-pool open allocates the pool (~4 ms), so it gets fewer attempts;
+    // checking stat(path) still lets the longer file through dozens of times.
+    const uint32_t attempts = g_cache.buffer_pool_frames == 0 ? 20000 : 2000;
+    for (uint32_t attempt = 0; attempt < attempts; ++attempt) {
         try {
-            heap.open_existing(path, layout, n, pages);
+            heap.open_existing(path, layout, n, pages, g_cache);
         } catch (const diskann::ANNException&) {
             ++refused;
             continue;
@@ -677,7 +688,7 @@ bool test_read_rejects_misplaced_page() {
     patch_bytes(path, 3 * PAGE, page_header_bytes(3, PAGE, ELEM / 2));  // page 3 claims smaller elements
 
     RawVectorHeap heap;
-    heap.open_existing(path, layout, n, pages);  // first and last pages are intact
+    heap.open_existing(path, layout, n, pages, g_cache);  // first and last pages are intact
     std::vector<char> got(ELEM);
     uint32_t wrong = 0;
     for (uint32_t i = 0; i < n; ++i) {
@@ -696,6 +707,12 @@ bool test_read_rejects_misplaced_page() {
     heap.read_page_directory(0, bitmap.data(), owners.data());
     t.check(owners[1] == 1 && (bitmap[0] & 0b10) != 0, "page 0's directory does not name slot 1's owner as occupied");
     t.expect_throw("page directory of a misplaced page", [&] { heap.read_page_directory(2, bitmap.data(), owners.data()); });
+    // A batch read is refused for its one slot in a bad page, not just read around it.
+    const std::vector<uint32_t> batch = {0, spp, 4 * spp};  // pages 0, 1 (claims 2), 4
+    std::vector<char> batch_out(batch.size() * ELEM);
+    std::vector<uint32_t> batch_owners(batch.size());
+    t.expect_throw("read_vectors including a misplaced page",
+                   [&] { heap.read_vectors(batch.data(), batch.size(), batch_out.data(), batch_owners.data()); });
 
     std::vector<char> before = read_whole_file(path);
     std::vector<char> page(PAGE, 0);
@@ -718,7 +735,7 @@ void check_bulk_load(TestCase& t, const std::string& tag, uint32_t n, uint32_t p
     auto fail = [&](const std::string& msg) { t.check(false, "[" + tag + "] " + msg); };
 
     RawVectorHeap bulk;
-    bulk.open(bulk_path, layout);
+    bulk.open(bulk_path, layout, g_cache);
     {
         RawVectorHeapBulkWriter writer(bulk, pages_per_flush);
         for (uint32_t i = 0; i < n; ++i) {
@@ -728,7 +745,7 @@ void check_bulk_load(TestCase& t, const std::string& tag, uint32_t n, uint32_t p
     }
 
     RawVectorHeap per_slot;
-    per_slot.open(slot_path, layout);
+    per_slot.open(slot_path, layout, g_cache);
     RawVectorFreeList unused;
     for (uint32_t i = 0; i < n; ++i) {
         per_slot.write_vector(per_slot.allocate_slot(unused), i, pattern(i).data());
@@ -738,6 +755,8 @@ void check_bulk_load(TestCase& t, const std::string& tag, uint32_t n, uint32_t p
         bulk.allocated_pages() != per_slot.allocated_pages()) {
         fail("cursor differs from per-slot allocation");
     }
+    bulk.flush();
+    per_slot.flush();
     std::vector<char> bulk_bytes = read_whole_file(bulk_path);
     if (bulk_bytes.size() != size_t(bulk.allocated_pages()) * PAGE) fail("file size is not whole pages");
     if (bulk_bytes != read_whole_file(slot_path)) fail("file differs from per-slot writes");
@@ -781,7 +800,7 @@ bool test_bulk_writer_rejects_misuse() {
     TestCase t("bulk writer rejects zero flush size, append after finish, and a used heap");
     std::string path = temp_path("ivf_heap_misuse");
     RawVectorHeap heap;
-    heap.open(path, compute_raw_vector_heap_layout(PAGE, ELEM));
+    heap.open(path, compute_raw_vector_heap_layout(PAGE, ELEM), g_cache);
 
     t.expect_throw("pages_per_flush == 0", [&] { RawVectorHeapBulkWriter w(heap, 0); });
 
@@ -802,12 +821,12 @@ bool test_rejects_bad_layout_and_out_of_range_slots() {
     TestCase t("heap rejects an inconsistent layout, slots past the allocated pages, a bad cursor");
     std::string path = temp_path("ivf_heap_guard");
     RawVectorHeap heap;
-    t.expect_throw("default-constructed layout", [&] { heap.open(path, RawVectorHeapLayout{}); });
+    t.expect_throw("default-constructed layout", [&] { heap.open(path, RawVectorHeapLayout{}, g_cache); });
     RawVectorHeapLayout too_many = compute_raw_vector_heap_layout(PAGE, ELEM);
     too_many.slots_per_page += 1;  // slots would run past the page
-    t.expect_throw("slots overrunning the page", [&] { heap.open(path, too_many); });
+    t.expect_throw("slots overrunning the page", [&] { heap.open(path, too_many, g_cache); });
 
-    heap.open(path, compute_raw_vector_heap_layout(PAGE, ELEM));
+    heap.open(path, compute_raw_vector_heap_layout(PAGE, ELEM), g_cache);
     RawVectorFreeList free_list;
     uint32_t last = 0;
     for (int i = 0; i < 3; ++i) last = heap.allocate_slot(free_list);  // page 0 only
@@ -827,25 +846,202 @@ bool test_rejects_bad_layout_and_out_of_range_slots() {
     return t.done();
 }
 
+// The buffer-pool heap under eviction: the same allocate/write/free/rewrite
+// sequence through a pool of far fewer frames than pages and through the page
+// cache must leave byte-identical files, and every vector must read back from
+// the pool heap before and after a reopen. Without write-back on eviction or
+// on close, pages would come back stale or the files would differ.
+bool test_buffer_pool_evicts_and_writes_back() {
+    TestCase t("through a 256-frame buffer pool, 1000 pages of writes survive eviction and close byte for byte");
+    std::string pool_path = temp_path("ivf_heap_pool"), plain_path = temp_path("ivf_heap_plain");
+    RawVectorHeapLayout layout = compute_raw_vector_heap_layout(PAGE, ELEM);
+    const uint32_t frames = 256, n = 1000 * layout.slots_per_page;  // batches of 4 pages
+    InPlaceIOStats stats;
+    RawVectorHeap pooled, plain;
+    pooled.open(pool_path, layout, RawVectorHeapCache{frames, &stats});
+    plain.open(plain_path, layout);
+
+    // Vector i in slot i, then every third freed and refilled by vector n + i.
+    std::vector<uint32_t> owner_of(n);
+    for (RawVectorHeap* heap : {&pooled, &plain}) {
+        RawVectorFreeList free_list;
+        for (uint32_t i = 0; i < n; ++i) heap->write_vector(heap->allocate_slot(free_list), i, pattern(i).data());
+        for (uint32_t i = 0; i < n; i += 3) heap->free_slot(i, free_list);
+        for (uint32_t i = 0; i < n; i += 3) {
+            const uint32_t slot = heap->allocate_slot(free_list);
+            heap->write_vector(slot, n + slot, pattern(n + slot).data());
+        }
+    }
+    for (uint32_t i = 0; i < n; ++i) owner_of[i] = i % 3 == 0 ? n + i : i;
+    t.check(stats.dirty_evictions.load() > 0, "the pool never evicted a dirty page; the test did not exercise write-back");
+
+    auto read_all_back = [&](RawVectorHeap& heap, const std::string& when) {
+        std::vector<char> got(ELEM);
+        uint32_t bad = 0;
+        for (uint32_t i = 0; i < n; ++i) {
+            bad += heap.read_vector(i, got.data()) != owner_of[i] || got != pattern(owner_of[i]);
+        }
+        t.check(bad == 0, std::to_string(bad) + " slots read back wrong " + when);
+    };
+    read_all_back(pooled, "through the pool before close");
+    pooled.close();
+    plain.close();
+    t.check(read_whole_file(pool_path) == read_whole_file(plain_path),
+            "the pool heap's file differs from the page-cache heap's after identical writes");
+
+    // Batched reads of every slot, out of order and with repeats, in one call
+    // that spans more batches than the pool has frames for at once.
+    pooled.open_existing(pool_path, layout, n, n / layout.slots_per_page, RawVectorHeapCache{frames, &stats});
+    std::vector<uint32_t> slots(n);
+    std::iota(slots.begin(), slots.end(), 0u);
+    std::shuffle(slots.begin(), slots.end(), std::mt19937(7));
+    slots.insert(slots.end(), {5, 5, 6, 5});
+    drain_query_cache_hits(stats);  // hits still buffered per thread from the reads above
+    stats.reset();
+    std::vector<char> out(slots.size() * ELEM);
+    std::vector<uint32_t> owners(slots.size());
+    pooled.read_vectors(slots.data(), slots.size(), out.data(), owners.data());
+    uint32_t bad = 0;
+    for (size_t i = 0; i < slots.size(); ++i) {
+        const std::vector<char> want = pattern(owner_of[slots[i]]);
+        bad += owners[i] != owner_of[slots[i]] || !std::equal(want.begin(), want.end(), out.begin() + i * ELEM);
+    }
+    t.check(bad == 0, std::to_string(bad) + " of " + std::to_string(slots.size()) + " batched reads came back wrong");
+    // One lookup per requested slot, and every page missed at least once: the
+    // counts BufANN's query path reports, over the same pool.
+    drain_query_cache_hits(stats);
+    t.check(stats.cache_hits.load() + stats.cache_misses.load() == slots.size(),
+            "hits + misses " + std::to_string(stats.cache_hits.load() + stats.cache_misses.load()) +
+                " != the " + std::to_string(slots.size()) + " slots read");
+    t.check(stats.batch_misses_total.load() >= n / layout.slots_per_page,
+            "fewer page reads than pages in a heap 4x the pool");
+    read_all_back(pooled, "through the pool after reopen");
+    pooled.close();
+    ::unlink(pool_path.c_str());
+    ::unlink(plain_path.c_str());
+    return t.done();
+}
+
+// 32 threads batch-read random slots through a pool smaller than the heap,
+// so pages are loaded, hit and evicted under one another. BufferPool once let
+// pin_batch keep a pin on a frame an evictor had just claimed: the batch then
+// got another page's bytes (caught by the page header check, 4 runs in 5) or
+// deadlocked against the evictor waiting for its pin to drain. A watchdog
+// fails the test rather than let a deadlock hang the suite.
+bool test_buffer_pool_concurrent_batches_under_eviction() {
+    TestCase t("32 threads batch-reading through a pool of 16384 frames over 20000 pages get only their own pages");
+    std::string path = temp_path("ivf_heap_pool_stress");
+    RawVectorHeapLayout layout = compute_raw_vector_heap_layout(PAGE, 128);
+    const uint32_t pages = 20000, n = pages * layout.slots_per_page;
+    ::unlink(path.c_str());
+    {
+        RawVectorHeap heap;
+        heap.open(path, layout);
+        RawVectorHeapBulkWriter writer(heap, 256);
+        std::vector<char> v(128, 0);
+        for (uint32_t i = 0; i < n; ++i) {
+            std::memcpy(v.data(), &i, 4);
+            writer.append(i, v.data());
+        }
+        writer.finish();
+    }
+    RawVectorHeap heap;
+    heap.open_existing(path, layout, n, pages, RawVectorHeapCache{16384, nullptr});
+
+    std::atomic<bool> stop{false}, finished{false};
+    std::atomic<uint64_t> batches{0}, wrong{0}, thrown{0};
+    std::thread watchdog([&] {
+        for (int i = 0; i < 600 && !finished.load(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        if (!finished.load()) {
+            std::cout << "  FAIL: batch readers still running 55 s after being stopped (deadlock)" << std::endl;
+            std::_Exit(1);
+        }
+    });
+    std::vector<std::thread> readers;
+    for (uint32_t r = 0; r < 32; ++r) {
+        readers.emplace_back([&, r] {
+            std::mt19937 rng(r);
+            std::vector<uint32_t> slots(100), owners(100);
+            std::vector<char> out(100 * 128);
+            while (!stop.load()) {
+                for (uint32_t& s : slots) s = rng() % n;
+                try {
+                    heap.read_vectors(slots.data(), slots.size(), out.data(), owners.data());
+                } catch (const diskann::ANNException&) {
+                    thrown.fetch_add(1);
+                    continue;
+                }
+                for (size_t i = 0; i < slots.size(); ++i) {
+                    uint32_t id;
+                    std::memcpy(&id, out.data() + i * 128, 4);
+                    wrong += owners[i] != slots[i] || id != slots[i];
+                }
+                batches.fetch_add(1);
+            }
+        });
+    }
+    std::this_thread::sleep_for(std::chrono::seconds(5));
+    stop.store(true);
+    for (auto& th : readers) th.join();
+    finished.store(true);
+    watchdog.join();
+
+    t.check(thrown.load() == 0, std::to_string(thrown.load()) + " batches were handed another page");
+    t.check(wrong.load() == 0, std::to_string(wrong.load()) + " slots read back another vector's bytes");
+    t.check(batches.load() > 1000, "only " + std::to_string(batches.load()) + " batches ran");
+    heap.close();
+    ::unlink(path.c_str());
+    return t.done();
+}
+
+bool test_buffer_pool_needs_direct_io_pages() {
+    TestCase t("a buffer-pool heap refuses a page_size O_DIRECT cannot read, and creates no file doing so");
+    std::string path = temp_path("ivf_heap_pool_page");
+    RawVectorHeapLayout small = compute_raw_vector_heap_layout(2048, 64);
+    RawVectorHeap heap;
+    ::unlink(path.c_str());
+    t.expect_throw("open with page_size 2048", [&] { heap.open(path, small, RawVectorHeapCache{64, nullptr}); });
+    t.check(::access(path.c_str(), F_OK) != 0, "the refused open created the file");
+    heap.open(path, small);  // through the page cache any page_size works
+    RawVectorFreeList free_list;
+    heap.write_vector(heap.allocate_slot(free_list), 0, pattern(0, 64).data());
+    heap.close();
+    t.expect_throw("open_existing with page_size 2048",
+                   [&] { heap.open_existing(path, small, 1, 1, RawVectorHeapCache{64, nullptr}); });
+    t.check(heap.allocated_pages() == 0 && !heap.uses_buffer_pool(), "the refused open left the heap open");
+    ::unlink(path.c_str());
+    return t.done();
+}
+
 }  // namespace
 
 int main() {
     bool all_pass = true;
-    all_pass &= test_layout();
-    all_pass &= test_on_disk_format();
-    all_pass &= test_allocate_write_read_free_reuse();
-    all_pass &= test_free_waits_for_readers_registered_before_it();
-    all_pass &= test_reader_never_sees_a_reused_slot();
-    all_pass &= test_concurrent_bitmap_updates();
-    all_pass &= test_rejects_slots_past_the_rid_slot_space();
-    all_pass &= test_open_refuses_existing_nonempty_file();
-    all_pass &= test_reopen_resumes_the_heap();
-    all_pass &= test_reopen_rejects_bad_file();
-    all_pass &= test_rejected_reopen_after_use_leaves_nothing_behind();
-    all_pass &= test_reopen_sizes_the_file_it_opened();
-    all_pass &= test_read_rejects_misplaced_page();
-    all_pass &= test_bulk_writer_matches_per_slot_writes();
-    all_pass &= test_bulk_writer_rejects_misuse();
-    all_pass &= test_rejects_bad_layout_and_out_of_range_slots();
+    for (uint32_t frames : {0u, 64u}) {
+        InPlaceIOStats stats;
+        g_cache = RawVectorHeapCache{frames, &stats};
+        std::cout << (frames == 0 ? "== through the page cache ==" : "== through a 64-frame buffer pool ==")
+                  << std::endl;
+        all_pass &= test_layout();
+        all_pass &= test_on_disk_format();
+        all_pass &= test_allocate_write_read_free_reuse();
+        all_pass &= test_free_waits_for_readers_registered_before_it();
+        all_pass &= test_reader_never_sees_a_reused_slot();
+        all_pass &= test_concurrent_bitmap_updates();
+        all_pass &= test_rejects_slots_past_the_rid_slot_space();
+        all_pass &= test_open_refuses_existing_nonempty_file();
+        all_pass &= test_reopen_resumes_the_heap();
+        all_pass &= test_reopen_rejects_bad_file();
+        all_pass &= test_rejected_reopen_after_use_leaves_nothing_behind();
+        all_pass &= test_reopen_sizes_the_file_it_opened();
+        all_pass &= test_read_rejects_misplaced_page();
+        all_pass &= test_bulk_writer_matches_per_slot_writes();
+        all_pass &= test_bulk_writer_rejects_misuse();
+        all_pass &= test_rejects_bad_layout_and_out_of_range_slots();
+    }
+    g_cache = RawVectorHeapCache{};
+    all_pass &= test_buffer_pool_evicts_and_writes_back();
+    all_pass &= test_buffer_pool_concurrent_batches_under_eviction();
+    all_pass &= test_buffer_pool_needs_direct_io_pages();
     return all_pass ? 0 : 1;
 }

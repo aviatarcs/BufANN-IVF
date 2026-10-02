@@ -124,6 +124,13 @@ completes it, citing the commit subject.
       65536 and 131072 (~20 sqrt(N) is 60K) with nprobes between the
       powers of two, and at 90M; build time (59 min at 65536) is then
       the cost, so this and the build-time item inform each other.
+      First points, beam 2 x nprobe, best q/s at recall >= 95 / 98 / 99
+      (nprobe): 9M at 65536 10773 (192) / 6209 (384) / 4871 (512), ahead
+      of 32768's 10472 / 6001 / 4231 everywhere; 90M at 16384 1919 (48) /
+      763 (128) / 518 (192); 90M at 131072 (built in 5 h 23 min, peak RSS
+      12.5 GB) 3042 (192) / 1637 (384) / 869 (768). At 90M the scan is the
+      cost: recall 99 scans ~530K codes per query (768 lists of ~690)
+      against ~70K at 9M. Logs: `/var/tmp/bufann-ivf-evpeng/final/`.
 - [ ] **Build time at large nlist.** Assignment of 9M to 32K centroids took
       378 s, ~200 GFLOP/s against a ~1.2 TFLOP/s peak; find where it goes
       before changing the algorithm. Then, if still needed, assign through
@@ -134,6 +141,26 @@ completes it, citing the commit subject.
       run. Depends on the nlist measurement: whole builds at 9M took 85,
       310, 976 and 3562 s at nlist 4096 to 65536, ~3.4x per doubling of
       nlist (the training sample grows with nlist, and so does each pass).
+      Where it goes (9M, nlist 32768, 996 s, phase timers in the build
+      log): k-means++ seeding 376 s, 15 Lloyd's iterations 440 s,
+      assignment and heap write 138 s, PQ training and encoding 38 s.
+      k-means++ does two serial passes over the sample per centroid
+      picked, so it grows with nlist x sample (~16x from 32768 to 131072);
+      Lloyd's and the assignment run their GEMMs at ~550-600 GFLOP/s and
+      grow with nlist x points. Scaled to 90M at 131072 each is ~1.5-2 h,
+      matching the 5 h 23 min measured. Order: final assignment through
+      the graph (largest at 90M, and exact-checkable), then Lloyd's, then
+      k-means++ (parallel sums, or seeding from a subsample).
+      Final assignment through the graph: done in "Assign vectors through
+      the centroid graph from nlist 32768 on" (138 -> 35 s at 9M/32768,
+      recall within 0.02 points; ~8x at 90M/131072 by extrapolation).
+      Lloyd's through the graph: done in "Run Lloyd's iterations through
+      the centroid graph from nlist 32768 on" (2.1M x 32768 from the same
+      init: 429 s -> 60 s, mean squared distance +0.006%; the 9M build
+      16:36 -> 8:31, recall within 0.1 points). k-means++: done in "Drop
+      k-means++'s two serial passes per pick" (374 -> 302 s) and "Seed
+      k-means++ from 4 points per centroid" (302 -> ~20 s; the 9M build
+      7:26 before it).
 - [ ] **nlist cost model.** For 90M+, where one build takes 41 min: sample
       m vectors, cluster them at each candidate nlist, take ~100 sample
       queries with exact neighbours within the sample, estimate nprobe as
@@ -149,6 +176,29 @@ completes it, citing the commit subject.
       the scalar scan as oracle, then compare QPS-recall end to end. Small
       lists (large nlist) leave partial blocks; measure at nlist 32768
       (~275 codes per list at 9M), the sweep's best.
+- [ ] **Raw-vector heap through BufANN's buffer pool.** The heap is read
+      with plain pread, so the query bench serves re-rank reads from an
+      unbounded OS page cache (the 9M heap, 1.2 GB, is fully cached after
+      warmup) while BufANN's runs pay 75 misses per query against a 1 GB
+      pool (262144 frames; I/O is 70% of its latency). Serve the heap's
+      pages through BufANN's buffer pool so both are measured at the same
+      pool size and miss accounting, then compare at 9M and 90M. This is
+      what makes the IVF-PQ vs BufANN numbers like for like; it subsumes
+      the cold-heap item's bench mode below.
+      Serving is done ("Let the raw-vector heap serve its pages through
+      BufANN's buffer pool", "Re-rank from one batched heap read ..."):
+      `ivf_pq_query_bench --buffer_pool_frames` (default 262144, BufANN's
+      1 GB; 0 = page cache) reports hits, misses/query and I/O time under
+      bufann_driver's field names, and a query's re-rank pages are fetched
+      with one pin_batch. Still open: the 9M and 90M comparison on a quiet
+      node. Two things to settle first. (1) The budget: 1 GB is 87% of
+      the 9M heap (300000 pages) but ~28% of BufANN's 9M graph, and
+      IVF-PQ's in-memory part (codes twice, lists) is ~720 MB at 9M, so
+      compare at equal total RSS as well as equal pool size. (2) Warmup:
+      a 4-thread smoke run with a 1000-query warmup showed 22.2 / 13.5
+      misses/query at nprobe 16 / 64 (recall unchanged at 88.248 /
+      97.987), mostly first touches, so both systems should use the same
+      warmup (or preload) before misses are compared.
 - [ ] **Re-rank reads under a cold heap.** The bench reads the heap through
       a warm page cache, while BufANN's numbers pay ~75 buffer-pool misses
       per query; the re-rank's up to rerank_m (100) random reads are our

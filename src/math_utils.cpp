@@ -420,11 +420,29 @@ namespace kmeans {
 
     float* dist = new float[num_points];
 
-#pragma omp parallel for schedule(static, 8192)
-    for (int64_t i = 0; i < (_s64) num_points; i++) {
-      dist[i] =
-          math_utils::calc_distance(data + i * dim, data + init_id * dim, dim);
-    }
+    // Each block of KMEANSPP_BLOCK points keeps a double total of its
+    // distances, filled by the parallel update. A pick then costs that one
+    // parallel pass plus a serial scan of the block totals and of the one
+    // block holding the dart, rather than two serial passes over every
+    // point (74 of the 376 s k-means++ took for 32768 centres over 2.1M
+    // points; the rest is the parallel pass, bound by reading the data).
+    const size_t KMEANSPP_BLOCK = 8192;
+    const size_t num_blocks = (num_points + KMEANSPP_BLOCK - 1) / KMEANSPP_BLOCK;
+    std::vector<double> block_sum(num_blocks);
+    auto update_dist = [&](size_t pivot, bool first) {
+#pragma omp parallel for schedule(static)
+      for (int64_t b = 0; b < (_s64) num_blocks; b++) {
+        const size_t end = (std::min)(num_points, ((size_t) b + 1) * KMEANSPP_BLOCK);
+        double       s = 0;
+        for (size_t i = (size_t) b * KMEANSPP_BLOCK; i < end; i++) {
+          const float d = math_utils::calc_distance(data + i * dim, data + pivot * dim, dim);
+          dist[i] = first ? d : (std::min)(dist[i], d);
+          s += (double) dist[i];
+        }
+        block_sum[(size_t) b] = s;
+      }
+    };
+    update_dist(init_id, true);
 
     double dart_val;
     size_t tmp_pivot;
@@ -434,16 +452,24 @@ namespace kmeans {
       dart_val = distribution(generator);
 
       double sum = 0;
-      for (size_t i = 0; i < num_points; i++) {
-        sum = sum + (double) dist[i];
-      }
+      for (size_t b = 0; b < num_blocks; b++)
+        sum += block_sum[b];
       if (sum == 0)
         sum_flag = true;
 
       dart_val *= sum;
 
+      // The block holding the dart (the last one if rounding leaves it past
+      // every block), then the point within it, as a scan over all points
+      // would have found it.
       double prefix_sum = 0;
-      for (size_t i = 0; i < (num_points); i++) {
+      size_t b = 0;
+      while (b + 1 < num_blocks && dart_val >= prefix_sum + block_sum[b]) {
+        prefix_sum += block_sum[b];
+        b++;
+      }
+      const size_t block_end = (std::min)(num_points, (b + 1) * KMEANSPP_BLOCK);
+      for (size_t i = b * KMEANSPP_BLOCK; i < block_end; i++) {
         tmp_pivot = i;
         if (dart_val >= prefix_sum &&
             dart_val < prefix_sum + (double) dist[i]) {
@@ -460,12 +486,7 @@ namespace kmeans {
       std::memcpy(pivot_data + num_picked * dim, data + tmp_pivot * dim,
                   dim * sizeof(float));
 
-#pragma omp parallel for schedule(static, 8192)
-      for (int64_t i = 0; i < (_s64) num_points; i++) {
-        dist[i] = (std::min)(
-            dist[i], math_utils::calc_distance(data + i * dim,
-                                               data + tmp_pivot * dim, dim));
-      }
+      update_dist(tmp_pivot, false);
       num_picked++;
       // if (num_picked % 32 == 0)
       //  diskann::cout << "." << std::flush;

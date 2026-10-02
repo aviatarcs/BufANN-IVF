@@ -1,7 +1,8 @@
 // Tests for the IVF-PQ build steps on a synthetic-blob base: centroid
 // training (shape, padding, blob recovery, seeding, save/load), cluster
 // assignment + raw-vector bulk load (exact nearest-centroid agreement,
-// RID/heap contents, multi-block streaming, sidecar round-trips, error paths),
+// RID/heap contents, multi-block streaming, sidecar round-trips, error paths;
+// through the centroid graph against brute force on 2048 centroids),
 // posting-list construction (exact inverse of the assignments), PQ (codes
 // are the nearest pivots; PQ distances rank blobs correctly), and the
 // combined index file (round-trip, atomic replace, corruption detection).
@@ -166,6 +167,40 @@ bool test_same_seed_reproduces_centroids(const std::string& base_bin, const IVFM
     return t.done();
 }
 
+// 80000 training points exceed IVF_KMEANSPP_MIN_POINTS, so k-means++ seeds
+// from every other row (the last one included) and Lloyd's refines on all
+// of them; every blob must still get its own centroid near its centre.
+bool test_training_seeds_from_a_strided_subset(const std::string& prefix) {
+    TestCase t("training on a sample larger than the k-means++ seeding cap recovers every blob");
+    const uint32_t blobs = 16, per_blob = 5001, dim = 8;  // 80016: the stride leaves a partial tail
+    const float spacing = 50.0f;
+    std::mt19937 gen(8);
+    std::normal_distribution<float> noise(0.0f, 1.0f);
+    std::vector<float> data;
+    for (uint32_t b = 0; b < blobs; ++b) {
+        for (uint32_t i = 0; i < per_blob; ++i) {
+            for (uint32_t d = 0; d < dim; ++d) data.push_back(float(b) * spacing + noise(gen));
+        }
+    }
+    const std::string bin = prefix + "_strided_seed.bin";
+    diskann::save_bin<float>(bin, data.data(), size_t(blobs) * per_blob, dim);
+    IVFMetadata meta = train_ivf_centroids<float>(bin, blobs, 1.0, NUM_K_MEANS_ITERS, TRAIN_SEED);
+    for (uint32_t b = 0; b < blobs; ++b) {
+        float best = std::numeric_limits<float>::max();
+        for (uint32_t c = 0; c < blobs; ++c) {
+            float s = 0.0f;
+            for (uint32_t d = 0; d < dim; ++d) {
+                const float diff = meta.centroids[size_t(c) * meta.aligned_dim + d] - float(b) * spacing;
+                s += diff * diff;
+            }
+            best = std::min(best, s);
+        }
+        t.check(best < 1.0f, "blob " + std::to_string(b) + " has no centroid near its centre");
+    }
+    ::unlink(bin.c_str());
+    return t.done();
+}
+
 bool test_training_error_paths(const std::string& base_bin) {
     TestCase t("training rejects nlist == 0, nlist > N, and too small a sample");
     t.expect_throw("nlist == 0", [&] { train_ivf_centroids<float>(base_bin, 0); });
@@ -242,6 +277,209 @@ bool test_assign_clusters_and_load_heap(const std::string& tag, const std::strin
     ::unlink(heap_path.c_str());
     ::unlink(ivf_cluster_ids_path(prefix).c_str());
     ::unlink(ivf_rid_table_path(prefix).c_str());
+    return t.done();
+}
+
+// Assignment through the centroid graph, on enough centroids (2048, drawn
+// as blobs rather than trained) for the graph to matter. A beam of nlist
+// must give the brute-force nearest centroid, a narrow beam a near one
+// almost always; the heap and RIDs must be the GEMM path's, byte for byte.
+bool test_graph_assignment(const std::string& prefix) {
+    TestCase t("assignment through the centroid graph: exact at a full beam, near at a narrow one");
+    const uint32_t nlist = 2048, dim = 20, n = 20000;
+    IVFMetadata meta;
+    meta.nlist = nlist, meta.dim = dim, meta.aligned_dim = 24;
+    const std::vector<float> centres = draw_blobs<float>(nlist, 3, dim, 64);
+    meta.centroids.assign(size_t(nlist) * meta.aligned_dim, 0.0f);
+    for (uint32_t c = 0; c < nlist; ++c) {
+        std::copy_n(centres.begin() + size_t(c) * dim, dim, meta.centroids.begin() + size_t(c) * meta.aligned_dim);
+    }
+    set_ivf_centroid_norms(meta);
+    const std::vector<float> base = draw_blobs<float>(n, 4, dim, 64);
+    const std::string base_bin = prefix + "_graph_base.bin", heap_path = ivf_raw_vectors_path(prefix) + ".graph";
+    diskann::save_bin<float>(base_bin, const_cast<float*>(base.data()), n, dim);
+    const IVFCentroidGraph graph = build_ivf_centroid_graph(meta);
+
+    auto assign = [&](const IVFCentroidGraph* g, uint32_t L, ClusterAssignments& a, RawVectorRIDTable& r,
+                      std::vector<char>& heap_bytes) {
+        ::unlink(heap_path.c_str());
+        RawVectorHeap heap;
+        heap.open(heap_path, compute_raw_vector_heap_layout(4096, dim * sizeof(float)));
+        assign_ivf_clusters<float>(base_bin, meta, heap, a, r, 777, g, L);
+        heap.close();
+        std::ifstream in(heap_path, std::ios::binary);
+        heap_bytes.assign(std::istreambuf_iterator<char>(in), {});
+    };
+    ClusterAssignments exact, full, narrow;
+    RawVectorRIDTable exact_rid, full_rid, narrow_rid;
+    std::vector<char> exact_heap, full_heap, narrow_heap;
+    assign(nullptr, 0, exact, exact_rid, exact_heap);
+    assign(&graph, nlist, full, full_rid, full_heap);
+    assign(&graph, 8, narrow, narrow_rid, narrow_heap);
+
+    size_t full_off = 0, narrow_farther = 0;
+    for (uint32_t i = 0; i < n; ++i) {
+        const float* p = base.data() + size_t(i) * dim;
+        const float best = dist_to_centroid(p, meta, nearest_centroid(p, meta));
+        full_off += !close(dist_to_centroid(p, meta, full.cluster_id[i]), best);
+        narrow_farther += narrow.cluster_id[i] >= nlist || !close(dist_to_centroid(p, meta, narrow.cluster_id[i]), best);
+    }
+    t.check(full_off == 0, std::to_string(full_off) + " vectors not at the nearest centroid with a beam of nlist");
+    std::cout << "  beam 8: " << narrow_farther << " of " << n << " vectors at a farther centroid" << std::endl;
+    t.check(narrow_farther < n / 100, "beam 8 put " + std::to_string(narrow_farther) + " vectors off the nearest");
+    t.check(narrow_farther > 0, "beam 8 found every nearest centroid; the narrow case tests nothing");
+    auto same_rids = [](const RawVectorRIDTable& a, const RawVectorRIDTable& b) {
+        return a.rid.size() == b.rid.size() && std::equal(a.rid.begin(), a.rid.end(), b.rid.begin(),
+                                                          [](RawVectorRID x, RawVectorRID y) { return x.packed == y.packed; });
+    };
+    t.check(full_heap == exact_heap && narrow_heap == exact_heap, "heap file differs from the GEMM path's");
+    t.check(same_rids(full_rid, exact_rid) && same_rids(narrow_rid, exact_rid), "RID table differs from the GEMM path's");
+
+    auto rejects = [&](const std::string& what, const IVFCentroidGraph& g, uint32_t L) {
+        t.expect_throw(what, [&] {
+            ClusterAssignments a;
+            RawVectorRIDTable r;
+            std::vector<char> bytes;
+            assign(&g, L, a, r, bytes);
+        });
+    };
+    rejects("graph_L == 0", graph, 0);
+    IVFCentroidGraph other = graph;
+    other.nlist -= 1;
+    rejects("graph for another nlist", other, 16);
+    IVFCentroidGraph short_table = graph;
+    short_table.neighbors.pop_back();
+    rejects("graph neighbour table short by one", short_table, 16);
+    ::unlink(heap_path.c_str());
+    ::unlink(base_bin.c_str());
+    return t.done();
+}
+
+// k-means++ against a serial reference written here: the same generator
+// draws (initial point, then one dart per pick), a full prefix-sum scan per
+// dart, and the same retry on an already picked point. The pivots must be
+// the same points, across several of the implementation's 8192-point blocks.
+bool test_kmeanspp_matches_reference() {
+    TestCase t("k-means++ picks the same pivots as a serial reference");
+    const uint32_t dim = 12, centers = 300;
+    const size_t n = 30000;  // four blocks, the last partial
+    std::vector<float> data = draw_blobs<float>(uint32_t(n), 9, dim, 40);
+    std::vector<float> got(size_t(centers) * dim);
+    kmeans::kmeanspp_selecting_pivots(data.data(), n, dim, got.data(), centers, 17);
+
+    std::vector<float> want(size_t(centers) * dim);
+    std::mt19937 gen(17);
+    std::uniform_real_distribution<> unit(0, 1);
+    std::uniform_int_distribution<size_t> first(0, n - 1);
+    std::vector<size_t> picked{first(gen)};
+    std::vector<double> d(n);
+    for (size_t i = 0; i < n; ++i) d[i] = sq_dist(data.data() + i * dim, data.data() + picked[0] * dim, dim);
+    while (picked.size() < centers) {
+        double dart = unit(gen), sum = 0;
+        for (double v : d) sum += v;
+        dart *= sum;
+        size_t pick = n - 1;
+        double prefix = 0;
+        for (size_t i = 0; i < n; ++i) {
+            if (dart >= prefix && dart < prefix + d[i]) {
+                pick = i;
+                break;
+            }
+            prefix += d[i];
+        }
+        if (std::find(picked.begin(), picked.end(), pick) != picked.end()) continue;
+        picked.push_back(pick);
+        for (size_t i = 0; i < n; ++i) {
+            d[i] = std::min(d[i], double(sq_dist(data.data() + i * dim, data.data() + pick * dim, dim)));
+        }
+    }
+    for (uint32_t c = 0; c < centers; ++c) std::copy_n(data.begin() + picked[c] * dim, dim, want.begin() + size_t(c) * dim);
+    size_t differ = 0;
+    for (uint32_t c = 0; c < centers; ++c) {
+        differ += std::memcmp(got.data() + size_t(c) * dim, want.data() + size_t(c) * dim, dim * sizeof(float)) != 0;
+    }
+    t.check(differ == 0, std::to_string(differ) + " of " + std::to_string(centers) + " pivots differ from the reference");
+    return t.done();
+}
+
+// Graph Lloyd's from fixed initial centres. A beam of nlist makes every
+// assignment exact, so one iteration must give the centres a brute-force
+// iteration in the test does. Over several iterations it is compared with
+// upstream's kmeans::run_lloyds by the sum of squared distances, for a full
+// and a narrow beam: upstream's GEMM expansion breaks near-ties within a few
+// ulps of the norms differently, and it zeroes empty clusters, so the
+// centres themselves drift apart. The returned
+// residual is over assigned, not nearest, centres, so it bounds the
+// recomputed one from above.
+bool test_graph_lloyds() {
+    TestCase t("graph Lloyd's: a brute-force iteration at a full beam, near exact Lloyd's error at a narrow one");
+    const uint32_t nlist = 512, dim = 20, reps = 8;
+    const size_t n = 40000;
+    std::vector<float> data = draw_blobs<float>(uint32_t(n), 5, dim, 64);
+    std::vector<float> init(data.begin(), data.begin() + size_t(nlist) * dim);
+    auto sse = [&](const std::vector<float>& centers) {
+        double s = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            float best = std::numeric_limits<float>::max();
+            for (uint32_t c = 0; c < nlist; ++c) best = std::min(best, sq_dist(data.data() + i * dim, centers.data() + size_t(c) * dim, dim));
+            s += best;
+        }
+        return s;
+    };
+    // One iteration by brute force: nearest centre by direct squared
+    // distance, then the mean in double (independent of the code under test).
+    std::vector<float> want1(init.size(), 0.0f), full1 = init;
+    {
+        std::vector<double> sum(init.size(), 0.0);
+        std::vector<size_t> count(nlist, 0);
+        for (size_t i = 0; i < n; ++i) {
+            std::vector<float> d(nlist);
+            for (uint32_t c = 0; c < nlist; ++c) d[c] = sq_dist(data.data() + i * dim, init.data() + size_t(c) * dim, dim);
+            const uint32_t best = top_k(d, 1)[0];
+            ++count[best];
+            for (uint32_t k = 0; k < dim; ++k) sum[size_t(best) * dim + k] += data[i * dim + k];
+        }
+        for (uint32_t c = 0; c < nlist; ++c) {
+            for (uint32_t k = 0; k < dim; ++k) {
+                want1[size_t(c) * dim + k] = count[c] ? float(sum[size_t(c) * dim + k] / double(count[c])) : init[size_t(c) * dim + k];
+            }
+        }
+    }
+    run_ivf_graph_lloyds(data.data(), n, dim, full1.data(), nlist, 1, nlist);
+    size_t differ = 0;
+    for (size_t i = 0; i < want1.size(); ++i) {
+        differ += std::fabs(want1[i] - full1[i]) > 1e-3f * (1.0f + std::fabs(want1[i]));
+    }
+    t.check(differ == 0, std::to_string(differ) + " centre coordinates differ from one brute-force Lloyd's iteration");
+
+    std::vector<float> exact = init, full = init, narrow = init;
+    kmeans::run_lloyds(data.data(), n, dim, exact.data(), nlist, reps, NULL, NULL);
+    run_ivf_graph_lloyds(data.data(), n, dim, full.data(), nlist, reps, nlist);
+    const float narrow_residual = run_ivf_graph_lloyds(data.data(), n, dim, narrow.data(), nlist, reps, 8);
+    const double e = sse(exact), f = sse(full), w = sse(narrow), i0 = sse(init);
+    std::cout << "  sum of squared distances: initial " << i0 << ", exact " << e << ", beam nlist " << f
+              << ", beam 8 " << w << std::endl;
+    t.check(f <= 1.001 * e && w <= 1.01 * e, "graph Lloyd's is worse than exact Lloyd's beyond tolerance");
+    t.check(e < 0.9 * i0, "Lloyd's barely improved on the initial centres; the comparison tests nothing");
+    t.check(w <= narrow_residual * (1.0 + 1e-5), "returned residual is below the nearest-centre error");
+    t.expect_throw("L == 0", [&] { run_ivf_graph_lloyds(data.data(), n, dim, narrow.data(), nlist, reps, 0); });
+
+    // Two identical initial centres: ties go to one, so the other's cluster
+    // is empty and it must keep its centre, not become NaN or zero. Compared
+    // bit for bit: under -Ofast a NaN compares equal to anything and
+    // std::isfinite is folded to true.
+    std::vector<float> dup = init;
+    std::copy_n(dup.begin(), dim, dup.begin() + dim);
+    run_ivf_graph_lloyds(data.data(), n, dim, dup.data(), nlist, 1, nlist);
+    const size_t row_bytes = dim * sizeof(float);
+    const bool kept = std::memcmp(dup.data() + dim, init.data(), row_bytes) == 0 ||
+                      std::memcmp(dup.data(), init.data(), row_bytes) == 0;
+    const bool finite = std::all_of(dup.begin(), dup.end(), [](float v) {
+        uint32_t bits;
+        std::memcpy(&bits, &v, sizeof(bits));
+        return ((bits >> 23) & 0xFFu) != 0xFFu;
+    });
+    t.check(kept && finite, "an empty cluster's centre was not kept");
     return t.done();
 }
 
@@ -716,8 +954,12 @@ int main() {
         all_pass &= test_seeded_primitives_are_deterministic(base_f32);
         all_pass &= test_same_seed_reproduces_centroids(base_f32, meta);
         all_pass &= test_training_error_paths(base_f32);
+        all_pass &= test_training_seeds_from_a_strided_subset(prefix);
         all_pass &= test_assign_clusters_and_load_heap<float>("float", prefix, base_f32, data_f32, meta);
         all_pass &= test_assignment_error_paths(prefix, base_f32, meta);
+        all_pass &= test_graph_assignment(prefix);
+        all_pass &= test_graph_lloyds();
+        all_pass &= test_kmeanspp_matches_reference();
         all_pass &= test_posting_lists_invert_assignments(prefix);
         all_pass &= test_posting_codes_follow_lists();
         all_pass &= test_closest_centers_blocking();

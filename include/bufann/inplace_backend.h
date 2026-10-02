@@ -117,6 +117,11 @@ struct InPlaceIOStats {
     }
 };
 
+// Pins with FrameRegion::QUERY count their cache hits in per-thread buffers;
+// this moves every thread's count into `stats` (as InPlaceGraphStore::stats()
+// does for its own).
+void drain_query_cache_hits(InPlaceIOStats& stats);
+
 // ---------------------------------------------------------------------------
 // PackedSlotHeader -- 8 bytes, on-disk
 // ---------------------------------------------------------------------------
@@ -462,6 +467,9 @@ class BufferPool {
 
     uint32_t page_size() const { return _page_size; }
     uint32_t num_frames() const { return _num_frames; }
+    // The O_DIRECT descriptor init() opened, for callers that must check the
+    // file they are reading through (its size) rather than a path.
+    int heap_fd() const { return _heap_fd; }
     uint32_t total_pages() const { return _total_pages.load(std::memory_order_acquire); }
     uint32_t pin_count_of(uint32_t page_id) const;
 

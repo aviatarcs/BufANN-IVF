@@ -11,10 +11,16 @@
 //                      --query_file <query.bin> --gt_file <truthset.bin>
 //                      [--nprobes 8,16,32,64,128] [--rerank_m 100] [--k 10]
 //                      [--threads N] [--warmup N] [--graph_beams 2,4]
+//                      [--buffer_pool_frames 262144]
 //
-// The heap is read with pread through the page cache (not O_DIRECT) and has
-// no bounded buffer pool, so after the warmup its touched pages are cached.
+// The heap is read through a BufANN buffer pool of --buffer_pool_frames
+// page frames (default 262144, 1 GB of 4 KB pages: BufANN's benchmark
+// default), O_DIRECT underneath, so the numbers are taken under the memory
+// budget BufANN's are, and each line reports the pool's hits, misses and I/O
+// time for its timed queries under BufANN's driver's field names. 0 frames
+// reads the heap through the unbounded OS page cache instead, as before.
 
+#include "bufann/inplace_backend.h"
 #include "bufann/ivf_pq_build.h"
 #include "bufann/ivf_pq_centroid_graph.h"
 #include "bufann/ivf_pq_index_file.h"
@@ -83,6 +89,7 @@ int run(int argc, char** argv) {
     const int threads = std::stoi(get_arg(argc, argv, "--threads", std::to_string(omp_get_max_threads())));
     const std::vector<uint32_t> nprobes = parse_list(get_arg(argc, argv, "--nprobes", "8,16,32,64,128"));
     const std::vector<uint32_t> graph_beams = parse_list(get_arg(argc, argv, "--graph_beams", ""));
+    const uint32_t pool_frames = uint32_t(std::stoul(get_arg(argc, argv, "--buffer_pool_frames", "262144")));
     for (const std::string& f : {ivf_pq_index_path(prefix), query_file, gt_file}) {
         if (!file_exists(f)) throw diskann::ANNException("missing file: " + f, -1);
     }
@@ -108,8 +115,10 @@ int run(int argc, char** argv) {
 
     auto t0 = std::chrono::steady_clock::now();
     IVFPQIndex ix = load_ivf_pq_index(prefix);
+    InPlaceIOStats io;
     RawVectorHeap heap;
-    heap.open_existing(ivf_raw_vectors_path(prefix), ix.heap_layout, ix.heap_next_slot, ix.heap_pages);
+    heap.open_existing(ivf_raw_vectors_path(prefix), ix.heap_layout, ix.heap_next_slot, ix.heap_pages,
+                       RawVectorHeapCache{pool_frames, &io});
     const size_t n = ix.assignments.cluster_id.size();
     if (dim != ix.meta.dim) {
         throw diskann::ANNException("query dim " + std::to_string(dim) + " != index dim " +
@@ -120,6 +129,14 @@ int run(int argc, char** argv) {
                 prefix.c_str(), n, ix.meta.nlist, ix.pq.chunks, seconds_since(t0), rss_mb(),
                 file_mb(ivf_pq_index_path(prefix)), file_mb(ivf_raw_vectors_path(prefix)),
                 file_mb(ivf_pq_codes_path(prefix)));
+    if (pool_frames == 0) {
+        std::printf("heap: %u pages of %u B through the OS page cache\n", ix.heap_pages, ix.heap_layout.page_size);
+    } else {
+        std::printf("heap: %u pages of %u B through a buffer pool of %u frames (%.0f MB, %.1f%% of the heap)\n",
+                    ix.heap_pages, ix.heap_layout.page_size, pool_frames,
+                    double(pool_frames) * ix.heap_layout.page_size / double(1 << 20),
+                    100.0 * double(pool_frames) / double(std::max(1u, ix.heap_pages)));
+    }
 
     omp_set_num_threads(threads);
     IVFCentroidGraph graph;
@@ -150,6 +167,29 @@ int run(int argc, char** argv) {
         }
     }
 
+    // The pool's counters over one timed phase, as bufann_driver reports them:
+    // I/O time is the single-page pins' plus the batch pins' wait.
+    auto reset_io = [&] {
+        drain_query_cache_hits(io);
+        io.reset();
+    };
+    auto io_json = [&](size_t queries, double avg_latency_s) {
+        drain_query_cache_hits(io);
+        const uint64_t hits = io.cache_hits.load(), misses = io.cache_misses.load();
+        const double io_us = double(io.query_io_ns.load() + io.batch_io_ns_total.load()) / 1e3 / double(queries);
+        char buf[512];
+        std::snprintf(buf, sizeof(buf),
+                      "\"buffer_pool_frames\":%u,\"cache_hits\":%llu,\"cache_misses\":%llu,"
+                      "\"cache_miss_rate\":%.6f,\"misses_per_query\":%.2f,\"io_read_random_ios\":%llu,"
+                      "\"query_io_avg_us_per_query\":%.1f,\"query_io_fraction_of_latency\":%.4f",
+                      pool_frames, (unsigned long long)hits, (unsigned long long)misses,
+                      hits + misses == 0 ? 0.0 : double(misses) / double(hits + misses),
+                      double(misses) / double(queries),
+                      (unsigned long long)(io.page_fault_total.load() + io.batch_misses_total.load()), io_us,
+                      avg_latency_s > 0 ? io_us / (avg_latency_s * 1e6) : 0.0);
+        return std::string(buf);
+    };
+
     auto recall_of = [&](const std::vector<IVFPQSearchResult>& res) {
         size_t hits = 0;
         for (size_t q = 0; q < nq; ++q) {
@@ -175,6 +215,7 @@ int run(int argc, char** argv) {
             }
         };
         concurrent(warmup);
+        reset_io();
         t0 = std::chrono::steady_clock::now();
         concurrent(nq);
         const double wall = seconds_since(t0);
@@ -182,6 +223,7 @@ int run(int argc, char** argv) {
         double avg = 0;
         for (double l : lat) avg += l;
         avg /= double(nq);
+        const std::string io_fields = io_json(nq, avg);
 
         t0 = std::chrono::steady_clock::now();
         std::vector<IVFPQSearchResult> batch = ivf_pq_search_batch<T>(ix, heap, queries.data(), nq, k, nprobe, rerank_m);
@@ -191,10 +233,10 @@ int run(int argc, char** argv) {
                     "\"nprobe\":%u,\"rerank_m\":%u,"
                     "\"query_threads\":%d,\"query_count\":%zu,\"query_qps\":%.1f,\"query_lat_avg_us\":%.1f,"
                     "\"query_lat_p50_us\":%.1f,\"query_lat_p99_us\":%.1f,\"recall\":%.3f,"
-                    "\"batched_qps\":%.1f,\"batched_recall\":%.3f,\"rss_mb\":%.0f}\n",
+                    "\"batched_qps\":%.1f,\"batched_recall\":%.3f,\"rss_mb\":%.0f,%s}\n",
                     n, ix.meta.nlist, ix.pq.chunks, nprobe, rerank_m, threads, nq, double(nq) / wall,
                     avg * 1e6, percentile_us(lat, 0.50), percentile_us(lat, 0.99), recall,
-                    double(nq) / batch_wall, recall_of(batch), rss_mb());
+                    double(nq) / batch_wall, recall_of(batch), rss_mb(), io_fields.c_str());
         std::fflush(stdout);
 
         for (uint32_t factor : graph_beams) {
@@ -214,12 +256,14 @@ int run(int argc, char** argv) {
                 }
             };
             concurrent_graph(warmup);
+            reset_io();
             t0 = std::chrono::steady_clock::now();
             concurrent_graph(nq);
             const double graph_wall = seconds_since(t0);
             double graph_avg = 0;
             for (double l : lat) graph_avg += l;
             graph_avg /= double(nq);
+            const std::string graph_io_fields = io_json(nq, graph_avg);
 
             size_t probe_hits = 0;
 #pragma omp parallel reduction(+ : probe_hits)
@@ -243,11 +287,11 @@ int run(int argc, char** argv) {
                         "\"nlist\":%u,\"pq_chunks\":%u,\"nprobe\":%u,\"rerank_m\":%u,\"query_threads\":%d,"
                         "\"query_count\":%zu,\"query_qps\":%.1f,\"query_lat_avg_us\":%.1f,"
                         "\"query_lat_p50_us\":%.1f,\"query_lat_p99_us\":%.1f,\"recall\":%.3f,"
-                        "\"probe_recall\":%.4f,\"rss_mb\":%.0f}\n",
+                        "\"probe_recall\":%.4f,\"rss_mb\":%.0f,%s}\n",
                         beam, n, ix.meta.nlist, ix.pq.chunks, nprobe, rerank_m, threads, nq,
                         double(nq) / graph_wall, graph_avg * 1e6, percentile_us(lat, 0.50),
                         percentile_us(lat, 0.99), recall_of(res), double(probe_hits) / double(nq * probes),
-                        rss_mb());
+                        rss_mb(), graph_io_fields.c_str());
             std::fflush(stdout);
         }
     }
@@ -266,7 +310,8 @@ int main(int argc, char** argv) {
         get_arg(argc, argv, "--gt_file", "").empty()) {
         std::cerr << "Usage: ivf_pq_query_bench --data_type float|int8|uint8 --index_prefix <prefix> "
                      "--query_file <query.bin> --gt_file <truthset.bin> [--nprobes 8,16,32,64,128] "
-                     "[--rerank_m 100] [--k 10] [--threads N] [--warmup N] [--graph_beams 2,4]"
+                     "[--rerank_m 100] [--k 10] [--threads N] [--warmup N] [--graph_beams 2,4] "
+                     "[--buffer_pool_frames 262144]"
                   << std::endl;
         return 2;
     }

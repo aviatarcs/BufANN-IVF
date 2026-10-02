@@ -1,5 +1,7 @@
 // IVF-PQ raw-vector heap: fixed-size slots in fixed-size pages, addressed by
-// flat slot index (see RawVectorRID). Plain pread/pwrite, no buffer pool.
+// flat slot index (see RawVectorRID). Pages reach memory either through the
+// OS page cache (pread/pwrite) or through a BufANN BufferPool; see
+// RawVectorHeapCache.
 // open() creates a fresh heap; open_existing() resumes one from the geometry
 // and allocation cursor the index file recorded; the free list is rebuilt
 // on load from the page directories (ivf_pq_recover_deletes). The heap file
@@ -10,6 +12,7 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -23,6 +26,24 @@ namespace inplace {
 constexpr uint32_t RAW_VECTOR_BITMAP_LOCK_STRIPES = 64;
 constexpr uint32_t RAW_VECTOR_MAX_READERS         = 1024;  // ReadGuards held at once
 
+class BufferPool;
+struct InPlaceIOStats;
+
+// How the heap's pages reach memory. With buffer_pool_frames == 0 they are
+// read and written with pread/pwrite, so the OS page cache holds as much of
+// the heap as it likes, uncounted. Otherwise every page access goes through a
+// BufANN BufferPool of that many page frames over the file opened O_DIRECT:
+// the same CLOCK replacement, libaio batch reads and hit/miss/I/O-time
+// accounting (into `stats`, when given) as BufANN's graph, so the two are
+// measured under one memory budget. page_size must then be a multiple of
+// 4096, and the pool must hold the pages every concurrent reader pins at once
+// (read_vectors pins up to buffer_pool_frames / 64, at most 256, at a time):
+// BufferPool throws when every frame of the shard a page maps to is pinned.
+struct RawVectorHeapCache {
+    uint32_t buffer_pool_frames = 0;
+    InPlaceIOStats* stats = nullptr;
+};
+
 // allocate_slot/write_vector/free_slot may be called concurrently: allocation
 // is serialized on _grow_mtx, bitmap read-modify-writes on a per-page stripe.
 // A freed slot is not handed out again while a ReadGuard that could still
@@ -34,15 +55,21 @@ public:
     RawVectorHeap(const RawVectorHeap&)            = delete;
     RawVectorHeap& operator=(const RawVectorHeap&) = delete;
 
-    void open(const std::string& path, RawVectorHeapLayout layout);
+    void open(const std::string& path, RawVectorHeapLayout layout, RawVectorHeapCache cache = {});
 
     // Resumes a heap that open()/bulk load wrote earlier. The file must be
     // exactly `allocated_pages` pages and its first and last page headers must
     // carry their own ids and this layout's page_size/elem_size; every other
     // page is verified when it is read.
     void open_existing(const std::string& path, RawVectorHeapLayout layout,
-                       uint32_t next_flat_slot, uint32_t allocated_pages);
-    void close();  // afterwards next_flat_slot() == allocated_pages() == 0
+                       uint32_t next_flat_slot, uint32_t allocated_pages, RawVectorHeapCache cache = {});
+    // Writes back the buffer pool's dirty pages; afterwards next_flat_slot()
+    // == allocated_pages() == 0.
+    void close();
+    // Writes back the buffer pool's dirty pages, so the file holds everything
+    // written so far; a no-op without a pool, whose writes go straight to the file.
+    void flush();
+    bool uses_buffer_pool() const { return _pool != nullptr; }
 
     // Grace period for slot reuse. A reader holds a ReadGuard from before it
     // loads any RID until after its last read_vector; a slot freed while the
@@ -72,6 +99,11 @@ public:
     // Returns the slot's owner; throws if the page header is not the slot's
     // page and geometry.
     uint32_t read_vector(uint32_t flat_slot, void* out) const;
+    // read_vector for each of `n` slots: slot i's bytes to out + i *
+    // elem_size, its owner to owners[i]. With a buffer pool, the pages
+    // missing from it are read in batches of concurrent I/Os (BufANN's batch
+    // pin) rather than one read at a time.
+    void read_vectors(const uint32_t* flat_slots, size_t n, char* out, uint32_t* owners) const;
     bool is_slot_occupied(uint32_t flat_slot) const;
     // The page's occupancy bitmap (bitmap_bytes) and owner ids (slots_per_page)
     // in one read; verifies the page header.
@@ -96,6 +128,13 @@ public:
 
 private:
     void set_layout(RawVectorHeapLayout layout);
+    void open_buffer_pool(const std::string& path, RawVectorHeapCache cache, bool truncate);
+    // Buffer-pool page access: `fn` gets the page under the frame's shared
+    // (read) or exclusive (write) latch; a read verifies the page header first.
+    template<typename F>
+    void read_pool_page(uint32_t page_id, F fn) const;
+    template<typename F>
+    void write_pool_page(uint32_t page_id, F fn);
     void read_at(uint64_t offset, void* buf, size_t bytes, const char* what) const;
     void write_at(uint64_t offset, const void* buf, size_t bytes, const char* what);
     void require_page_header_on_disk(uint32_t page_id) const;
@@ -115,7 +154,8 @@ private:
         std::atomic<uint64_t> epoch{0};
     };
 
-    int _fd = -1;
+    int _fd = -1;           // page-cache mode only
+    std::unique_ptr<BufferPool> _pool;  // buffer-pool mode only; owns its own O_DIRECT descriptor
     RawVectorHeapLayout _layout;
     std::mutex _grow_mtx;
     mutable std::array<std::mutex, RAW_VECTOR_BITMAP_LOCK_STRIPES> _bitmap_mtx;
