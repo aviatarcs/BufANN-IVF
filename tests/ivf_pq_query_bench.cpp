@@ -11,6 +11,7 @@
 //                      --query_file <query.bin> --gt_file <truthset.bin>
 //                      [--nprobes 8,16,32,64,128] [--rerank_m 100] [--k 10]
 //                      [--threads N] [--warmup N] [--graph_beams 2,4]
+//                      [--warmup_query_file <warmup.bin>] [--skip_exact 1]
 //                      [--buffer_pool_frames 262144]
 //
 // The heap is read through a BufANN buffer pool of --buffer_pool_frames
@@ -36,6 +37,7 @@
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -111,7 +113,27 @@ int run(int argc, char** argv) {
     }
     if (nq == 0) throw diskann::ANNException("query file holds no queries: " + query_file, -1);
     if (gt_rows < nq || gt_k < k) throw diskann::ANNException("truthset smaller than queries x k", -1);
-    const size_t warmup = std::min(nq, size_t(std::stoul(get_arg(argc, argv, "--warmup", "1000"))));
+    // Warmup queries: the first --warmup of the timed ones, or, as
+    // bufann_driver's --warmup_query_file, up to --warmup rows of a separate
+    // file (BufANN's scripts sample them from the base), so the pool is not
+    // warmed by the very queries that are then timed.
+    const std::string warmup_file = get_arg(argc, argv, "--warmup_query_file", "");
+    const bool skip_exact = get_arg(argc, argv, "--skip_exact", "0") != "0";
+    if (skip_exact && graph_beams.empty()) throw diskann::ANNException("--skip_exact needs --graph_beams", -1);
+    std::vector<float> warmup_queries;
+    size_t warmup = std::min(nq, size_t(std::stoul(get_arg(argc, argv, "--warmup", "1000"))));
+    if (warmup_file.empty()) {
+        warmup_queries.assign(queries.begin(), queries.begin() + warmup * dim);
+    } else {
+        if (!file_exists(warmup_file)) throw diskann::ANNException("missing file: " + warmup_file, -1);
+        T* wraw = nullptr;
+        size_t wn = 0, wdim = 0;
+        diskann::load_bin<T>(warmup_file, wraw, wn, wdim);
+        std::unique_ptr<T[]> owned(wraw);
+        if (wdim != dim) throw diskann::ANNException("warmup query dim differs from the queries'", -1);
+        warmup = std::min(wn, size_t(std::stoul(get_arg(argc, argv, "--warmup", "1000"))));
+        warmup_queries.assign(wraw, wraw + warmup * dim);
+    }
 
     auto t0 = std::chrono::steady_clock::now();
     IVFPQIndex ix = load_ivf_pq_index(prefix);
@@ -202,63 +224,68 @@ int run(int argc, char** argv) {
     for (uint32_t nprobe : nprobes) {
         std::vector<IVFPQSearchResult> res(nq);
         std::vector<double> lat(nq);
-        auto concurrent = [&](size_t count) {
+        // Searches `count` rows of `qs`, recording results and latencies
+        // only when they are the timed queries.
+        auto concurrent = [&](const float* qs, size_t count, bool timed) {
 #pragma omp parallel
             {
                 IVFPQSearchScratch scratch;
 #pragma omp for schedule(dynamic, 1)
                 for (size_t q = 0; q < count; ++q) {
                     auto s = std::chrono::steady_clock::now();
-                    res[q] = ivf_pq_search<T>(ix, heap, queries.data() + q * dim, k, nprobe, rerank_m, scratch);
-                    lat[q] = seconds_since(s);
+                    IVFPQSearchResult r = ivf_pq_search<T>(ix, heap, qs + q * dim, k, nprobe, rerank_m, scratch);
+                    if (timed) res[q] = std::move(r), lat[q] = seconds_since(s);
                 }
             }
         };
-        concurrent(warmup);
-        reset_io();
-        t0 = std::chrono::steady_clock::now();
-        concurrent(nq);
-        const double wall = seconds_since(t0);
-        const double recall = recall_of(res);
-        double avg = 0;
-        for (double l : lat) avg += l;
-        avg /= double(nq);
-        const std::string io_fields = io_json(nq, avg);
+        if (!skip_exact) {
+            concurrent(warmup_queries.data(), warmup, false);
+            reset_io();
+            t0 = std::chrono::steady_clock::now();
+            concurrent(queries.data(), nq, true);
+            const double wall = seconds_since(t0);
+            const double recall = recall_of(res);
+            double avg = 0;
+            for (double l : lat) avg += l;
+            avg /= double(nq);
+            const std::string io_fields = io_json(nq, avg);
 
-        t0 = std::chrono::steady_clock::now();
-        std::vector<IVFPQSearchResult> batch = ivf_pq_search_batch<T>(ix, heap, queries.data(), nq, k, nprobe, rerank_m);
-        const double batch_wall = seconds_since(t0);
+            t0 = std::chrono::steady_clock::now();
+            std::vector<IVFPQSearchResult> batch =
+                ivf_pq_search_batch<T>(ix, heap, queries.data(), nq, k, nprobe, rerank_m);
+            const double batch_wall = seconds_since(t0);
 
-        std::printf("{\"baseline\":\"IVF-PQ\",\"centroid_search\":\"exact\",\"N\":%zu,\"nlist\":%u,\"pq_chunks\":%u,"
-                    "\"nprobe\":%u,\"rerank_m\":%u,"
-                    "\"query_threads\":%d,\"query_count\":%zu,\"query_qps\":%.1f,\"query_lat_avg_us\":%.1f,"
-                    "\"query_lat_p50_us\":%.1f,\"query_lat_p99_us\":%.1f,\"recall\":%.3f,"
-                    "\"batched_qps\":%.1f,\"batched_recall\":%.3f,\"rss_mb\":%.0f,%s}\n",
-                    n, ix.meta.nlist, ix.pq.chunks, nprobe, rerank_m, threads, nq, double(nq) / wall,
-                    avg * 1e6, percentile_us(lat, 0.50), percentile_us(lat, 0.99), recall,
-                    double(nq) / batch_wall, recall_of(batch), rss_mb(), io_fields.c_str());
-        std::fflush(stdout);
+            std::printf("{\"baseline\":\"IVF-PQ\",\"centroid_search\":\"exact\",\"N\":%zu,\"nlist\":%u,\"pq_chunks\":%u,"
+                        "\"nprobe\":%u,\"rerank_m\":%u,"
+                        "\"query_threads\":%d,\"query_count\":%zu,\"query_qps\":%.1f,\"query_lat_avg_us\":%.1f,"
+                        "\"query_lat_p50_us\":%.1f,\"query_lat_p99_us\":%.1f,\"recall\":%.3f,"
+                        "\"batched_qps\":%.1f,\"batched_recall\":%.3f,\"rss_mb\":%.0f,%s}\n",
+                        n, ix.meta.nlist, ix.pq.chunks, nprobe, rerank_m, threads, nq, double(nq) / wall,
+                        avg * 1e6, percentile_us(lat, 0.50), percentile_us(lat, 0.99), recall,
+                        double(nq) / batch_wall, recall_of(batch), rss_mb(), io_fields.c_str());
+            std::fflush(stdout);
+        }
 
         for (uint32_t factor : graph_beams) {
             const uint32_t probes = std::min(nprobe, ix.meta.nlist);
             const uint32_t beam = factor * probes;
-            auto concurrent_graph = [&](size_t count) {
+            auto concurrent_graph = [&](const float* qs, size_t count, bool timed) {
 #pragma omp parallel
                 {
                     IVFPQSearchScratch scratch;
 #pragma omp for schedule(dynamic, 1)
                     for (size_t q = 0; q < count; ++q) {
                         auto s = std::chrono::steady_clock::now();
-                        res[q] = ivf_pq_search_graph<T>(ix, graph, heap, queries.data() + q * dim, k, nprobe, beam,
-                                                        rerank_m, scratch);
-                        lat[q] = seconds_since(s);
+                        IVFPQSearchResult r = ivf_pq_search_graph<T>(ix, graph, heap, qs + q * dim, k, nprobe, beam,
+                                                                     rerank_m, scratch);
+                        if (timed) res[q] = std::move(r), lat[q] = seconds_since(s);
                     }
                 }
             };
-            concurrent_graph(warmup);
+            concurrent_graph(warmup_queries.data(), warmup, false);
             reset_io();
             t0 = std::chrono::steady_clock::now();
-            concurrent_graph(nq);
+            concurrent_graph(queries.data(), nq, true);
             const double graph_wall = seconds_since(t0);
             double graph_avg = 0;
             for (double l : lat) graph_avg += l;
@@ -311,6 +338,7 @@ int main(int argc, char** argv) {
         std::cerr << "Usage: ivf_pq_query_bench --data_type float|int8|uint8 --index_prefix <prefix> "
                      "--query_file <query.bin> --gt_file <truthset.bin> [--nprobes 8,16,32,64,128] "
                      "[--rerank_m 100] [--k 10] [--threads N] [--warmup N] [--graph_beams 2,4] "
+                     "[--warmup_query_file <warmup.bin>] [--skip_exact 1] "
                      "[--buffer_pool_frames 262144]"
                   << std::endl;
         return 2;
