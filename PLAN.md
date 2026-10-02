@@ -237,13 +237,16 @@ completes it, citing the commit subject.
       load through the heap's occupancy bitmap, `ivf_pq_recover_deletes`);
       the backend's inserted-tag maps must survive the fold or be persisted
       with it.
-- [ ] **One in-memory copy of the PQ codes.** Search reads the posting-order
+- [x] **One in-memory copy of the PQ codes.** Search reads the posting-order
       `PostingLists::codes`; `PQMetadata::codes` (by id) is kept only for the
       index-file writer and the tests' oracles, doubling the codes' memory
       (32 B/vector at 32 chunks: +2.7 GB at 90M). Persist the codes in
       posting order (bump the index version), drop the by-id copy after load,
       and have the rebuild produce posting-order codes directly. Depends on
-      the rebuild above.
+      the rebuild above. (Done without waiting for the rebuild in "Keep the
+      IVF-PQ codes in memory once, in posting order": index file version 5;
+      9M nlist 65536 loads in 484 MB instead of 751, q/s unchanged. The
+      rebuild, when written, must fill PostingLists::codes itself.)
 
 ## Not planned
 
