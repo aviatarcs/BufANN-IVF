@@ -160,7 +160,11 @@ completes it, citing the commit subject.
       16:36 -> 8:31, recall within 0.1 points). k-means++: done in "Drop
       k-means++'s two serial passes per pick" (374 -> 302 s) and "Seed
       k-means++ from 4 points per centroid" (302 -> ~20 s; the 9M build
-      7:26 before it).
+      7:26 before it). At 90M: nlist 131072 builds in 30:55, 262144 in
+      1:02:50, where seeding (1245 s) and Lloyd's (1316 s) dominate:
+      seeding costs nlist x 4 nlist rows, quadratic in nlist, so 1B
+      (~630K lists) needs a cheaper seed (fewer points per centroid,
+      k-means||, or random init) before it is affordable.
 - [ ] **nlist cost model.** For 90M+, where one build takes 41 min: sample
       m vectors, cluster them at each candidate nlist, take ~100 sample
       queries with exact neighbours within the sample, estimate nprobe as
@@ -216,7 +220,19 @@ completes it, citing the commit subject.
       One run in ~40 aborted before the pin_batch fix; none of 20 after.
       BufANN's numbers come from BufANN-CS395T's bufann_driver, whose
       pin_batch has the same race (recall matched its earlier runs, so no
-      sign it bit at 1 GB). Still open: 90M.
+      sign it bit at 1 GB).
+      90M, done (`benchmark_results/sift100m_2026-10-03.jsonl`; IVF-PQ index v5,
+      one copy of the codes, so equal pools are near equal RSS: 5.2-6.6 GB
+      for IVF-PQ against 5.5 GB for BufANN at 1 GB). Best q/s at recall
+      >= 90 / 95 / 98, 1 GB pool: BufANN 8748 / 6991 / 4060 (98.98 at L
+      200, 3069 q/s); IVF-PQ nlist 262144 7021 / 3499 / 1993, nlist 131072
+      5068 / 2927 / 1615. BufANN wins 1.2-2.0x at 90M. IVF-PQ is scan-bound
+      (I/O 3-12% of latency at those recalls, ~90 ns per scanned code as at
+      9M, p99 23-82 ms against BufANN's 8-13 ms); 262144 beats 131072 by
+      1.2-1.4x and has not flattened. An 8 GB pool moved either system by
+      under 10%: after a 1000-query warmup it is mostly empty, so most
+      misses are first touches. Next: 4-bit fast-scan (LindormVector scans
+      codes in SIMD batches of 32), nlist beyond 262144, a longer warmup.
 - [ ] **Re-rank reads under a cold heap.** The bench reads the heap through
       a warm page cache, while BufANN's numbers pay ~75 buffer-pool misses
       per query; the re-rank's up to rerank_m (100) random reads are our
