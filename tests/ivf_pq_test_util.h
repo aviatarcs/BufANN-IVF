@@ -118,6 +118,20 @@ std::vector<float> to_float(const T* v, size_t n) {
     return std::vector<float>(v, v + n);
 }
 
+// The PQ chunk split as the upstream trainer makes it, restated for the
+// oracles: when chunks does not divide dim, the first dim % chunks chunks
+// hold one dimension more. Chunk c of a vector is [off[c], off[c+1]), and
+// chunk c's pivot j is the len(c) floats at k * off[c] + j * len(c).
+inline std::vector<uint32_t> expected_chunk_offsets(uint32_t dim, uint32_t chunks) {
+    std::vector<uint32_t> off{0};
+    for (uint32_t c = 0; c < chunks; ++c) off.push_back(off.back() + dim / chunks + (c < dim % chunks ? 1 : 0));
+    return off;
+}
+inline const float* expected_pivot(const diskann::inplace::PQMetadata& pq, const std::vector<uint32_t>& off,
+                                   uint32_t c, uint32_t j) {
+    return pq.pivots.data() + size_t(pq.k) * off[c] + size_t(j) * (off[c + 1] - off[c]);
+}
+
 // --- fixtures --------------------------------------------------------------
 
 // `blobs` Gaussian blobs with centres drawn once (seed 99) in [40, 215] and

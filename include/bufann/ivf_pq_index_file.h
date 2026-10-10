@@ -6,7 +6,7 @@
 //   [cluster ids     u32  N]
 //   [posting offsets u32  nlist + 1]
 //   [posting ids     u32  N]
-//   [pq pivots       f32  chunks x k x chunk_dim]
+//   [pq pivots       f32  k x dim, chunk by chunk (PQMetadata)]
 //   [pq codes        u8   N x chunks, row i the code of posting id i]
 //   [rid table       u32  N]
 //

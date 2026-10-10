@@ -46,8 +46,7 @@ void require_consistent(const IVFPQIndex& ix) {
                        ix.meta.centroids.size() == size_t(ix.meta.nlist) * ix.meta.aligned_dim &&
                        ix.meta.centroid_l2sq.size() == ix.meta.nlist,
                    "IVFMetadata is inconsistent (centroid_l2sq must be set; see set_ivf_centroid_norms)");
-    IVF_PQ_REQUIRE(ix.pq.chunks > 0 && ix.pq.k > 0 && ix.pq.chunks * ix.pq.chunk_dim == ix.meta.dim &&
-                       ix.pq.pivots.size() == size_t(ix.pq.chunks) * ix.pq.k * ix.pq.chunk_dim,
+    IVF_PQ_REQUIRE(pq_shape_ok(ix.pq, ix.meta.dim),
                    "PQMetadata is inconsistent with the index");
     IVF_PQ_REQUIRE(ix.lists.offsets.size() == size_t(ix.meta.nlist) + 1 && ix.lists.offsets.front() == 0 &&
                        ix.lists.ids.size() == n_base,
@@ -198,10 +197,9 @@ IVFPQSearchResult search_probes(const IVFPQIndex& ix, const RawVectorHeap& heap,
     RawVectorHeap::ReadGuard guard(heap);
 
     for (uint32_t c = 0; c < pq.chunks; ++c) {
+        const uint32_t len = pq_chunk_len(pq, c);
         for (uint32_t j = 0; j < pq.k; ++j) {
-            scratch.pq_table[size_t(c) * pq.k + j] =
-                sq_dist(query + c * pq.chunk_dim, pq.pivots.data() + (size_t(c) * pq.k + j) * pq.chunk_dim,
-                        pq.chunk_dim);
+            scratch.pq_table[size_t(c) * pq.k + j] = sq_dist(query + pq.chunk_offsets[c], pq_pivot(pq, c, j), len);
         }
     }
 

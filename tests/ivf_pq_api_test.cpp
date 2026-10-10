@@ -415,7 +415,7 @@ bool test_config_validation(const std::string& prefix) {
     };
     bad("ivf_nlist == 0", [](BufANNConfig& c) { c.ivf_nlist = 0; });
     bad("ivf_pq_chunks == 0", [](BufANNConfig& c) { c.ivf_pq_chunks = 0; });
-    bad("dim % ivf_pq_chunks != 0", [](BufANNConfig& c) { c.ivf_pq_chunks = 5; });
+    bad("ivf_pq_chunks > dim", [](BufANNConfig& c) { c.ivf_pq_chunks = c.dim + 1; });
     bad("config.dim != data dim", [](BufANNConfig& c) { c.dim = DIM + 1; });
 
     // nprobe is only needed at query time; 0 there is an error, search_L cures it.

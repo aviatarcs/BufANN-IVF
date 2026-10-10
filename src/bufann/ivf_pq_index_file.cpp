@@ -132,8 +132,8 @@ void require_section_sizes(const IVFPQIndexFileHeader& h) {
                    "posting-offsets section size does not match nlist + 1");
     IVF_PQ_REQUIRE(h.posting_ids_bytes == n * sizeof(uint32_t),
                    "posting-ids section size does not match num_vectors");
-    IVF_PQ_REQUIRE(h.pq_pivots_bytes == uint64_t(h.pq_chunks) * h.pq_k * h.pq_chunk_dim * sizeof(float),
-                   "PQ pivot section size does not match chunks x k x chunk_dim");
+    IVF_PQ_REQUIRE(h.pq_pivots_bytes == uint64_t(h.pq_k) * h.dim * sizeof(float),
+                   "PQ pivot section size does not match k x dim");
     IVF_PQ_REQUIRE(h.pq_codes_bytes == n * h.pq_chunks, "PQ code section size does not match N x chunks");
     IVF_PQ_REQUIRE(h.rid_table_bytes == n * sizeof(uint32_t),
                    "RID-table section size does not match num_vectors");
@@ -145,8 +145,9 @@ void require_header(const IVFPQIndexFileHeader& h, const std::string& path) {
                    "IVF-PQ index file version " + std::to_string(h.version) + " is not supported");
     IVF_PQ_REQUIRE(h.nlist > 0 && h.dim > 0 && h.aligned_dim == align_dim(h.dim),
                    "IVF-PQ index header has an invalid nlist/dim");
-    IVF_PQ_REQUIRE(h.pq_chunks > 0 && h.pq_k > 0 && h.pq_k <= 256 &&
-                       uint64_t(h.pq_chunks) * h.pq_chunk_dim == h.dim,
+    // pq_chunk_dim is dim / pq_chunks when that divides, else 0 (uneven chunks).
+    IVF_PQ_REQUIRE(h.pq_chunks > 0 && h.pq_chunks <= h.dim && h.pq_k > 0 && h.pq_k <= 256 &&
+                       h.pq_chunk_dim == (h.dim % h.pq_chunks == 0 ? h.dim / h.pq_chunks : 0),
                    "IVF-PQ index header has an invalid PQ shape");
     IVF_PQ_REQUIRE(h.num_vectors <= uint64_t(RAW_VECTOR_RID_SLOT_MASK) + 1,
                    "IVF-PQ index header num_vectors exceeds the RID slot space");
@@ -274,6 +275,7 @@ IVFPQIndex load_ivf_pq_index(const std::string& index_prefix) {
     index.lists.ids = in.read<uint32_t>(h.posting_ids_offset, h.posting_ids_bytes, "posting ids");
     index.pq.chunks = h.pq_chunks;
     index.pq.chunk_dim = h.pq_chunk_dim;
+    index.pq.chunk_offsets = pq_chunk_offsets(h.dim, h.pq_chunks);
     index.pq.k = h.pq_k;
     index.pq.pivots = in.read<float>(h.pq_pivots_offset, h.pq_pivots_bytes, "PQ pivots");
     // The blocked layout (and the scans over it) index 256-entry tables.

@@ -19,7 +19,7 @@ namespace inplace {
 uint32_t ivf_nearest_centroid(const IVFMetadata& meta, const float* x);
 
 // code[c] = argmin_j ||x[chunk c] - pivots[c][j]||^2, exact float distances,
-// the lowest j on a tie. x has chunks * chunk_dim elements.
+// the lowest j on a tie. x has chunk_offsets.back() (= dim) elements.
 void ivf_pq_encode(const PQMetadata& pq, const float* x, uint8_t* code);
 
 // An insert in two steps, so a caller can publish its own bookkeeping (the

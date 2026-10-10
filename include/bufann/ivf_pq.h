@@ -61,12 +61,19 @@ struct PostingLists {
     IVFPQBlockedCodes blocked;    // empty until build_ivf_blocked_codes
 };
 
-// PQMetadata: product-quantization pivots and per-vector codes
+// PQMetadata: product-quantization pivots and per-vector codes. Chunk c
+// covers dimensions [chunk_offsets[c], chunk_offsets[c+1]); when chunks does
+// not divide dim, the first dim - floor(dim / chunks) * chunks chunks hold
+// one dimension more, as the upstream PQ trainer splits them
+// (pq_chunk_offsets). Chunk c's k pivots are contiguous, k * chunk_len(c)
+// floats from pivots[k * chunk_offsets[c]] on (pq_pivot); with uniform
+// chunks that is the [chunks, k, chunk_dim] layout.
 struct PQMetadata {
     uint32_t chunks    = 0;
-    uint32_t chunk_dim = 0;
+    uint32_t chunk_dim = 0;  // dim / chunks when uniform, else 0
     uint32_t k         = 0;  // number of PQ centers per chunk (256 for uint8 codes)
-    std::vector<float>   pivots;  // shape: [chunks, k, chunk_dim]
+    std::vector<uint32_t> chunk_offsets;  // [chunks + 1]
+    std::vector<float>   pivots;  // [k x dim], chunk by chunk
     // shape: [N, chunks], by vector id. Only the build holds them (from
     // load_ivf_pq); a loaded index keeps the codes once, in PostingLists::codes,
     // and leaves this empty.
@@ -143,6 +150,24 @@ struct PostingListDelta {
 };
 
 // DynamicPQCodes: PQ codes for vectors inserted since the last rebuild
+inline std::vector<uint32_t> pq_chunk_offsets(uint32_t dim, uint32_t chunks) {
+    std::vector<uint32_t> off(size_t(chunks) + 1, 0);
+    const uint32_t low = chunks == 0 ? 0 : dim / chunks, high_count = chunks == 0 ? 0 : dim - low * chunks;
+    for (uint32_t c = 0; c < chunks; ++c) off[c + 1] = off[c] + low + (c < high_count ? 1 : 0);
+    return off;
+}
+inline uint32_t pq_chunk_len(const PQMetadata& pq, uint32_t c) { return pq.chunk_offsets[c + 1] - pq.chunk_offsets[c]; }
+inline const float* pq_pivot(const PQMetadata& pq, uint32_t c, uint32_t j) {
+    return pq.pivots.data() + size_t(pq.k) * pq.chunk_offsets[c] + size_t(j) * pq_chunk_len(pq, c);
+}
+// The PQ's shape is consistent with `dim`: offsets as pq_chunk_offsets gives
+// them, chunk_dim matching, k pivots of every chunk.
+inline bool pq_shape_ok(const PQMetadata& pq, uint32_t dim) {
+    return pq.chunks > 0 && pq.chunks <= dim && pq.k > 0 && pq.chunk_offsets.size() == size_t(pq.chunks) + 1 &&
+           pq.chunk_offsets.back() == dim && pq.chunk_dim == (dim % pq.chunks == 0 ? dim / pq.chunks : 0) &&
+           pq.pivots.size() == size_t(pq.k) * dim;
+}
+
 // PQMetadata::codes is a flat array and cannot grow in place, so codes for
 // recent inserts live here until the next rebuild. Queries consult both.
 struct DynamicPQCodes {

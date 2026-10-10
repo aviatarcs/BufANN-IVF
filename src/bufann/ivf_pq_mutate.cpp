@@ -33,16 +33,15 @@ uint32_t ivf_nearest_centroid(const IVFMetadata& meta, const float* x) {
 }
 
 void ivf_pq_encode(const PQMetadata& pq, const float* x, uint8_t* code) {
-    IVF_PQ_REQUIRE(pq.chunks > 0 && pq.k > 0 && pq.k <= 256 &&
-                       pq.pivots.size() == size_t(pq.chunks) * pq.k * pq.chunk_dim,
+    IVF_PQ_REQUIRE(pq.k <= 256 && !pq.chunk_offsets.empty() && pq_shape_ok(pq, pq.chunk_offsets.back()),
                    "PQMetadata is inconsistent");
     for (uint32_t c = 0; c < pq.chunks; ++c) {
-        const float* sub = x + size_t(c) * pq.chunk_dim;
-        const float* pivots = pq.pivots.data() + size_t(c) * pq.k * pq.chunk_dim;
+        const float* sub = x + pq.chunk_offsets[c];
+        const uint32_t len = pq_chunk_len(pq, c);
         uint32_t best = 0;
-        float best_dist = sq_dist(sub, pivots, pq.chunk_dim);
+        float best_dist = sq_dist(sub, pq_pivot(pq, c, 0), len);
         for (uint32_t j = 1; j < pq.k; ++j) {
-            const float d = sq_dist(sub, pivots + size_t(j) * pq.chunk_dim, pq.chunk_dim);
+            const float d = sq_dist(sub, pq_pivot(pq, c, j), len);
             if (d < best_dist) best = j, best_dist = d;
         }
         code[c] = uint8_t(best);
@@ -55,7 +54,7 @@ IVFPQPreparedInsert ivf_pq_prepare_insert(IVFPQIndex& ix, RawVectorHeap& heap, I
     const uint32_t dim = ix.meta.dim;
     IVF_PQ_REQUIRE(heap.layout().elem_size == dim * sizeof(T),
                    "raw-vector heap elem_size does not match dim * sizeof(T)");
-    IVF_PQ_REQUIRE(ix.pq.chunks * ix.pq.chunk_dim == dim, "PQMetadata does not cover dim");
+    IVF_PQ_REQUIRE(pq_shape_ok(ix.pq, dim), "PQMetadata does not cover dim");
 
     std::vector<float> x(dim);
     for (uint32_t d = 0; d < dim; ++d) x[d] = float(vec[d]);

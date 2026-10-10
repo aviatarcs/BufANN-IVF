@@ -47,11 +47,10 @@ IVFPQSearchResult reference_search(const IVFPQIndex& ix, const RawVectorHeap& he
         centroid_dist[c] = sq_dist(q, ix.meta.centroids.data() + size_t(c) * ix.meta.aligned_dim, DIM);
     }
     std::vector<float> table(size_t(ix.pq.chunks) * ix.pq.k);
+    const std::vector<uint32_t> off = expected_chunk_offsets(DIM, ix.pq.chunks);
     for (uint32_t c = 0; c < ix.pq.chunks; ++c) {
         for (uint32_t j = 0; j < ix.pq.k; ++j) {
-            table[size_t(c) * ix.pq.k + j] = sq_dist(
-                q + c * ix.pq.chunk_dim, ix.pq.pivots.data() + (size_t(c) * ix.pq.k + j) * ix.pq.chunk_dim,
-                ix.pq.chunk_dim);
+            table[size_t(c) * ix.pq.k + j] = sq_dist(q + off[c], expected_pivot(ix.pq, off, c, j), off[c + 1] - off[c]);
         }
     }
     std::vector<uint32_t> candidates;
@@ -452,7 +451,8 @@ bool test_guards(const Built& b, const std::vector<float>& queries) {
         c.lists.codes.clear();
         c.lists.blocked = IVFPQBlockedCodes{};
     });
-    corrupt("PQ chunks do not cover dim", [](IVFPQIndex& c) { c.pq.chunk_dim -= 1; });
+    corrupt("PQ chunk_dim disagreeing with chunks", [](IVFPQIndex& c) { c.pq.chunk_dim -= 1; });
+    corrupt("PQ chunks do not cover dim", [](IVFPQIndex& c) { c.pq.chunk_offsets.back() -= 1; });
     corrupt("posting offsets end early", [](IVFPQIndex& c) { c.lists.offsets.back() -= 1; });
     corrupt("posting offsets missing a partition", [](IVFPQIndex& c) { c.lists.offsets.pop_back(); });
     corrupt("centroids short by one", [](IVFPQIndex& c) { c.meta.centroids.pop_back(); });
@@ -464,6 +464,7 @@ bool test_guards(const Built& b, const std::vector<float>& queries) {
 int main() {
     const std::string prefix_f = temp_path("ivf_pq_search_f32");
     const std::string prefix_u = temp_path("ivf_pq_search_u8");
+    const std::string prefix_e = temp_path("ivf_pq_search_uneven");
     bool all_pass = true;
     try {
         std::vector<float> base_f = draw_blobs<float>(N, 1, DIM, BLOBS);
@@ -474,9 +475,12 @@ int main() {
         set_fastscan_enabled(false);
         std::unique_ptr<Built> f = build_index<float>(prefix_f, base_f, N, DIM, NLIST, CHUNKS, TRAIN_SEED);
         std::unique_ptr<Built> u = build_index<uint8_t>(prefix_u, base_u, N, DIM, NLIST, CHUNKS, TRAIN_SEED);
+        // 20 dims into 6 chunks: two of 4 dims, four of 3.
+        std::unique_ptr<Built> e = build_index<float>(prefix_e, base_f, N, DIM, NLIST, 6, TRAIN_SEED);
 
         all_pass &= test_matches_reference<float>("f32", *f, queries);
         all_pass &= test_matches_reference<uint8_t>("u8", *u, queries);
+        all_pass &= test_matches_reference<float>("f32 uneven chunks", *e, queries);
         all_pass &= test_batch_matches_single<float>("f32", *f, queries);
         all_pass &= test_batch_matches_single<uint8_t>("u8", *u, queries);
         all_pass &= test_exact_distances_and_full_probe<float>("f32", *f, base_f, queries);
@@ -490,16 +494,19 @@ int main() {
         all_pass &= test_buffer_pool_matches_reference<uint8_t>("u8", *u, prefix_u, queries);
         all_pass &= test_fastscan_end_to_end<float>("f32", *f, base_f, queries);
         all_pass &= test_fastscan_end_to_end<uint8_t>("u8", *u, base_u, queries);
+        all_pass &= test_fastscan_end_to_end<float>("f32 uneven chunks", *e, base_f, queries);
         all_pass &= test_scratch_follows_index(*f, *u, queries);
         all_pass &= test_guards(*f, queries);
 
         f->heap.close();
         u->heap.close();
+        e->heap.close();
     } catch (const diskann::ANNException& e) {
         std::cout << "  FAIL: " << e.message() << std::endl;
         all_pass = false;
     }
     remove_index_files(prefix_f);
     remove_index_files(prefix_u);
+    remove_index_files(prefix_e);
     return all_pass ? 0 : 1;
 }
