@@ -26,15 +26,17 @@ namespace inplace {
 
 std::string ivf_pq_index_path(const std::string& index_prefix);
 
-// Writes the PQ codes from index.lists.codes when they cover the lists, else
-// gathers them in posting order from the by-id index.pq.codes (the build's).
+// Writes the PQ codes in posting order from index.lists.codes when they cover
+// the lists, else from index.lists.blocked (a loaded index), else gathered
+// from the by-id index.pq.codes (the build's).
 void write_ivf_pq_index(const std::string& index_prefix, const IVFPQIndex& index);
 
 // Validates the header, every section's size against the header's shape,
 // and the cross-section invariants (posting lists are the exact inverse of
 // the cluster ids, RIDs address allocated heap slots, the heap file has the
 // recorded size). Throws on any inconsistency. The codes land in
-// lists.codes only; pq.codes stays empty.
+// lists.blocked (lists.codes when the PQ has fewer than 256 centres);
+// pq.codes stays empty.
 IVFPQIndex load_ivf_pq_index(const std::string& index_prefix);
 
 }  // namespace inplace

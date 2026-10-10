@@ -445,9 +445,13 @@ bool test_guards(const Built& b, const std::vector<float>& queries) {
         t.expect_throw(what, [&] { ivf_pq_search<float>(copy, b.heap, query, K, 4, RERANK_M); });
     };
     corrupt("RID table short by one", [](IVFPQIndex& c) { c.rid_table.rid.pop_back(); });
-    corrupt("posting-list codes short by one row",
-            [](IVFPQIndex& c) { c.lists.codes.resize(c.lists.codes.size() - CHUNKS); });
-    corrupt("posting-list codes never set", [](IVFPQIndex& c) { c.lists.codes.clear(); });
+    corrupt("blocked codes short by one block", [](IVFPQIndex& c) {
+        c.lists.blocked.blocks.resize(c.lists.blocked.blocks.size() - size_t(CHUNKS) * IVF_FASTSCAN_BLOCK);
+    });
+    corrupt("no codes for the lists", [](IVFPQIndex& c) {
+        c.lists.codes.clear();
+        c.lists.blocked = IVFPQBlockedCodes{};
+    });
     corrupt("PQ chunks do not cover dim", [](IVFPQIndex& c) { c.pq.chunk_dim -= 1; });
     corrupt("posting offsets end early", [](IVFPQIndex& c) { c.lists.offsets.back() -= 1; });
     corrupt("posting offsets missing a partition", [](IVFPQIndex& c) { c.lists.offsets.pop_back(); });

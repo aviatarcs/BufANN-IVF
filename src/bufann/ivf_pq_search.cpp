@@ -52,8 +52,9 @@ void require_consistent(const IVFPQIndex& ix) {
     IVF_PQ_REQUIRE(ix.lists.offsets.size() == size_t(ix.meta.nlist) + 1 && ix.lists.offsets.front() == 0 &&
                        ix.lists.ids.size() == n_base,
                    "PostingLists are inconsistent with the index");
-    IVF_PQ_REQUIRE(ix.lists.codes.size() == n_base * ix.pq.chunks,
-                   "PostingLists codes do not cover the lists (see set_ivf_posting_codes)");
+    IVF_PQ_REQUIRE(ix.lists.codes.size() == n_base * ix.pq.chunks ||
+                       ivf_blocked_codes_cover(ix.lists.blocked, ix.lists, ix.pq.chunks),
+                   "neither posting-list nor blocked codes cover the lists (see set_ivf_posting_codes)");
 }
 
 void size_scratch(IVFPQSearchScratch& s, const IVFPQIndex& index) {
@@ -218,9 +219,24 @@ IVFPQSearchResult search_probes(const IVFPQIndex& ix, const RawVectorHeap& heap,
         };
         scratch.candidates.clear();
         scratch.pq_dist.clear();
-        for (uint32_t part : scratch.probe_order) {
-            for (uint32_t i = ix.lists.offsets[part]; i < ix.lists.offsets[part + 1]; ++i) {
-                add_candidate(ix.lists.ids[i], ix.lists.codes.data() + size_t(i) * pq.chunks);
+        if (!ix.lists.codes.empty()) {
+            for (uint32_t part : scratch.probe_order) {
+                for (uint32_t i = ix.lists.offsets[part]; i < ix.lists.offsets[part + 1]; ++i) {
+                    add_candidate(ix.lists.ids[i], ix.lists.codes.data() + size_t(i) * pq.chunks);
+                }
+            }
+        } else {
+            // A loaded index keeps only the blocked layout.
+            const size_t block_bytes = size_t(pq.chunks) * IVF_FASTSCAN_BLOCK;
+            for (uint32_t part : scratch.probe_order) {
+                const uint32_t begin = ix.lists.offsets[part], n = ix.lists.offsets[part + 1] - begin;
+                const uint8_t* first = ivf_list_blocks(ix.lists.blocked, part);
+                for (uint32_t i = 0; i < n; ++i) {
+                    scratch.candidates.push_back(ix.lists.ids[begin + i]);
+                    scratch.pq_dist.push_back(adc_block_lane(first + size_t(i / IVF_FASTSCAN_BLOCK) * block_bytes,
+                                                             pq.chunks, i % IVF_FASTSCAN_BLOCK,
+                                                             scratch.pq_table.data()));
+                }
             }
         }
 

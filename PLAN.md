@@ -36,7 +36,7 @@ of all scanned codes, and 7-21% in heap reads
       The search is still mostly centroid cache misses (1.4 ms per query at
       nprobe 512, beam 1x); a compact copy of the centroids for the
       traversal is the next lever, as LindormVector compresses them.)
-- [ ] **Quicker ADC scan for the existing 32 x 8-bit codes.** Andre,
+- [x] **Quicker ADC scan for the existing 32 x 8-bit codes.** Andre,
       Kermarrec and Le Scouarnec, "Quicker ADC: Unlocking the Hidden
       Potential of Product Quantization with SIMD" (TPAMI 2019,
       arXiv:1812.09162), split tables: each 256-entry lookup table, with its
@@ -58,9 +58,15 @@ of all scanned codes, and 7-21% in heap reads
       90M, nlist 262144, beam 1.25x, 1 GB pool, nprobe 128 / 256 / 512:
       q/s 6138 / 3673 / 2083 -> 10982 / 8644 / 5757, recall 92.47 / 96.22 /
       98.28 -> 92.45 / 96.21 / 98.25, p99 17.0 / 29.5 / 50.3 -> 4.8 / 6.7 /
-      10.8 ms. Still to do: the blocked codes are built at load beside the
-      posting-order ones (+3 GB at 90M); drop the latter after load, with
-      the float path and the writer reading the blocked layout.
+      10.8 ms. Then "Keep a loaded index's PQ codes only in the blocked
+      layout": the loader streams the file's codes into the blocks 64K rows
+      at a time and keeps no posting-order copy; the float path and the
+      writer read the blocked layout. 90M load RSS 6.6 GB (both copies, or
+      the freed one held by tcmalloc) -> 4.6 GB; running RSS at the 1 GB
+      pool 5.3-5.5 GB, BufANN's 5.5 GB; q/s unchanged (11020 / 5800 at
+      nprobe 128 / 512). Note: the IVF-PQ binaries link the system
+      tcmalloc (the dev_env shim is a symlink to it), like bufann_driver;
+      an earlier note that the bench used glibc malloc was wrong.
 - [ ] **Two-level IVF for the centroid search.** Instead of the centroid
       graph, cluster the nlist centroids into ~sqrt(nlist) super-centroids
       (512 at 262144), probe the nearest super-lists and compute exact

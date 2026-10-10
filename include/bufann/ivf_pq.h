@@ -37,15 +37,16 @@ struct ClusterAssignments {
 // PostingLists: partition c is ids[offsets[c] : offsets[c+1]]. `codes` holds
 // the PQ code of ids[i] at [i * chunks, (i + 1) * chunks), so a probe scans
 // its partition's codes sequentially; PQMetadata::codes, indexed by id, would
-// cost a cache miss per candidate. The index file stores them in this order
-// and the loader reads them straight here; the build derives them from the
-// by-id codes (set_ivf_posting_codes, or the writer).
+// cost a cache miss per candidate. The index file stores them in this order;
+// the build derives them from the by-id codes (set_ivf_posting_codes, or the
+// writer). A loaded index holds them only as `blocked` and leaves `codes`
+// empty, so the codes are in memory once.
 // The same codes transposed for the SIMD scan (ivf_pq_fastscan.h): list p
 // owns blocks [block_start[p], block_start[p+1]); its i-th vector is lane
 // i % IVF_FASTSCAN_BLOCK of its (i / IVF_FASTSCAN_BLOCK)-th block, and a
 // block holds `chunks` rows of IVF_FASTSCAN_BLOCK bytes, row c being
 // sub-code c of the block's vectors. Lanes past the list's end are zero.
-// Derived at load, not persisted.
+// Built at load from the file's posting-order codes, not persisted.
 constexpr uint32_t IVF_FASTSCAN_BLOCK = 64;
 struct IVFPQBlockedCodes {
     uint32_t chunks = 0;

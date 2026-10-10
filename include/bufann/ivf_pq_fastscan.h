@@ -21,6 +21,22 @@ namespace inplace {
 // Built from lists.codes (posting order). Throws unless those cover the lists.
 IVFPQBlockedCodes build_ivf_blocked_codes(const PostingLists& lists, uint32_t chunks);
 
+// The same in two steps, so the codes can be streamed in rather than held
+// whole: the zeroed layout for posting lists `offsets`, then rows
+// [first_row, first_row + nrows) of the posting-order codes placed in it.
+IVFPQBlockedCodes make_ivf_blocked_layout(const std::vector<uint32_t>& offsets, uint32_t chunks);
+void place_ivf_blocked_rows(IVFPQBlockedCodes& b, const std::vector<uint32_t>& offsets, uint32_t first_row,
+                            const uint8_t* rows, uint32_t nrows);
+
+// O(1) shape check: one block range per list and storage for every block.
+// (That each range fits its list is build_ivf_blocked_codes' invariant.)
+bool ivf_blocked_codes_cover(const IVFPQBlockedCodes& b, const PostingLists& lists, uint32_t chunks);
+
+// The blocks of list p, and where its local row i lives in them.
+inline const uint8_t* ivf_list_blocks(const IVFPQBlockedCodes& b, uint32_t p) {
+    return b.blocks.data() + size_t(b.block_start[p]) * b.chunks * IVF_FASTSCAN_BLOCK;
+}
+
 // A query's lookup tables quantized for the scan: entry [c][j] is
 // min(255, round((table[c][j] - min_j table[c][j]) / delta)), so a code's
 // summed entries s estimate its PQ distance as dmin + s * delta. With delta =

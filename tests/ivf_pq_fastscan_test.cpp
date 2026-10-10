@@ -20,9 +20,10 @@ namespace {
 
 const uint32_t CHUNKS = 32;
 
-// Lists of sizes 0, 1, 63, 64, 65, 200 and random ones, with random codes.
+// Lists of sizes 0, 1, 63, 64, 65, 200 with runs of empty lists between
+// them, and random ones, with random codes.
 PostingLists random_lists(std::mt19937& gen) {
-    std::vector<uint32_t> sizes{0, 1, 63, 64, 65, 200};
+    std::vector<uint32_t> sizes{0, 1, 0, 0, 63, 64, 0, 65, 200, 0};
     std::uniform_int_distribution<uint32_t> size(0, 300);
     for (int i = 0; i < 20; ++i) sizes.push_back(size(gen));
     PostingLists lists;
@@ -66,6 +67,29 @@ bool test_blocked_layout() {
     short_codes.codes.pop_back();
     t.expect_throw("codes not covering the lists", [&] { build_ivf_blocked_codes(short_codes, CHUNKS); });
     t.expect_throw("zero chunks", [&] { build_ivf_blocked_codes(lists, 0); });
+    return t.done();
+}
+
+// The loader streams the codes in pieces; any split into consecutive pieces,
+// including ones that end mid-list and empty lists between them, must give
+// the layout built in one go.
+bool test_blocked_rows_in_pieces() {
+    TestCase t("blocked rows placed piece by piece equal the layout built in one go");
+    std::mt19937 gen(4);
+    const PostingLists lists = random_lists(gen);
+    const IVFPQBlockedCodes whole = build_ivf_blocked_codes(lists, CHUNKS);
+    const uint32_t n = lists.offsets.back();
+    for (uint32_t piece : {1u, 7u, 64u, 65u, 1000u}) {
+        IVFPQBlockedCodes b = make_ivf_blocked_layout(lists.offsets, CHUNKS);
+        for (uint32_t r = 0; r < n; r += piece) {
+            const uint32_t nr = std::min(piece, n - r);
+            place_ivf_blocked_rows(b, lists.offsets, r, lists.codes.data() + size_t(r) * CHUNKS, nr);
+        }
+        t.check(b.block_start == whole.block_start && b.blocks == whole.blocks,
+                "pieces of " + std::to_string(piece) + " rows give a different layout");
+    }
+    IVFPQBlockedCodes b = make_ivf_blocked_layout(lists.offsets, CHUNKS);
+    t.expect_throw("rows past the lists", [&] { place_ivf_blocked_rows(b, lists.offsets, n, lists.codes.data(), 1); });
     return t.done();
 }
 
@@ -138,6 +162,7 @@ int main() {
     bool all_pass = true;
     try {
         all_pass &= test_blocked_layout();
+        all_pass &= test_blocked_rows_in_pieces();
         all_pass &= test_quantized_table();
         all_pass &= test_kernel_matches_plain_sum();
     } catch (const diskann::ANNException& e) {

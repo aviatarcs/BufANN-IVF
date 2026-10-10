@@ -856,20 +856,27 @@ bool test_index_file(const std::string& prefix, const std::string& base_bin, con
                 loaded.heap_pages == ix.heap_pages && loaded.heap_next_slot == ix.heap_next_slot,
             "loaded index differs from what was written");
 
-    // The loader lays the codes out by posting list; checked against the
-    // codes file as upstream wrote it, row = vector id.
+    // The loader keeps the codes once, transposed into blocks of 64 per
+    // posting list; read back here by hand and checked against the codes
+    // file as upstream wrote it, row = vector id.
     {
         uint8_t* file_codes = nullptr;
         size_t rows = 0, chunks = 0;
         diskann::load_bin<uint8_t>(ivf_pq_codes_path(pre), file_codes, rows, chunks);
-        size_t wrong = loaded.lists.codes.size() == rows * chunks ? 0 : 1;
-        for (size_t i = 0; wrong == 0 && i < loaded.lists.ids.size(); ++i) {
-            wrong += !std::equal(file_codes + size_t(loaded.lists.ids[i]) * chunks,
-                                 file_codes + size_t(loaded.lists.ids[i] + 1) * chunks,
-                                 loaded.lists.codes.begin() + i * chunks);
+        const IVFPQBlockedCodes& b = loaded.lists.blocked;
+        size_t wrong = loaded.lists.codes.empty() && b.chunks == chunks ? 0 : 1;
+        for (size_t p = 0; wrong == 0 && p + 1 < loaded.lists.offsets.size(); ++p) {
+            for (uint32_t i = loaded.lists.offsets[p]; i < loaded.lists.offsets[p + 1]; ++i) {
+                const uint32_t local = i - loaded.lists.offsets[p];
+                const uint8_t* block = b.blocks.data() + (b.block_start[p] + local / IVF_FASTSCAN_BLOCK) * chunks * IVF_FASTSCAN_BLOCK;
+                for (size_t c = 0; c < chunks; ++c) {
+                    wrong += block[c * IVF_FASTSCAN_BLOCK + local % IVF_FASTSCAN_BLOCK] !=
+                             file_codes[size_t(loaded.lists.ids[i]) * chunks + c];
+                }
+            }
         }
         delete[] file_codes;
-        t.check(wrong == 0, "loaded posting-list codes are not the codes file's rows in list order");
+        t.check(wrong == 0, "loaded blocked codes are not the codes file's rows in list order");
     }
 
     // What the loaded header says about the heap is enough to reopen it, and
@@ -905,6 +912,7 @@ bool test_index_file(const std::string& prefix, const std::string& base_bin, con
     {
         IVFPQIndex no_codes = loaded;
         no_codes.lists.codes.clear();
+        no_codes.lists.blocked = IVFPQBlockedCodes{};
         t.expect_throw("writing an index with neither posting nor by-id codes",
                        [&] { write_ivf_pq_index(pre + "_none", no_codes); });
         ::unlink(ivf_pq_index_path(pre + "_none").c_str());

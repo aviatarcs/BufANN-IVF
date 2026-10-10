@@ -14,33 +14,50 @@
 namespace diskann {
 namespace inplace {
 
-IVFPQBlockedCodes build_ivf_blocked_codes(const PostingLists& lists, uint32_t chunks) {
-    IVF_PQ_REQUIRE(chunks > 0 && !lists.offsets.empty() && lists.codes.size() == lists.ids.size() * chunks,
-                   "posting-list codes do not cover the lists");
-    const size_t nlist = lists.offsets.size() - 1;
+IVFPQBlockedCodes make_ivf_blocked_layout(const std::vector<uint32_t>& offsets, uint32_t chunks) {
+    IVF_PQ_REQUIRE(chunks > 0 && !offsets.empty(), "blocked layout needs chunks > 0 and posting offsets");
+    const size_t nlist = offsets.size() - 1;
     IVFPQBlockedCodes b;
     b.chunks = chunks;
     b.block_start.resize(nlist + 1);
     uint32_t next = 0;
     for (size_t p = 0; p < nlist; ++p) {
         b.block_start[p] = next;
-        next += (lists.offsets[p + 1] - lists.offsets[p] + IVF_FASTSCAN_BLOCK - 1) / IVF_FASTSCAN_BLOCK;
+        next += (offsets[p + 1] - offsets[p] + IVF_FASTSCAN_BLOCK - 1) / IVF_FASTSCAN_BLOCK;
     }
     b.block_start[nlist] = next;
-    const size_t block_bytes = size_t(chunks) * IVF_FASTSCAN_BLOCK;
-    b.blocks.assign(size_t(next) * block_bytes, 0);
-#pragma omp parallel for schedule(dynamic, 256)
-    for (int64_t p = 0; p < int64_t(nlist); ++p) {
-        const uint32_t begin = lists.offsets[size_t(p)], end = lists.offsets[size_t(p) + 1];
-        uint8_t* first = b.blocks.data() + size_t(b.block_start[size_t(p)]) * block_bytes;
-        for (uint32_t i = begin; i < end; ++i) {
-            const uint32_t local = i - begin;
-            uint8_t* block = first + size_t(local / IVF_FASTSCAN_BLOCK) * block_bytes;
-            const uint8_t* code = lists.codes.data() + size_t(i) * chunks;
-            for (uint32_t c = 0; c < chunks; ++c) block[size_t(c) * IVF_FASTSCAN_BLOCK + local % IVF_FASTSCAN_BLOCK] = code[c];
-        }
-    }
+    b.blocks.assign(size_t(next) * chunks * IVF_FASTSCAN_BLOCK, 0);
     return b;
+}
+
+void place_ivf_blocked_rows(IVFPQBlockedCodes& b, const std::vector<uint32_t>& offsets, uint32_t first_row,
+                            const uint8_t* rows, uint32_t nrows) {
+    IVF_PQ_REQUIRE(uint64_t(first_row) + nrows <= offsets.back(), "rows past the posting lists");
+    const size_t block_bytes = size_t(b.chunks) * IVF_FASTSCAN_BLOCK;
+    // The list holding first_row; rows are in posting order, so later ones
+    // walk forward through the lists.
+    size_t p = size_t(std::upper_bound(offsets.begin(), offsets.end(), first_row) - offsets.begin()) - 1;
+    for (uint32_t r = 0; r < nrows; ++r) {
+        const uint32_t row = first_row + r;
+        while (row >= offsets[p + 1]) ++p;
+        const uint32_t local = row - offsets[p];
+        uint8_t* block = b.blocks.data() + (size_t(b.block_start[p]) + local / IVF_FASTSCAN_BLOCK) * block_bytes;
+        const uint8_t* code = rows + size_t(r) * b.chunks;
+        for (uint32_t c = 0; c < b.chunks; ++c) block[size_t(c) * IVF_FASTSCAN_BLOCK + local % IVF_FASTSCAN_BLOCK] = code[c];
+    }
+}
+
+IVFPQBlockedCodes build_ivf_blocked_codes(const PostingLists& lists, uint32_t chunks) {
+    IVF_PQ_REQUIRE(chunks > 0 && !lists.offsets.empty() && lists.codes.size() == lists.ids.size() * chunks,
+                   "posting-list codes do not cover the lists");
+    IVFPQBlockedCodes b = make_ivf_blocked_layout(lists.offsets, chunks);
+    place_ivf_blocked_rows(b, lists.offsets, 0, lists.codes.data(), uint32_t(lists.ids.size()));
+    return b;
+}
+
+bool ivf_blocked_codes_cover(const IVFPQBlockedCodes& b, const PostingLists& lists, uint32_t chunks) {
+    return b.chunks == chunks && chunks > 0 && !lists.offsets.empty() && b.block_start.size() == lists.offsets.size() &&
+           b.blocks.size() == size_t(b.block_start.back()) * chunks * IVF_FASTSCAN_BLOCK;
 }
 
 void quantize_pq_table(const float* table, uint32_t chunks, float dmax, IVFPQQuantizedTable& out) {
