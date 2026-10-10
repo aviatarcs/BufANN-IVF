@@ -67,12 +67,20 @@ of all scanned codes, and 7-21% in heap reads
       nprobe 128 / 512). Note: the IVF-PQ binaries link the system
       tcmalloc (the dev_env shim is a symlink to it), like bufann_driver;
       an earlier note that the bench used glibc malloc was wrong.
-- [ ] **Two-level IVF for the centroid search.** Instead of the centroid
+- [x] **Two-level IVF for the centroid search.** Instead of the centroid
       graph, cluster the nlist centroids into ~sqrt(nlist) super-centroids
       (512 at 262144), probe the nearest super-lists and compute exact
       distances to the centroids in them (a small GEMV) to pick nprobe lists.
       Compare with the graph at equal probe-set recall: time, recall, build
       cost. Oracle: the exact GEMM probe set.
+      (Tried, not adopted. Prototype at 90M, nlist 262144, nprobe 512,
+      supers by k-means over the centroids (1.8-12 s), member centroids
+      contiguous per super-list: 512 supers need 33K centroids scanned for
+      probe recall 0.985 (3.8 ms per query per thread), 4096 supers 17K for
+      0.982 (2.3 ms), 2048 supers 33K for 0.995 (4.0 ms); the graph with a
+      1x beam gets 0.997 in 1.4 ms. Both are bound by reading centroid
+      rows (memory bandwidth for the scan, misses for the graph), so a
+      compact copy of the centroids would help either; the graph stays.)
 - [ ] **SIFT100M rerun.** With the items above, rerun the 2026-10-03
       comparison as it was (same BufANN results, same warmup, pools, nprobe
       grid) and record it next to the old one; add nprobes between the
