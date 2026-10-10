@@ -93,26 +93,68 @@ void scan_block_scalar(const uint8_t* block, const IVFPQQuantizedTable& qt, uint
 
 #ifdef IVF_FASTSCAN_HAVE_VBMI
 namespace {
-// Sums fit 16 bits: at most 255 per sub-quantizer, and chunks <= 257.
-__attribute__((target("avx512f,avx512bw,avx512vbmi"))) void scan_block_vbmi(const uint8_t* block,
-                                                                           const IVFPQQuantizedTable& qt,
-                                                                           uint16_t* out) {
-    __m512i acc_lo = _mm512_setzero_si512(), acc_hi = _mm512_setzero_si512();
+#define IVF_FASTSCAN_TARGET __attribute__((target("avx512f,avx512bw,avx512vbmi")))
+
+// One sub-quantizer's 256 entries in four registers; vpermi2b indexes 128 of
+// them by a code's low 7 bits, and the top bit picks the half.
+IVF_FASTSCAN_TARGET inline __m512i lookup(const __m512i t[4], __m512i codes) {
+    return _mm512_mask_blend_epi8(_mm512_movepi8_mask(codes), _mm512_permutex2var_epi8(t[0], codes, t[1]),
+                                  _mm512_permutex2var_epi8(t[2], codes, t[3]));
+}
+
+IVF_FASTSCAN_TARGET inline void accumulate(__m512i& lo, __m512i& hi, __m512i v) {
+    lo = _mm512_add_epi16(lo, _mm512_cvtepu8_epi16(_mm512_castsi512_si256(v)));
+    hi = _mm512_add_epi16(hi, _mm512_cvtepu8_epi16(_mm512_extracti64x4_epi64(v, 1)));
+}
+
+// Sums fit 16 bits: at most 255 per sub-quantizer, and chunks <= 257. Blocks
+// go in pairs so each table load serves two (the loads, not the lookups,
+// bound a single block), and the pair after next is prefetched: a list's
+// codes come from DRAM.
+IVF_FASTSCAN_TARGET void scan_blocks_vbmi(const uint8_t* first, uint32_t nblocks, const IVFPQQuantizedTable& qt,
+                                          uint16_t* out) {
+    const size_t block_bytes = size_t(qt.chunks) * IVF_FASTSCAN_BLOCK;
     const uint8_t* entries = qt.entries.data();
-    for (uint32_t c = 0; c < qt.chunks; ++c) {
-        const uint8_t* t = entries + size_t(c) * 256;
-        const __m512i t0 = _mm512_loadu_si512(t), t1 = _mm512_loadu_si512(t + 64);
-        const __m512i t2 = _mm512_loadu_si512(t + 128), t3 = _mm512_loadu_si512(t + 192);
-        const __m512i codes = _mm512_loadu_si512(block + size_t(c) * IVF_FASTSCAN_BLOCK);
-        // vpermi2b indexes 128 entries by the low 7 bits; the top bit picks the half.
-        const __m512i low = _mm512_permutex2var_epi8(t0, codes, t1);
-        const __m512i high = _mm512_permutex2var_epi8(t2, codes, t3);
-        const __m512i v = _mm512_mask_blend_epi8(_mm512_movepi8_mask(codes), low, high);
-        acc_lo = _mm512_add_epi16(acc_lo, _mm512_cvtepu8_epi16(_mm512_castsi512_si256(v)));
-        acc_hi = _mm512_add_epi16(acc_hi, _mm512_cvtepu8_epi16(_mm512_extracti64x4_epi64(v, 1)));
+    uint32_t b = 0;
+    for (; b + 2 <= nblocks; b += 2) {
+        const uint8_t* b0 = first + size_t(b) * block_bytes;
+        const uint8_t* b1 = b0 + block_bytes;
+        if (b + 4 <= nblocks) {
+            for (size_t off = 0; off < 2 * block_bytes; off += 64) _mm_prefetch((const char*)b0 + 2 * block_bytes + off, _MM_HINT_T0);
+        }
+        __m512i lo0 = _mm512_setzero_si512(), hi0 = lo0, lo1 = lo0, hi1 = lo0;
+        for (uint32_t c = 0; c < qt.chunks; ++c) {
+            const uint8_t* t = entries + size_t(c) * 256;
+            const __m512i tab[4] = {_mm512_loadu_si512(t), _mm512_loadu_si512(t + 64), _mm512_loadu_si512(t + 128),
+                                    _mm512_loadu_si512(t + 192)};
+            accumulate(lo0, hi0, lookup(tab, _mm512_loadu_si512(b0 + size_t(c) * IVF_FASTSCAN_BLOCK)));
+            accumulate(lo1, hi1, lookup(tab, _mm512_loadu_si512(b1 + size_t(c) * IVF_FASTSCAN_BLOCK)));
+        }
+        uint16_t* o = out + size_t(b) * IVF_FASTSCAN_BLOCK;
+        _mm512_storeu_si512(o, lo0);
+        _mm512_storeu_si512(o + 32, hi0);
+        _mm512_storeu_si512(o + 64, lo1);
+        _mm512_storeu_si512(o + 96, hi1);
     }
-    _mm512_storeu_si512(out, acc_lo);
-    _mm512_storeu_si512(out + 32, acc_hi);
+    if (b < nblocks) {
+        const uint8_t* b0 = first + size_t(b) * block_bytes;
+        __m512i lo = _mm512_setzero_si512(), hi = lo;
+        for (uint32_t c = 0; c < qt.chunks; ++c) {
+            const uint8_t* t = entries + size_t(c) * 256;
+            const __m512i tab[4] = {_mm512_loadu_si512(t), _mm512_loadu_si512(t + 64), _mm512_loadu_si512(t + 128),
+                                    _mm512_loadu_si512(t + 192)};
+            accumulate(lo, hi, lookup(tab, _mm512_loadu_si512(b0 + size_t(c) * IVF_FASTSCAN_BLOCK)));
+        }
+        uint16_t* o = out + size_t(b) * IVF_FASTSCAN_BLOCK;
+        _mm512_storeu_si512(o, lo);
+        _mm512_storeu_si512(o + 32, hi);
+    }
+}
+
+IVF_FASTSCAN_TARGET uint64_t lanes_below_avx512(const uint16_t* sums, uint16_t bound) {
+    const __m512i b = _mm512_set1_epi16(short(bound));
+    return uint64_t(_mm512_cmplt_epu16_mask(_mm512_loadu_si512(sums), b)) |
+           uint64_t(_mm512_cmplt_epu16_mask(_mm512_loadu_si512(sums + 32), b)) << 32;
 }
 }  // namespace
 #endif
@@ -133,14 +175,28 @@ bool fastscan_simd_available() {
 #endif
 }
 
-void scan_block(const uint8_t* block, const IVFPQQuantizedTable& qt, uint16_t* out) {
+void scan_blocks(const uint8_t* first, uint32_t nblocks, const IVFPQQuantizedTable& qt, uint16_t* out) {
 #ifdef IVF_FASTSCAN_HAVE_VBMI
     if (fastscan_simd_available()) {
-        scan_block_vbmi(block, qt, out);
+        scan_blocks_vbmi(first, nblocks, qt, out);
         return;
     }
 #endif
-    scan_block_scalar(block, qt, out);
+    const size_t block_bytes = size_t(qt.chunks) * IVF_FASTSCAN_BLOCK;
+    for (uint32_t b = 0; b < nblocks; ++b) {
+        scan_block_scalar(first + b * block_bytes, qt, out + size_t(b) * IVF_FASTSCAN_BLOCK);
+    }
+}
+
+uint64_t lanes_below(const uint16_t* sums, uint32_t lanes, uint32_t bound) {
+    const uint64_t valid = lanes >= 64 ? ~uint64_t(0) : (uint64_t(1) << lanes) - 1;
+    if (bound > 0xFFFF) return valid;
+#ifdef IVF_FASTSCAN_HAVE_VBMI
+    if (fastscan_simd_available()) return lanes_below_avx512(sums, uint16_t(bound)) & valid;
+#endif
+    uint64_t mask = 0;
+    for (uint32_t l = 0; l < lanes && l < 64; ++l) mask |= uint64_t(sums[l] < bound) << l;
+    return mask;
 }
 
 float adc_block_lane(const uint8_t* block, uint32_t chunks, uint32_t lane, const float* table) {

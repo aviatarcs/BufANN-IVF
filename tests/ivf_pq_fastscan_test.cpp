@@ -2,7 +2,8 @@
 // blocked layout against the posting-order codes it is built from, the
 // quantized lookup table against its definition, and the block kernel
 // (AVX-512 VBMI when the CPU has it) against a plain sum of table bytes,
-// exactly, on random codes and tables including the extremes.
+// exactly, on random codes and tables including the extremes, and the lane mask
+// against a per-lane comparison.
 
 #include "bufann/ivf_pq_fastscan.h"
 #include "ivf_pq_test_util.h"
@@ -129,30 +130,58 @@ bool test_quantized_table() {
 
 bool test_kernel_matches_plain_sum() {
     TestCase t(std::string("block kernel (") + (fastscan_simd_available() ? "AVX-512 VBMI" : "scalar") +
-               ") equals a plain sum of table bytes");
+               ") equals a plain sum of table bytes over runs of 1-5 blocks");
     std::mt19937 gen(3);
     std::uniform_int_distribution<int> byte(0, 255);
-    std::vector<uint8_t> block(size_t(CHUNKS) * IVF_FASTSCAN_BLOCK);
-    std::vector<uint16_t> got(IVF_FASTSCAN_BLOCK), ref(IVF_FASTSCAN_BLOCK);
+    const size_t block_bytes = size_t(CHUNKS) * IVF_FASTSCAN_BLOCK;
     IVFPQQuantizedTable qt;
     qt.chunks = CHUNKS;
     qt.entries.resize(size_t(CHUNKS) * 256);
-    size_t wrong = 0;
+    size_t wrong = 0, lanes_checked = 0;
     for (int trial = 0; trial < 200; ++trial) {
+        // Odd and even counts: the kernel takes blocks in pairs, then a last one.
+        const uint32_t nblocks = 1 + trial % 5;
+        std::vector<uint8_t> blocks(nblocks * block_bytes);
+        std::vector<uint16_t> got(nblocks * IVF_FASTSCAN_BLOCK), ref(IVF_FASTSCAN_BLOCK);
         // Trial 0: every code 255 and every entry 255 (the largest sum, the
         // top half of every table); trial 1: every code 127 (the low half's
         // last entry); the rest random.
-        for (size_t i = 0; i < block.size(); ++i) block[i] = trial == 0 ? 255 : trial == 1 ? 127 : uint8_t(byte(gen));
-        for (size_t i = 0; i < qt.entries.size(); ++i) qt.entries[i] = trial == 0 ? 255 : uint8_t(byte(gen));
-        scan_block(block.data(), qt, got.data());
-        scan_block_scalar(block.data(), qt, ref.data());
-        for (uint32_t lane = 0; lane < IVF_FASTSCAN_BLOCK; ++lane) {
-            uint32_t want = 0;
-            for (uint32_t c = 0; c < CHUNKS; ++c) want += qt.entries[c * 256 + block[c * IVF_FASTSCAN_BLOCK + lane]];
-            wrong += got[lane] != want || ref[lane] != want;
+        for (uint8_t& c : blocks) c = trial == 0 ? 255 : trial == 1 ? 127 : uint8_t(byte(gen));
+        for (uint8_t& e : qt.entries) e = trial == 0 ? 255 : uint8_t(byte(gen));
+        scan_blocks(blocks.data(), nblocks, qt, got.data());
+        for (uint32_t b = 0; b < nblocks; ++b) {
+            const uint8_t* block = blocks.data() + b * block_bytes;
+            scan_block_scalar(block, qt, ref.data());
+            for (uint32_t lane = 0; lane < IVF_FASTSCAN_BLOCK; ++lane) {
+                uint32_t want = 0;
+                for (uint32_t c = 0; c < CHUNKS; ++c) want += qt.entries[c * 256 + block[c * IVF_FASTSCAN_BLOCK + lane]];
+                wrong += got[b * IVF_FASTSCAN_BLOCK + lane] != want || ref[lane] != want;
+                ++lanes_checked;
+            }
         }
     }
-    t.check(wrong == 0, std::to_string(wrong) + " lane sums differ from the plain sum");
+    t.check(wrong == 0, std::to_string(wrong) + " of " + std::to_string(lanes_checked) +
+                            " lane sums differ from the plain sum");
+    return t.done();
+}
+
+bool test_lanes_below() {
+    TestCase t("lanes_below sets exactly the bits of valid lanes under the bound");
+    std::mt19937 gen(5);
+    std::uniform_int_distribution<int> word(0, 0xFFFF);
+    std::vector<uint16_t> sums(IVF_FASTSCAN_BLOCK);
+    size_t wrong = 0;
+    for (int trial = 0; trial < 500; ++trial) {
+        for (uint16_t& v : sums) v = uint16_t(word(gen));
+        // Include the extremes: a bound of 0 (no lane), one past the largest
+        // sum (every lane), and bounds equal to a lane's sum (strictly below).
+        const uint32_t bound = trial % 4 == 0 ? 0 : trial % 4 == 1 ? 0x10000 : trial % 4 == 2 ? sums[trial % 64] : word(gen);
+        const uint32_t lanes = trial % 3 == 0 ? IVF_FASTSCAN_BLOCK : uint32_t(trial % IVF_FASTSCAN_BLOCK);
+        uint64_t want = 0;
+        for (uint32_t l = 0; l < lanes; ++l) want |= uint64_t(sums[l] < bound) << l;
+        wrong += lanes_below(sums.data(), lanes, bound) != want;
+    }
+    t.check(wrong == 0, std::to_string(wrong) + " masks differ from the per-lane comparison");
     return t.done();
 }
 
@@ -165,6 +194,7 @@ int main() {
         all_pass &= test_blocked_rows_in_pieces();
         all_pass &= test_quantized_table();
         all_pass &= test_kernel_matches_plain_sum();
+        all_pass &= test_lanes_below();
     } catch (const diskann::ANNException& e) {
         std::cout << "  FAIL: " << e.message() << std::endl;
         all_pass = false;

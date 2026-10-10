@@ -53,12 +53,17 @@ struct IVFPQQuantizedTable {
 // that matter (the rerank_m-th smallest seen so far).
 void quantize_pq_table(const float* table, uint32_t chunks, float dmax, IVFPQQuantizedTable& out);
 
-// Sums of quantized entries for the 64 lanes of one block, into out[64].
-// The SIMD kernel when the CPU has AVX-512 VBMI, else the scalar one.
-void scan_block(const uint8_t* block, const IVFPQQuantizedTable& qt, uint16_t* out);
-// The same integer arithmetic, one lane at a time; the kernel's reference.
+// Sums of quantized entries for every lane of `nblocks` consecutive blocks
+// (one list's), into out[64 * nblocks]. The SIMD kernel when the CPU has
+// AVX-512 VBMI, else the scalar one.
+void scan_blocks(const uint8_t* first, uint32_t nblocks, const IVFPQQuantizedTable& qt, uint16_t* out);
+// The same integer arithmetic for one block, one lane at a time; the
+// kernel's reference.
 void scan_block_scalar(const uint8_t* block, const IVFPQQuantizedTable& qt, uint16_t* out);
-// True when scan_block runs the AVX-512 VBMI kernel.
+// Bit l set for each lane l < `lanes` of one block's sums[64] below `bound`
+// (every such lane when bound > 0xFFFF).
+uint64_t lanes_below(const uint16_t* sums, uint32_t lanes, uint32_t bound);
+// True when scan_blocks runs the AVX-512 VBMI kernel.
 bool fastscan_simd_available();
 
 // Process-wide switch for the search's SIMD scan (on by default); off makes
