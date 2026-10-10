@@ -37,8 +37,9 @@ struct ClusterAssignments {
 // PostingLists: partition c is ids[offsets[c] : offsets[c+1]]. `codes` holds
 // the PQ code of ids[i] at [i * chunks, (i + 1) * chunks), so a probe scans
 // its partition's codes sequentially; PQMetadata::codes, indexed by id, would
-// cost a cache miss per candidate. Derived from PQMetadata::codes by
-// set_ivf_posting_codes and not persisted.
+// cost a cache miss per candidate. The index file stores them in this order
+// and the loader reads them straight here; the build derives them from the
+// by-id codes (set_ivf_posting_codes, or the writer).
 struct PostingLists {
     std::vector<uint32_t> offsets;
     std::vector<uint32_t> ids;
@@ -51,7 +52,10 @@ struct PQMetadata {
     uint32_t chunk_dim = 0;
     uint32_t k         = 0;  // number of PQ centers per chunk (256 for uint8 codes)
     std::vector<float>   pivots;  // shape: [chunks, k, chunk_dim]
-    std::vector<uint8_t> codes;   // shape: [N, chunks]
+    // shape: [N, chunks], by vector id. Only the build holds them (from
+    // load_ivf_pq); a loaded index keeps the codes once, in PostingLists::codes,
+    // and leaves this empty.
+    std::vector<uint8_t> codes;
 };
 
 // IVFPQSearchConfig: search-time handle over the live index structures
@@ -174,8 +178,8 @@ struct IVFPQDelta {
 // IVFPQIndex: everything the combined index file persists, in memory. The
 // raw vectors themselves stay in the heap file; heap_layout, heap_pages and
 // heap_next_slot describe it and are what RawVectorHeap::open_existing needs.
-// assignments and rid_table also cover inserted vectors; lists and pq.codes
-// cover only the base vectors the file was written from.
+// assignments and rid_table also cover inserted vectors; lists (and their
+// codes) cover only the base vectors the file was written from.
 struct IVFPQIndex {
     IVFMetadata meta;
     ClusterAssignments assignments;
@@ -197,9 +201,10 @@ inline uint32_t ivf_pq_num_base(const IVFPQIndex& index) {
 // Version 2 added raw_vector_next_slot and the RawVectorPageHeader; version 3
 // grew that page header from 8 to 16 bytes to record page_size and elem_size,
 // which moves every slot in the heap file; version 4 added the per-page
-// owner-id array between the bitmap and the slots, which moves them again.
+// owner-id array between the bitmap and the slots, which moves them again;
+// version 5 stores the PQ codes in posting-list order, not by vector id.
 constexpr uint32_t IVF_PQ_INDEX_MAGIC   = 0x51465649;  // "IVFQ" little-endian
-constexpr uint32_t IVF_PQ_INDEX_VERSION = 4;
+constexpr uint32_t IVF_PQ_INDEX_VERSION = 5;
 
 struct IVFPQIndexFileHeader {
     uint32_t magic   = 0;

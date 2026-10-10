@@ -54,7 +54,7 @@ IVFPQIndexFileHeader make_header(const IVFPQIndex& index) {
     place(h.posting_offsets_offset, h.posting_offsets_bytes, bytes_of(index.lists.offsets));
     place(h.posting_ids_offset, h.posting_ids_bytes, bytes_of(index.lists.ids));
     place(h.pq_pivots_offset, h.pq_pivots_bytes, bytes_of(index.pq.pivots));
-    place(h.pq_codes_offset, h.pq_codes_bytes, bytes_of(index.pq.codes));
+    place(h.pq_codes_offset, h.pq_codes_bytes, uint64_t(index.lists.ids.size()) * index.pq.chunks);
     place(h.rid_table_offset, h.rid_table_bytes, bytes_of(index.rid_table.rid));
     return h;
 }
@@ -196,6 +196,10 @@ void write_ivf_pq_index(const std::string& index_prefix, const IVFPQIndex& index
     IVFPQIndexFileHeader h = make_header(index);
     require_header(h, index_prefix);
     require_consistent(index);
+    const size_t chunks = index.pq.chunks, rows = index.lists.ids.size();
+    const bool posting_codes = index.lists.codes.size() == rows * chunks;
+    IVF_PQ_REQUIRE(posting_codes || index.pq.codes.size() == rows * chunks,
+                   "neither posting-list nor by-id PQ codes cover the index's vectors");
 
     const std::string path = ivf_pq_index_path(index_prefix);
     const std::string tmp = path + ".tmp";
@@ -207,7 +211,22 @@ void write_ivf_pq_index(const std::string& index_prefix, const IVFPQIndex& index
         out.write(index.lists.offsets);
         out.write(index.lists.ids);
         out.write(index.pq.pivots);
-        out.write(index.pq.codes);
+        if (posting_codes) {
+            out.write(index.lists.codes);
+        } else {
+            // Gathered a block at a time, so the build never holds both orders.
+            const size_t block_rows = size_t(1) << 16;
+            std::vector<uint8_t> block;
+            for (size_t start = 0; start < rows; start += block_rows) {
+                const size_t n = std::min(block_rows, rows - start);
+                block.resize(n * chunks);
+                for (size_t i = 0; i < n; ++i) {
+                    std::memcpy(block.data() + i * chunks,
+                                index.pq.codes.data() + size_t(index.lists.ids[start + i]) * chunks, chunks);
+                }
+                out.write(block);
+            }
+        }
         static_assert(sizeof(RawVectorRID) == sizeof(uint32_t), "RID table is stored as uint32");
         out.write(index.rid_table.rid.data(), bytes_of(index.rid_table.rid));
         out.sync_and_close();
@@ -238,7 +257,7 @@ IVFPQIndex load_ivf_pq_index(const std::string& index_prefix) {
     index.pq.chunk_dim = h.pq_chunk_dim;
     index.pq.k = h.pq_k;
     index.pq.pivots = in.read<float>(h.pq_pivots_offset, h.pq_pivots_bytes, "PQ pivots");
-    index.pq.codes = in.read<uint8_t>(h.pq_codes_offset, h.pq_codes_bytes, "PQ codes");
+    index.lists.codes = in.read<uint8_t>(h.pq_codes_offset, h.pq_codes_bytes, "PQ codes");
     std::vector<uint32_t> packed = in.read<uint32_t>(h.rid_table_offset, h.rid_table_bytes, "RID table");
     index.rid_table.rid.reserve(packed.size());
     for (uint32_t p : packed) index.rid_table.rid.push_back(RawVectorRID{p});
@@ -247,7 +266,6 @@ IVFPQIndex load_ivf_pq_index(const std::string& index_prefix) {
     index.heap_pages = uint32_t(h.raw_vectors_bytes / h.raw_vector_page_size);
     index.heap_next_slot = uint32_t(h.raw_vector_next_slot);
     require_consistent(index);
-    set_ivf_posting_codes(index);
 
     const std::string heap_path = ivf_raw_vectors_path(index_prefix);
     IVF_PQ_REQUIRE(file_exists(heap_path) && get_file_size(heap_path) == h.raw_vectors_bytes,

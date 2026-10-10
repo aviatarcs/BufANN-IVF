@@ -850,7 +850,7 @@ bool test_index_file(const std::string& prefix, const std::string& base_bin, con
                 loaded.assignments.cluster_id == ix.assignments.cluster_id &&
                 loaded.lists.offsets == ix.lists.offsets && loaded.lists.ids == ix.lists.ids &&
                 loaded.pq.chunks == ix.pq.chunks && loaded.pq.chunk_dim == ix.pq.chunk_dim &&
-                loaded.pq.k == ix.pq.k && loaded.pq.pivots == ix.pq.pivots && loaded.pq.codes == ix.pq.codes &&
+                loaded.pq.k == ix.pq.k && loaded.pq.pivots == ix.pq.pivots && loaded.pq.codes.empty() &&
                 loaded.rid_table.rid.size() == ix.rid_table.rid.size() && rids_equal &&
                 loaded.heap_layout.slots_per_page == ix.heap_layout.slots_per_page &&
                 loaded.heap_pages == ix.heap_pages && loaded.heap_next_slot == ix.heap_next_slot,
@@ -891,6 +891,24 @@ bool test_index_file(const std::string& prefix, const std::string& base_bin, con
     // Writing again replaces the file in place and still loads.
     write_ivf_pq_index(pre, ix);
     t.check(load_ivf_pq_index(pre).lists.ids == ix.lists.ids, "rewrite did not replace cleanly");
+
+    // A loaded index has only the posting-order codes; writing it must give
+    // the same file as writing from the by-id codes did.
+    {
+        std::ifstream first(path, std::ios::binary);
+        const std::string from_by_id((std::istreambuf_iterator<char>(first)), {});
+        write_ivf_pq_index(pre, loaded);
+        std::ifstream second(path, std::ios::binary);
+        const std::string from_posting((std::istreambuf_iterator<char>(second)), {});
+        t.check(from_posting == from_by_id, "rewriting a loaded index changed the file");
+    }
+    {
+        IVFPQIndex no_codes = loaded;
+        no_codes.lists.codes.clear();
+        t.expect_throw("writing an index with neither posting nor by-id codes",
+                       [&] { write_ivf_pq_index(pre + "_none", no_codes); });
+        ::unlink(ivf_pq_index_path(pre + "_none").c_str());
+    }
 
     // Each corruption is applied to a fresh copy and must be rejected.
     IVFPQIndexFileHeader h;
