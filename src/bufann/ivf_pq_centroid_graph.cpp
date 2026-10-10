@@ -31,42 +31,61 @@ void start_search(IVFCentroidGraphScratch& s, uint32_t nlist) {
         s.visited_epoch.assign(nlist, 0);
         s.epoch = 1;
     }
-    s.beam.clear();
+    s.frontier.clear();
+    s.best.clear();
 }
 
-// Best-first search from `entry` with a beam of L; `neighbors_of(c, out)`
-// copies c's out-edges into out. Every expanded centroid is appended to
-// `expanded` when it is non-null (the build prunes over them).
+// Ties on distance go to the lower centroid id, so results do not depend on
+// heap order (a duplicated centroid always loses to its first copy).
+bool nearer(const Candidate& a, const Candidate& b) { return a.dist < b.dist || (a.dist == b.dist && a.id < b.id); }
+bool farther(const Candidate& a, const Candidate& b) { return nearer(b, a); }
+
+// Best-first search from `entry` keeping the L nearest centroids visited:
+// expand the nearest unexpanded one, stop once it is farther than the L-th
+// nearest found. The same expansions as a sorted beam of L, but an insert
+// costs O(log L) rather than shifting up to L entries. `neighbors_of(c,
+// out)` copies c's out-edges into out. Every expanded centroid is appended
+// to `expanded` when it is non-null (the build prunes over them). Leaves
+// s.best sorted ascending by distance.
 template<typename NeighborsOf>
 void beam_search(const IVFMetadata& meta, uint32_t entry, const float* query, uint32_t L,
                  IVFCentroidGraphScratch& s, NeighborsOf&& neighbors_of, std::vector<Candidate>* expanded) {
     start_search(s, meta.nlist);
     s.visited_epoch[entry] = s.epoch;
-    s.beam.push_back({sq_dist(query, centroid(meta, entry), meta.dim), entry, false});
-    std::vector<uint32_t> nbrs;
-    size_t next = 0;  // the first unexpanded beam position
-    while (next < s.beam.size()) {
-        Candidate& cur = s.beam[next];
-        cur.expanded = true;
-        if (expanded != nullptr) expanded->push_back(cur);
-        neighbors_of(cur.id, nbrs);
-        size_t lowest_insert = s.beam.size();
-        for (uint32_t nb : nbrs) {
+    const Candidate first{sq_dist(query, centroid(meta, entry), meta.dim), entry, false};
+    s.frontier.push_back(first);
+    s.best.push_back(first);
+    while (!s.frontier.empty()) {
+        std::pop_heap(s.frontier.begin(), s.frontier.end(), farther);
+        const Candidate cur = s.frontier.back();
+        s.frontier.pop_back();
+        if (s.best.size() == L && cur.dist > s.best.front().dist) break;
+        if (expanded != nullptr) expanded->push_back({cur.dist, cur.id, true});
+        neighbors_of(cur.id, s.nbrs);
+        // The centroids are far larger than the caches; ask for every
+        // unvisited neighbour's row before computing any distance.
+        const size_t row_bytes = size_t(meta.dim) * sizeof(float);
+        for (uint32_t nb : s.nbrs) {
+            if (s.visited_epoch[nb] == s.epoch) continue;
+            const char* row = reinterpret_cast<const char*>(centroid(meta, nb));
+            for (size_t off = 0; off < row_bytes; off += 64) __builtin_prefetch(row + off);
+        }
+        for (uint32_t nb : s.nbrs) {
             if (s.visited_epoch[nb] == s.epoch) continue;
             s.visited_epoch[nb] = s.epoch;
             const float d = sq_dist(query, centroid(meta, nb), meta.dim);
-            if (s.beam.size() == L && d >= s.beam.back().dist) continue;
-            auto at = std::upper_bound(s.beam.begin(), s.beam.end(), d,
-                                       [](float v, const Candidate& c) { return v < c.dist; });
-            lowest_insert = std::min(lowest_insert, size_t(at - s.beam.begin()));
-            s.beam.insert(at, {d, nb, false});
-            if (s.beam.size() > L) s.beam.pop_back();
+            if (s.best.size() == L && d >= s.best.front().dist) continue;
+            s.best.push_back({d, nb, false});
+            std::push_heap(s.best.begin(), s.best.end(), nearer);
+            if (s.best.size() > L) {
+                std::pop_heap(s.best.begin(), s.best.end(), nearer);
+                s.best.pop_back();
+            }
+            s.frontier.push_back({d, nb, false});
+            std::push_heap(s.frontier.begin(), s.frontier.end(), farther);
         }
-        // Resume at the nearest unexpanded candidate, which an insert may
-        // have placed before the current one.
-        next = std::min(lowest_insert, next + 1);
-        while (next < s.beam.size() && s.beam[next].expanded) ++next;
     }
+    std::sort_heap(s.best.begin(), s.best.end(), nearer);
 }
 
 // Robust prune: keeps up to R of `pool` nearest p, skipping any candidate
@@ -191,7 +210,7 @@ void search_ivf_centroid_graph(const IVFMetadata& meta, const IVFCentroidGraph& 
     beam_search(meta, start == IVF_CENTROID_GRAPH_NONE ? graph.entry : start, query, L, scratch, neighbors_of,
                 nullptr);
     out.clear();
-    for (size_t i = 0; i < scratch.beam.size() && out.size() < n; ++i) out.push_back(scratch.beam[i].id);
+    for (size_t i = 0; i < scratch.best.size() && out.size() < n; ++i) out.push_back(scratch.best[i].id);
 }
 
 }  // namespace inplace

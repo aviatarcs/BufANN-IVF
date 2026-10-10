@@ -109,6 +109,63 @@ bool test_full_beam_is_exact(const IVFMetadata& meta, const IVFCentroidGraph& g,
     return t.done();
 }
 
+// The search against a beam search written here the plain way: a beam kept
+// sorted, extended by inserts, expanded at its nearest unexpanded entry
+// until every entry is expanded. Same graph, entry and L, so the results
+// must be the same centroids at the same distances, position by position.
+bool test_matches_sorted_beam(const IVFMetadata& meta, const IVFCentroidGraph& g, const std::vector<float>& queries) {
+    TestCase t("search returns what a plain sorted-beam search returns");
+    struct C {
+        float d;
+        uint32_t id;
+        bool expanded;
+    };
+    auto reference = [&](const float* q, uint32_t L, uint32_t n) {
+        auto dist = [&](uint32_t c) { return sq_dist(q, meta.centroids.data() + size_t(c) * meta.aligned_dim, DIM); };
+        std::vector<C> beam{{dist(g.entry), g.entry, false}};
+        std::vector<uint8_t> seen(meta.nlist, 0);
+        seen[g.entry] = 1;
+        for (;;) {
+            auto next = std::find_if(beam.begin(), beam.end(), [](const C& c) { return !c.expanded; });
+            if (next == beam.end()) break;
+            next->expanded = true;
+            const uint32_t id = next->id;
+            for (uint32_t i = 0; i < g.degree; ++i) {
+                const uint32_t nb = g.neighbors[size_t(id) * g.degree + i];
+                if (nb == IVF_CENTROID_GRAPH_NONE) break;
+                if (seen[nb]) continue;
+                seen[nb] = 1;
+                C c{dist(nb), nb, false};
+                beam.insert(std::upper_bound(beam.begin(), beam.end(), c, [](const C& a, const C& b) { return a.d < b.d; }), c);
+                if (beam.size() > L) beam.pop_back();
+            }
+        }
+        std::vector<float> d;
+        for (size_t i = 0; i < beam.size() && d.size() < n; ++i) d.push_back(beam[i].d);
+        return d;
+    };
+    IVFCentroidGraphScratch scratch;
+    std::vector<uint32_t> got;
+    size_t compared = 0;
+    for (uint32_t L : {4u, 16u, 64u, 300u}) {
+        for (uint32_t q = 0; q < NQ; ++q) {
+            const float* query = queries.data() + size_t(q) * DIM;
+            const uint32_t n = std::max(1u, L / 2);
+            const std::vector<float> want = reference(query, L, n);
+            search_ivf_centroid_graph(meta, g, query, L, n, scratch, got);
+            const std::vector<float> d = centroid_dists(meta, query);
+            bool ok = got.size() == want.size();
+            for (size_t i = 0; ok && i < got.size(); ++i) ok = close(d[got[i]], want[i]);
+            ++compared;
+            if (!t.check(ok, "query " + std::to_string(q) + " L " + std::to_string(L) + " differs from the sorted beam")) {
+                return t.done();
+            }
+        }
+    }
+    std::cout << "  compared " << compared << " searches" << std::endl;
+    return t.done();
+}
+
 // Recall of the n returned centroids against the brute-force top n, over
 // the beams the search is used with (a few times nprobe).
 bool test_recall(const IVFMetadata& meta, const IVFCentroidGraph& g, const std::vector<float>& queries) {
@@ -232,6 +289,7 @@ int main() {
         const IVFCentroidGraph g = build_ivf_centroid_graph(meta);
         all_pass &= test_structure(meta, g);
         all_pass &= test_full_beam_is_exact(meta, g, queries);
+        all_pass &= test_matches_sorted_beam(meta, g, queries);
         all_pass &= test_recall(meta, g, queries);
         all_pass &= test_scratch_reuse(meta, g, queries);
         all_pass &= test_single_centroid();

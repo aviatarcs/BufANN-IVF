@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "bufann/ivf_pq_build.h"
+#include "bufann/ivf_pq_fastscan.h"
 #include "bufann/ivf_pq_require.h"
 #include "utils.h"
 
@@ -54,7 +55,7 @@ IVFPQIndexFileHeader make_header(const IVFPQIndex& index) {
     place(h.posting_offsets_offset, h.posting_offsets_bytes, bytes_of(index.lists.offsets));
     place(h.posting_ids_offset, h.posting_ids_bytes, bytes_of(index.lists.ids));
     place(h.pq_pivots_offset, h.pq_pivots_bytes, bytes_of(index.pq.pivots));
-    place(h.pq_codes_offset, h.pq_codes_bytes, bytes_of(index.pq.codes));
+    place(h.pq_codes_offset, h.pq_codes_bytes, uint64_t(index.lists.ids.size()) * index.pq.chunks);
     place(h.rid_table_offset, h.rid_table_bytes, bytes_of(index.rid_table.rid));
     return h;
 }
@@ -131,8 +132,8 @@ void require_section_sizes(const IVFPQIndexFileHeader& h) {
                    "posting-offsets section size does not match nlist + 1");
     IVF_PQ_REQUIRE(h.posting_ids_bytes == n * sizeof(uint32_t),
                    "posting-ids section size does not match num_vectors");
-    IVF_PQ_REQUIRE(h.pq_pivots_bytes == uint64_t(h.pq_chunks) * h.pq_k * h.pq_chunk_dim * sizeof(float),
-                   "PQ pivot section size does not match chunks x k x chunk_dim");
+    IVF_PQ_REQUIRE(h.pq_pivots_bytes == uint64_t(h.pq_k) * h.dim * sizeof(float),
+                   "PQ pivot section size does not match k x dim");
     IVF_PQ_REQUIRE(h.pq_codes_bytes == n * h.pq_chunks, "PQ code section size does not match N x chunks");
     IVF_PQ_REQUIRE(h.rid_table_bytes == n * sizeof(uint32_t),
                    "RID-table section size does not match num_vectors");
@@ -144,8 +145,9 @@ void require_header(const IVFPQIndexFileHeader& h, const std::string& path) {
                    "IVF-PQ index file version " + std::to_string(h.version) + " is not supported");
     IVF_PQ_REQUIRE(h.nlist > 0 && h.dim > 0 && h.aligned_dim == align_dim(h.dim),
                    "IVF-PQ index header has an invalid nlist/dim");
-    IVF_PQ_REQUIRE(h.pq_chunks > 0 && h.pq_k > 0 && h.pq_k <= 256 &&
-                       uint64_t(h.pq_chunks) * h.pq_chunk_dim == h.dim,
+    // pq_chunk_dim is dim / pq_chunks when that divides, else 0 (uneven chunks).
+    IVF_PQ_REQUIRE(h.pq_chunks > 0 && h.pq_chunks <= h.dim && h.pq_k > 0 && h.pq_k <= 256 &&
+                       h.pq_chunk_dim == (h.dim % h.pq_chunks == 0 ? h.dim / h.pq_chunks : 0),
                    "IVF-PQ index header has an invalid PQ shape");
     IVF_PQ_REQUIRE(h.num_vectors <= uint64_t(RAW_VECTOR_RID_SLOT_MASK) + 1,
                    "IVF-PQ index header num_vectors exceeds the RID slot space");
@@ -196,6 +198,12 @@ void write_ivf_pq_index(const std::string& index_prefix, const IVFPQIndex& index
     IVFPQIndexFileHeader h = make_header(index);
     require_header(h, index_prefix);
     require_consistent(index);
+    const size_t chunks = index.pq.chunks, rows = index.lists.ids.size();
+    const bool posting_codes = index.lists.codes.size() == rows * chunks;
+    const bool blocked_codes =
+        !posting_codes && ivf_blocked_codes_cover(index.lists.blocked, index.lists, uint32_t(chunks));
+    IVF_PQ_REQUIRE(posting_codes || blocked_codes || index.pq.codes.size() == rows * chunks,
+                   "neither posting-list, blocked nor by-id PQ codes cover the index's vectors");
 
     const std::string path = ivf_pq_index_path(index_prefix);
     const std::string tmp = path + ".tmp";
@@ -207,7 +215,38 @@ void write_ivf_pq_index(const std::string& index_prefix, const IVFPQIndex& index
         out.write(index.lists.offsets);
         out.write(index.lists.ids);
         out.write(index.pq.pivots);
-        out.write(index.pq.codes);
+        if (posting_codes) {
+            out.write(index.lists.codes);
+        } else if (blocked_codes) {
+            // A loaded index: its codes, un-transposed list by list.
+            std::vector<uint8_t> list_codes;
+            const size_t block_bytes = chunks * IVF_FASTSCAN_BLOCK;
+            for (size_t p = 0; p + 1 < index.lists.offsets.size(); ++p) {
+                const uint32_t n = index.lists.offsets[p + 1] - index.lists.offsets[p];
+                const uint8_t* first = ivf_list_blocks(index.lists.blocked, uint32_t(p));
+                list_codes.resize(size_t(n) * chunks);
+                for (uint32_t i = 0; i < n; ++i) {
+                    const uint8_t* block = first + size_t(i / IVF_FASTSCAN_BLOCK) * block_bytes;
+                    for (size_t c = 0; c < chunks; ++c) {
+                        list_codes[size_t(i) * chunks + c] = block[c * IVF_FASTSCAN_BLOCK + i % IVF_FASTSCAN_BLOCK];
+                    }
+                }
+                out.write(list_codes);
+            }
+        } else {
+            // Gathered a block at a time, so the build never holds both orders.
+            const size_t block_rows = size_t(1) << 16;
+            std::vector<uint8_t> block;
+            for (size_t start = 0; start < rows; start += block_rows) {
+                const size_t n = std::min(block_rows, rows - start);
+                block.resize(n * chunks);
+                for (size_t i = 0; i < n; ++i) {
+                    std::memcpy(block.data() + i * chunks,
+                                index.pq.codes.data() + size_t(index.lists.ids[start + i]) * chunks, chunks);
+                }
+                out.write(block);
+            }
+        }
         static_assert(sizeof(RawVectorRID) == sizeof(uint32_t), "RID table is stored as uint32");
         out.write(index.rid_table.rid.data(), bytes_of(index.rid_table.rid));
         out.sync_and_close();
@@ -236,9 +275,29 @@ IVFPQIndex load_ivf_pq_index(const std::string& index_prefix) {
     index.lists.ids = in.read<uint32_t>(h.posting_ids_offset, h.posting_ids_bytes, "posting ids");
     index.pq.chunks = h.pq_chunks;
     index.pq.chunk_dim = h.pq_chunk_dim;
+    index.pq.chunk_offsets = pq_chunk_offsets(h.dim, h.pq_chunks);
     index.pq.k = h.pq_k;
     index.pq.pivots = in.read<float>(h.pq_pivots_offset, h.pq_pivots_bytes, "PQ pivots");
-    index.pq.codes = in.read<uint8_t>(h.pq_codes_offset, h.pq_codes_bytes, "PQ codes");
+    // The blocked layout (and the scans over it) index 256-entry tables.
+    // The codes are streamed into it a piece at a time rather than read
+    // whole: an allocator that keeps freed pages (tcmalloc, which the
+    // binaries link) would otherwise hold a second copy of them for good.
+    if (index.pq.k == 256) {
+        // Sized from the offsets, so checked first (require_consistent below
+        // checks everything again): unsorted ones would size it absurdly.
+        IVF_PQ_REQUIRE(index.lists.offsets.front() == 0 && index.lists.offsets.back() == h.num_vectors &&
+                           std::is_sorted(index.lists.offsets.begin(), index.lists.offsets.end()),
+                       "posting offsets are not a valid row index over num_vectors");
+        index.lists.blocked = make_ivf_blocked_layout(index.lists.offsets, index.pq.chunks);
+        const uint64_t rows = h.num_vectors, piece = uint64_t(1) << 16;
+        for (uint64_t r = 0; r < rows; r += piece) {
+            const uint64_t nr = std::min(piece, rows - r);
+            std::vector<uint8_t> part = in.read<uint8_t>(h.pq_codes_offset + r * h.pq_chunks, nr * h.pq_chunks, "PQ codes");
+            place_ivf_blocked_rows(index.lists.blocked, index.lists.offsets, uint32_t(r), part.data(), uint32_t(nr));
+        }
+    } else {
+        index.lists.codes = in.read<uint8_t>(h.pq_codes_offset, h.pq_codes_bytes, "PQ codes");
+    }
     std::vector<uint32_t> packed = in.read<uint32_t>(h.rid_table_offset, h.rid_table_bytes, "RID table");
     index.rid_table.rid.reserve(packed.size());
     for (uint32_t p : packed) index.rid_table.rid.push_back(RawVectorRID{p});
@@ -247,7 +306,6 @@ IVFPQIndex load_ivf_pq_index(const std::string& index_prefix) {
     index.heap_pages = uint32_t(h.raw_vectors_bytes / h.raw_vector_page_size);
     index.heap_next_slot = uint32_t(h.raw_vector_next_slot);
     require_consistent(index);
-    set_ivf_posting_codes(index);
 
     const std::string heap_path = ivf_raw_vectors_path(index_prefix);
     IVF_PQ_REQUIRE(file_exists(heap_path) && get_file_size(heap_path) == h.raw_vectors_bytes,

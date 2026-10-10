@@ -35,9 +35,9 @@ void require_ivf_pq_config(const BufANNConfig& config, const char* where) {
     if (config.dim == 0) fail("config.dim must be non-zero");
     if (config.ivf_nlist == 0) fail("config.ivf_nlist must be non-zero for an IVF-PQ index");
     if (config.ivf_pq_chunks == 0) fail("config.ivf_pq_chunks must be non-zero for an IVF-PQ index");
-    if (config.dim % config.ivf_pq_chunks != 0) {
-        fail("config.dim " + std::to_string(config.dim) + " is not a multiple of config.ivf_pq_chunks " +
-             std::to_string(config.ivf_pq_chunks));
+    if (config.ivf_pq_chunks > config.dim) {
+        fail("config.ivf_pq_chunks " + std::to_string(config.ivf_pq_chunks) + " exceeds config.dim " +
+             std::to_string(config.dim));
     }
 }
 

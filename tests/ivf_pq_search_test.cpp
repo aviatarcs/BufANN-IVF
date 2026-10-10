@@ -47,11 +47,10 @@ IVFPQSearchResult reference_search(const IVFPQIndex& ix, const RawVectorHeap& he
         centroid_dist[c] = sq_dist(q, ix.meta.centroids.data() + size_t(c) * ix.meta.aligned_dim, DIM);
     }
     std::vector<float> table(size_t(ix.pq.chunks) * ix.pq.k);
+    const std::vector<uint32_t> off = expected_chunk_offsets(DIM, ix.pq.chunks);
     for (uint32_t c = 0; c < ix.pq.chunks; ++c) {
         for (uint32_t j = 0; j < ix.pq.k; ++j) {
-            table[size_t(c) * ix.pq.k + j] = sq_dist(
-                q + c * ix.pq.chunk_dim, ix.pq.pivots.data() + (size_t(c) * ix.pq.k + j) * ix.pq.chunk_dim,
-                ix.pq.chunk_dim);
+            table[size_t(c) * ix.pq.k + j] = sq_dist(q + off[c], expected_pivot(ix.pq, off, c, j), off[c + 1] - off[c]);
         }
     }
     std::vector<uint32_t> candidates;
@@ -375,6 +374,60 @@ bool test_graph_matches_reference(const std::string& tag, const Built& b, const 
     return t.done();
 }
 
+// The SIMD scan keeps the rerank_m nearest by quantized PQ distance, so near
+// the boundary it may shortlist differently from the float scan. Checked
+// against brute force and the float reference: every returned distance is
+// exact; with every candidate re-ranked the result is the exact top-k; at a
+// normal rerank_m the top-k agrees with the float reference's on at least
+// 99% of ids, and the batch path returns what single queries do.
+template<typename T>
+bool test_fastscan_end_to_end(const std::string& tag, const Built& b, const std::vector<T>& base,
+                              const std::vector<float>& queries) {
+    TestCase t(tag + ": the SIMD scan returns exact distances, the exact top-k at a full re-rank, "
+               "and the float scan's top-k to within 1%");
+    if (!fastscan_simd_available()) {
+        std::cout << "  (no AVX-512 VBMI on this CPU: the search uses the float scan; nothing to compare)" << std::endl;
+        return t.done();
+    }
+    set_fastscan_enabled(true);
+    const std::vector<float> basef = to_float(base.data(), base.size());
+    IVFPQSearchScratch scratch, float_scratch;
+    size_t agree = 0, total = 0;
+    std::vector<float> all(N);
+    for (uint32_t nprobe : {1u, 3u, 8u, NLIST}) {
+        std::vector<IVFPQSearchResult> batch = ivf_pq_search_batch<T>(b.index, b.heap, queries.data(), NQ, K, nprobe, RERANK_M);
+        for (uint32_t q = 0; q < NQ; ++q) {
+            const float* query = queries.data() + size_t(q) * DIM;
+            IVFPQSearchResult got = ivf_pq_search<T>(b.index, b.heap, query, K, nprobe, RERANK_M, scratch);
+            bool exact = std::is_sorted(got.dists.begin(), got.dists.end());
+            for (size_t i = 0; exact && i < got.ids.size(); ++i) {
+                exact = close(got.dists[i], sq_dist(query, basef.data() + size_t(got.ids[i]) * DIM, DIM));
+            }
+            if (!t.check(exact, "query " + std::to_string(q) + ": a returned distance is not the exact one")) return t.done();
+            if (!probe_boundary_is_tied(b.index, query, nprobe)) {
+                t.check(same_within_ties(batch[q], got), "batched query " + std::to_string(q) + " differs from single");
+            }
+            set_fastscan_enabled(false);
+            IVFPQSearchResult want = ivf_pq_search<T>(b.index, b.heap, query, K, nprobe, RERANK_M, float_scratch);
+            set_fastscan_enabled(true);
+            for (uint32_t id : got.ids) agree += std::find(want.ids.begin(), want.ids.end(), id) != want.ids.end();
+            total += want.ids.size();
+        }
+    }
+    std::cout << "  top-k agreement with the float scan: " << double(agree) / double(total) << std::endl;
+    t.check(agree >= 0.99 * double(total), "SIMD and float top-k agree on fewer than 99% of ids");
+    for (uint32_t q = 0; q < NQ; ++q) {
+        const float* query = queries.data() + size_t(q) * DIM;
+        for (uint32_t i = 0; i < N; ++i) all[i] = sq_dist(query, basef.data() + size_t(i) * DIM, DIM);
+        IVFPQSearchResult want;
+        for (uint32_t i : top_k(all, K + 1)) want.ids.push_back(i), want.dists.push_back(all[i]);
+        IVFPQSearchResult full = ivf_pq_search<T>(b.index, b.heap, query, K, NLIST, N, scratch);
+        if (!t.check(same_within_ties(full, want), "query " + std::to_string(q) + ": full re-rank is not exact")) break;
+    }
+    set_fastscan_enabled(false);
+    return t.done();
+}
+
 bool test_guards(const Built& b, const std::vector<float>& queries) {
     TestCase t("argument and index-consistency guards");
     const IVFPQIndex& ix = b.index;
@@ -391,11 +444,15 @@ bool test_guards(const Built& b, const std::vector<float>& queries) {
         t.expect_throw(what, [&] { ivf_pq_search<float>(copy, b.heap, query, K, 4, RERANK_M); });
     };
     corrupt("RID table short by one", [](IVFPQIndex& c) { c.rid_table.rid.pop_back(); });
-    corrupt("PQ codes short by one row", [](IVFPQIndex& c) { c.pq.codes.resize(c.pq.codes.size() - CHUNKS); });
-    corrupt("posting-list codes short by one row",
-            [](IVFPQIndex& c) { c.lists.codes.resize(c.lists.codes.size() - CHUNKS); });
-    corrupt("posting-list codes never set", [](IVFPQIndex& c) { c.lists.codes.clear(); });
-    corrupt("PQ chunks do not cover dim", [](IVFPQIndex& c) { c.pq.chunk_dim -= 1; });
+    corrupt("blocked codes short by one block", [](IVFPQIndex& c) {
+        c.lists.blocked.blocks.resize(c.lists.blocked.blocks.size() - size_t(CHUNKS) * IVF_FASTSCAN_BLOCK);
+    });
+    corrupt("no codes for the lists", [](IVFPQIndex& c) {
+        c.lists.codes.clear();
+        c.lists.blocked = IVFPQBlockedCodes{};
+    });
+    corrupt("PQ chunk_dim disagreeing with chunks", [](IVFPQIndex& c) { c.pq.chunk_dim -= 1; });
+    corrupt("PQ chunks do not cover dim", [](IVFPQIndex& c) { c.pq.chunk_offsets.back() -= 1; });
     corrupt("posting offsets end early", [](IVFPQIndex& c) { c.lists.offsets.back() -= 1; });
     corrupt("posting offsets missing a partition", [](IVFPQIndex& c) { c.lists.offsets.pop_back(); });
     corrupt("centroids short by one", [](IVFPQIndex& c) { c.meta.centroids.pop_back(); });
@@ -407,16 +464,23 @@ bool test_guards(const Built& b, const std::vector<float>& queries) {
 int main() {
     const std::string prefix_f = temp_path("ivf_pq_search_f32");
     const std::string prefix_u = temp_path("ivf_pq_search_u8");
+    const std::string prefix_e = temp_path("ivf_pq_search_uneven");
     bool all_pass = true;
     try {
         std::vector<float> base_f = draw_blobs<float>(N, 1, DIM, BLOBS);
         std::vector<uint8_t> base_u = draw_blobs<uint8_t>(N, 1, DIM, BLOBS);
         std::vector<float> queries = draw_blobs<float>(NQ, 2, DIM, BLOBS);
+        // These tests compare against a float reference exactly; the SIMD
+        // scan, whose shortlist may differ near the boundary, has its own.
+        set_fastscan_enabled(false);
         std::unique_ptr<Built> f = build_index<float>(prefix_f, base_f, N, DIM, NLIST, CHUNKS, TRAIN_SEED);
         std::unique_ptr<Built> u = build_index<uint8_t>(prefix_u, base_u, N, DIM, NLIST, CHUNKS, TRAIN_SEED);
+        // 20 dims into 6 chunks: two of 4 dims, four of 3.
+        std::unique_ptr<Built> e = build_index<float>(prefix_e, base_f, N, DIM, NLIST, 6, TRAIN_SEED);
 
         all_pass &= test_matches_reference<float>("f32", *f, queries);
         all_pass &= test_matches_reference<uint8_t>("u8", *u, queries);
+        all_pass &= test_matches_reference<float>("f32 uneven chunks", *e, queries);
         all_pass &= test_batch_matches_single<float>("f32", *f, queries);
         all_pass &= test_batch_matches_single<uint8_t>("u8", *u, queries);
         all_pass &= test_exact_distances_and_full_probe<float>("f32", *f, base_f, queries);
@@ -428,16 +492,21 @@ int main() {
         all_pass &= test_graph_matches_reference<uint8_t>("u8", *u, queries);
         all_pass &= test_buffer_pool_matches_reference<float>("f32", *f, prefix_f, queries);
         all_pass &= test_buffer_pool_matches_reference<uint8_t>("u8", *u, prefix_u, queries);
+        all_pass &= test_fastscan_end_to_end<float>("f32", *f, base_f, queries);
+        all_pass &= test_fastscan_end_to_end<uint8_t>("u8", *u, base_u, queries);
+        all_pass &= test_fastscan_end_to_end<float>("f32 uneven chunks", *e, base_f, queries);
         all_pass &= test_scratch_follows_index(*f, *u, queries);
         all_pass &= test_guards(*f, queries);
 
         f->heap.close();
         u->heap.close();
+        e->heap.close();
     } catch (const diskann::ANNException& e) {
         std::cout << "  FAIL: " << e.message() << std::endl;
         all_pass = false;
     }
     remove_index_files(prefix_f);
     remove_index_files(prefix_u);
+    remove_index_files(prefix_e);
     return all_pass ? 0 : 1;
 }

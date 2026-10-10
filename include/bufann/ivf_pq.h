@@ -37,21 +37,47 @@ struct ClusterAssignments {
 // PostingLists: partition c is ids[offsets[c] : offsets[c+1]]. `codes` holds
 // the PQ code of ids[i] at [i * chunks, (i + 1) * chunks), so a probe scans
 // its partition's codes sequentially; PQMetadata::codes, indexed by id, would
-// cost a cache miss per candidate. Derived from PQMetadata::codes by
-// set_ivf_posting_codes and not persisted.
+// cost a cache miss per candidate. The index file stores them in this order;
+// the build derives them from the by-id codes (set_ivf_posting_codes, or the
+// writer). A loaded index holds them only as `blocked` and leaves `codes`
+// empty, so the codes are in memory once.
+// The same codes transposed for the SIMD scan (ivf_pq_fastscan.h): list p
+// owns blocks [block_start[p], block_start[p+1]); its i-th vector is lane
+// i % IVF_FASTSCAN_BLOCK of its (i / IVF_FASTSCAN_BLOCK)-th block, and a
+// block holds `chunks` rows of IVF_FASTSCAN_BLOCK bytes, row c being
+// sub-code c of the block's vectors. Lanes past the list's end are zero.
+// Built at load from the file's posting-order codes, not persisted.
+constexpr uint32_t IVF_FASTSCAN_BLOCK = 64;
+struct IVFPQBlockedCodes {
+    uint32_t chunks = 0;
+    std::vector<uint32_t> block_start;  // [nlist + 1]
+    std::vector<uint8_t> blocks;        // [blocks x chunks x IVF_FASTSCAN_BLOCK]
+};
+
 struct PostingLists {
     std::vector<uint32_t> offsets;
     std::vector<uint32_t> ids;
     std::vector<uint8_t>  codes;  // shape: [ids.size(), chunks]
+    IVFPQBlockedCodes blocked;    // empty until build_ivf_blocked_codes
 };
 
-// PQMetadata: product-quantization pivots and per-vector codes
+// PQMetadata: product-quantization pivots and per-vector codes. Chunk c
+// covers dimensions [chunk_offsets[c], chunk_offsets[c+1]); when chunks does
+// not divide dim, the first dim - floor(dim / chunks) * chunks chunks hold
+// one dimension more, as the upstream PQ trainer splits them
+// (pq_chunk_offsets). Chunk c's k pivots are contiguous, k * chunk_len(c)
+// floats from pivots[k * chunk_offsets[c]] on (pq_pivot); with uniform
+// chunks that is the [chunks, k, chunk_dim] layout.
 struct PQMetadata {
     uint32_t chunks    = 0;
-    uint32_t chunk_dim = 0;
+    uint32_t chunk_dim = 0;  // dim / chunks when uniform, else 0
     uint32_t k         = 0;  // number of PQ centers per chunk (256 for uint8 codes)
-    std::vector<float>   pivots;  // shape: [chunks, k, chunk_dim]
-    std::vector<uint8_t> codes;   // shape: [N, chunks]
+    std::vector<uint32_t> chunk_offsets;  // [chunks + 1]
+    std::vector<float>   pivots;  // [k x dim], chunk by chunk
+    // shape: [N, chunks], by vector id. Only the build holds them (from
+    // load_ivf_pq); a loaded index keeps the codes once, in PostingLists::codes,
+    // and leaves this empty.
+    std::vector<uint8_t> codes;
 };
 
 // IVFPQSearchConfig: search-time handle over the live index structures
@@ -124,6 +150,24 @@ struct PostingListDelta {
 };
 
 // DynamicPQCodes: PQ codes for vectors inserted since the last rebuild
+inline std::vector<uint32_t> pq_chunk_offsets(uint32_t dim, uint32_t chunks) {
+    std::vector<uint32_t> off(size_t(chunks) + 1, 0);
+    const uint32_t low = chunks == 0 ? 0 : dim / chunks, high_count = chunks == 0 ? 0 : dim - low * chunks;
+    for (uint32_t c = 0; c < chunks; ++c) off[c + 1] = off[c] + low + (c < high_count ? 1 : 0);
+    return off;
+}
+inline uint32_t pq_chunk_len(const PQMetadata& pq, uint32_t c) { return pq.chunk_offsets[c + 1] - pq.chunk_offsets[c]; }
+inline const float* pq_pivot(const PQMetadata& pq, uint32_t c, uint32_t j) {
+    return pq.pivots.data() + size_t(pq.k) * pq.chunk_offsets[c] + size_t(j) * pq_chunk_len(pq, c);
+}
+// The PQ's shape is consistent with `dim`: offsets as pq_chunk_offsets gives
+// them, chunk_dim matching, k pivots of every chunk.
+inline bool pq_shape_ok(const PQMetadata& pq, uint32_t dim) {
+    return pq.chunks > 0 && pq.chunks <= dim && pq.k > 0 && pq.chunk_offsets.size() == size_t(pq.chunks) + 1 &&
+           pq.chunk_offsets.back() == dim && pq.chunk_dim == (dim % pq.chunks == 0 ? dim / pq.chunks : 0) &&
+           pq.pivots.size() == size_t(pq.k) * dim;
+}
+
 // PQMetadata::codes is a flat array and cannot grow in place, so codes for
 // recent inserts live here until the next rebuild. Queries consult both.
 struct DynamicPQCodes {
@@ -174,8 +218,8 @@ struct IVFPQDelta {
 // IVFPQIndex: everything the combined index file persists, in memory. The
 // raw vectors themselves stay in the heap file; heap_layout, heap_pages and
 // heap_next_slot describe it and are what RawVectorHeap::open_existing needs.
-// assignments and rid_table also cover inserted vectors; lists and pq.codes
-// cover only the base vectors the file was written from.
+// assignments and rid_table also cover inserted vectors; lists (and their
+// codes) cover only the base vectors the file was written from.
 struct IVFPQIndex {
     IVFMetadata meta;
     ClusterAssignments assignments;
@@ -197,9 +241,10 @@ inline uint32_t ivf_pq_num_base(const IVFPQIndex& index) {
 // Version 2 added raw_vector_next_slot and the RawVectorPageHeader; version 3
 // grew that page header from 8 to 16 bytes to record page_size and elem_size,
 // which moves every slot in the heap file; version 4 added the per-page
-// owner-id array between the bitmap and the slots, which moves them again.
+// owner-id array between the bitmap and the slots, which moves them again;
+// version 5 stores the PQ codes in posting-list order, not by vector id.
 constexpr uint32_t IVF_PQ_INDEX_MAGIC   = 0x51465649;  // "IVFQ" little-endian
-constexpr uint32_t IVF_PQ_INDEX_VERSION = 4;
+constexpr uint32_t IVF_PQ_INDEX_VERSION = 5;
 
 struct IVFPQIndexFileHeader {
     uint32_t magic   = 0;

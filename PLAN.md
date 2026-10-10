@@ -1,11 +1,106 @@
 # IVF-PQ plan
 
 The worker takes the first unchecked item whose dependencies are checked,
-unless `REVIEW.md` has open findings, which come first. Each item is one
+from the October queue before the earlier queue, unless `REVIEW.md` has
+open findings, which come first. Each item is one
 PR-sized change with tests. Check an item off in the same commit that
 completes it, citing the commit subject.
 
-## Queue
+## Queue: scan speed and centroid search (October 2026)
+
+Taken before the earlier queue below. Context: at SIFT100M (90M base, 1 GB
+pool) BufANN gets 1.25-2.0x IVF-PQ's q/s at recall 90-98, and a profile of
+IVF-PQ (nlist 262144) puts 57-71% of query time in the PQ code scan (~48 ns
+per code per thread, near the scalar instruction limit), 17-18% in the
+centroid graph search (beam 2 x nprobe), 5% in selecting the top rerank_m
+of all scanned codes, and 7-21% in heap reads
+(`benchmark_results/sift100m_2026-10-03.jsonl`).
+
+- [x] **Narrower and heap-based centroid beam.** Accept a fractional beam
+      factor (centroid_L = ceil(f x nprobe)) in the API and the bench, and
+      measure probe-set recall and q/s for f in 1.0-2.0 at 100M; replace the
+      sorted-vector beam, whose inserts shift up to L entries, with a
+      structure whose insert does not (a bounded heap plus the expansion
+      order kept separately). Oracle: probe sets equal to the current beam's
+      at the same L; probe-set recall against the exact GEMM. Target: the
+      centroid share from ~18% to a few percent at no recall cost.
+      (Done in "Search the centroid graph with heaps and prefetch whole
+      rows". The insert cost was not the bottleneck: the heap beam alone ran
+      at the sorted beam's speed. Cache misses on the 134 MB of centroids
+      were: prefetching every unvisited neighbour's whole row cut the search
+      13-17% at equal L. With beam 1x, 1.25x, 2x the end-to-end recall at
+      nprobe 128 / 256 / 512 (90M, nlist 262144) is 92.42 / 96.22 / 98.27,
+      92.47 / 96.22 / 98.28, 92.55 / 96.23 / 98.28, and q/s 5632 / 3754 /
+      2129, 6138 / 3673 / 2083, 5814 / 3497 / 1983 (about 3% run noise):
+      a narrower beam costs at most 0.13 points and gains 5-7%. Use 1.25x.
+      The search is still mostly centroid cache misses (1.4 ms per query at
+      nprobe 512, beam 1x); a compact copy of the centroids for the
+      traversal is the next lever, as LindormVector compresses them.)
+- [x] **Quicker ADC scan for the existing 32 x 8-bit codes.** Andre,
+      Kermarrec and Le Scouarnec, "Quicker ADC: Unlocking the Hidden
+      Potential of Product Quantization with SIMD" (TPAMI 2019,
+      arXiv:1812.09162), split tables: each 256-entry lookup table, with its
+      entries quantized to 8-bit integers per query, is held in four 512-bit
+      registers as two 128-entry halves; an 8-bit lookup for 64 codes is two
+      AVX-512 VBMI vpermi2b shuffles on the low 7 bits plus a blend on the
+      top bit, with saturating 8-bit (or 16-bit) accumulation. The PQ
+      codebooks and codes stay; only their layout changes: each posting list
+      is transposed into blocks of 64 codes, sub-code-major, done at load
+      (or persisted with an index version bump). The scan keeps a running
+      top-rerank_m on the quantized distances instead of storing every
+      candidate, which also removes the select step. Fall back to the scalar
+      scan on CPUs without VBMI (this node, Xeon Silver 4314, has it).
+      Oracle: the kernel's quantized distances equal a scalar reference of
+      the same integer arithmetic exactly; end to end, recall within noise of
+      the float scan at the same nprobe and rerank_m. Measure ns per code
+      (48 now) and q/s-recall at 9M and 90M.
+      First step done in "Scan PQ codes with Quicker ADC split tables":
+      90M, nlist 262144, beam 1.25x, 1 GB pool, nprobe 128 / 256 / 512:
+      q/s 6138 / 3673 / 2083 -> 10982 / 8644 / 5757, recall 92.47 / 96.22 /
+      98.28 -> 92.45 / 96.21 / 98.25, p99 17.0 / 29.5 / 50.3 -> 4.8 / 6.7 /
+      10.8 ms. Then "Keep a loaded index's PQ codes only in the blocked
+      layout": the loader streams the file's codes into the blocks 64K rows
+      at a time and keeps no posting-order copy; the float path and the
+      writer read the blocked layout. 90M load RSS 6.6 GB (both copies, or
+      the freed one held by tcmalloc) -> 4.6 GB; running RSS at the 1 GB
+      pool 5.3-5.5 GB, BufANN's 5.5 GB; q/s unchanged (11020 / 5800 at
+      nprobe 128 / 512). Note: the IVF-PQ binaries link the system
+      tcmalloc (the dev_env shim is a symlink to it), like bufann_driver;
+      an earlier note that the bench used glibc malloc was wrong.
+- [x] **Two-level IVF for the centroid search.** Instead of the centroid
+      graph, cluster the nlist centroids into ~sqrt(nlist) super-centroids
+      (512 at 262144), probe the nearest super-lists and compute exact
+      distances to the centroids in them (a small GEMV) to pick nprobe lists.
+      Compare with the graph at equal probe-set recall: time, recall, build
+      cost. Oracle: the exact GEMM probe set.
+      (Tried, not adopted. Prototype at 90M, nlist 262144, nprobe 512,
+      supers by k-means over the centroids (1.8-12 s), member centroids
+      contiguous per super-list: 512 supers need 33K centroids scanned for
+      probe recall 0.985 (3.8 ms per query per thread), 4096 supers 17K for
+      0.982 (2.3 ms), 2048 supers 33K for 0.995 (4.0 ms); the graph with a
+      1x beam gets 0.997 in 1.4 ms. Both are bound by reading centroid
+      rows (memory bandwidth for the scan, misses for the graph), so a
+      compact copy of the centroids would help either; the graph stays.)
+- [x] **SIFT100M rerun.** With the items above, rerun the 2026-10-03
+      comparison as it was (same BufANN results, same warmup, pools, nprobe
+      grid) and record it next to the old one; add nprobes between the
+      powers of two near the recall targets.
+      (Done: `benchmark_results/sift100m_2026-10-10.jsonl`, BufANN rerun
+      in the same session. Best q/s at recall >= 90 / 95 / 98 / 99, 1 GB
+      pool, RSS 5.5 GB both: BufANN 8784 / 6937 / 3972 / - (p99 6.4 / 7.7
+      / 10.1 ms); IVF-PQ nlist 131072 12376 / 9708 / 6440 / 3857 (p99 5.0 /
+      6.8 / 10.8 / 17.9 ms), nlist 262144 11780 / 9174 / 5802 / 3510.
+      IVF-PQ now leads 1.40-1.62x, and with the scan cheap the smaller
+      nlist wins. 8 GB pool: the same picture, every system 1-10% higher.)
+- [ ] **Other 100M datasets.** DEEP100M (float32, 96-d), SPACEV100M (int8,
+      100-d), Turing100M (float32, 100-d), downloaded to /tmpdata/100m/.
+      Needs: query files and exact ground truth over each 90M base
+      (`scripts/datasets/exact_gt.cpp` reads uint8 only; extend it to int8
+      and float), IVF-PQ builds (chunk counts dividing the dimension: 32 for
+      96-d, 25 or 50 for 100-d), BufANN's DiskANN build, PQ and conversion
+      for each (~4-5 h each at 90M on this node), then the same comparison.
+
+## Earlier queue
 
 - [x] **Heap reopen.** `RawVectorHeap::open_existing(path, layout, next_flat_slot, allocated_pages)`
       driven by `IVFPQIndexFileHeader`; refuse a file whose size disagrees
@@ -160,7 +255,11 @@ completes it, citing the commit subject.
       16:36 -> 8:31, recall within 0.1 points). k-means++: done in "Drop
       k-means++'s two serial passes per pick" (374 -> 302 s) and "Seed
       k-means++ from 4 points per centroid" (302 -> ~20 s; the 9M build
-      7:26 before it).
+      7:26 before it). At 90M: nlist 131072 builds in 30:55, 262144 in
+      1:02:50, where seeding (1245 s) and Lloyd's (1316 s) dominate:
+      seeding costs nlist x 4 nlist rows, quadratic in nlist, so 1B
+      (~630K lists) needs a cheaper seed (fewer points per centroid,
+      k-means||, or random init) before it is affordable.
 - [ ] **nlist cost model.** For 90M+, where one build takes 41 min: sample
       m vectors, cluster them at each candidate nlist, take ~100 sample
       queries with exact neighbours within the sample, estimate nprobe as
@@ -169,14 +268,15 @@ completes it, citing the commit subject.
       measured per-code time, plus measured centroid-search time; pick the
       minimum (paper section 4.1). Validate against the 9M measurements.
       Depends on the nlist measurement.
-- [ ] **4-bit fast-scan PQ.** The scan does one scalar table lookup per
+- [ ] **4-bit fast-scan PQ.** (Superseded by Quicker ADC split tables in
+      the October queue, which keep the existing 8-bit codes.) The scan does one scalar table lookup per
       chunk per code. 64 x 4-bit sub-quantizers are the same 32 B/vector as
       32 x 8-bit for SIFT, and their tables fit SIMD registers (PQFastScan,
       blocks of 32 codes). Prototype the kernel on the SIFT10M codes against
       the scalar scan as oracle, then compare QPS-recall end to end. Small
       lists (large nlist) leave partial blocks; measure at nlist 32768
       (~275 codes per list at 9M), the sweep's best.
-- [ ] **Raw-vector heap through BufANN's buffer pool.** The heap is read
+- [x] **Raw-vector heap through BufANN's buffer pool.** The heap is read
       with plain pread, so the query bench serves re-rank reads from an
       unbounded OS page cache (the 9M heap, 1.2 GB, is fully cached after
       warmup) while BufANN's runs pay 75 misses per query against a 1 GB
@@ -216,7 +316,19 @@ completes it, citing the commit subject.
       One run in ~40 aborted before the pin_batch fix; none of 20 after.
       BufANN's numbers come from BufANN-CS395T's bufann_driver, whose
       pin_batch has the same race (recall matched its earlier runs, so no
-      sign it bit at 1 GB). Still open: 90M.
+      sign it bit at 1 GB).
+      90M, done (`benchmark_results/sift100m_2026-10-03.jsonl`; IVF-PQ index v5,
+      one copy of the codes, so equal pools are near equal RSS: 5.2-6.6 GB
+      for IVF-PQ against 5.5 GB for BufANN at 1 GB). Best q/s at recall
+      >= 90 / 95 / 98, 1 GB pool: BufANN 8748 / 6991 / 4060 (98.98 at L
+      200, 3069 q/s); IVF-PQ nlist 262144 7021 / 3499 / 1993, nlist 131072
+      5068 / 2927 / 1615. BufANN wins 1.2-2.0x at 90M. IVF-PQ is scan-bound
+      (I/O 3-12% of latency at those recalls, ~90 ns per scanned code as at
+      9M, p99 23-82 ms against BufANN's 8-13 ms); 262144 beats 131072 by
+      1.2-1.4x and has not flattened. An 8 GB pool moved either system by
+      under 10%: after a 1000-query warmup it is mostly empty, so most
+      misses are first touches. Next: 4-bit fast-scan (LindormVector scans
+      codes in SIMD batches of 32), nlist beyond 262144, a longer warmup.
 - [ ] **Re-rank reads under a cold heap.** The bench reads the heap through
       a warm page cache, while BufANN's numbers pay ~75 buffer-pool misses
       per query; the re-rank's up to rerank_m (100) random reads are our
@@ -237,13 +349,16 @@ completes it, citing the commit subject.
       load through the heap's occupancy bitmap, `ivf_pq_recover_deletes`);
       the backend's inserted-tag maps must survive the fold or be persisted
       with it.
-- [ ] **One in-memory copy of the PQ codes.** Search reads the posting-order
+- [x] **One in-memory copy of the PQ codes.** Search reads the posting-order
       `PostingLists::codes`; `PQMetadata::codes` (by id) is kept only for the
       index-file writer and the tests' oracles, doubling the codes' memory
       (32 B/vector at 32 chunks: +2.7 GB at 90M). Persist the codes in
       posting order (bump the index version), drop the by-id copy after load,
       and have the rebuild produce posting-order codes directly. Depends on
-      the rebuild above.
+      the rebuild above. (Done without waiting for the rebuild in "Keep the
+      IVF-PQ codes in memory once, in posting order": index file version 5;
+      9M nlist 65536 loads in 484 MB instead of 751, q/s unchanged. The
+      rebuild, when written, must fill PostingLists::codes itself.)
 
 ## Not planned
 

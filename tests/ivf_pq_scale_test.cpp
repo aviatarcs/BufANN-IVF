@@ -143,11 +143,15 @@ int main(int argc, char** argv) {
         });
         step("load index file (validating)", [&] {
             IVFPQIndex ix = load_ivf_pq_index(prefix);
-            pq = std::move(ix.pq);
+            // The checks below read codes by id from the encoder's own file;
+            // the loaded index holds them only in posting order.
+            pq = load_ivf_pq(prefix);
             round_trip = ix.meta.centroids == meta.centroids && ix.assignments.cluster_id == assignments.cluster_id &&
                          ix.rid_table.rid.size() == rid_table.rid.size() && ix.lists.ids == lists.ids &&
                          ix.lists.offsets == lists.offsets && ix.heap_pages == heap.allocated_pages() &&
-                         ix.heap_next_slot == heap.next_flat_slot();
+                         ix.heap_next_slot == heap.next_flat_slot() && ix.pq.codes.empty() &&
+                         ix.lists.codes.empty() && ix.lists.blocked.chunks == p.chunks &&
+                         ix.lists.blocked.blocks.size() >= size_t(p.n) * p.chunks;
         });
 
         TestCase t("invariants over every vector");

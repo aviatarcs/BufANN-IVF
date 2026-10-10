@@ -601,12 +601,13 @@ bool test_posting_lists_invert_assignments(const std::string& prefix) {
 // summed by code.
 std::vector<float> pq_distance_table(const float* query, const PQMetadata& pq) {
     std::vector<float> table(size_t(pq.chunks) * pq.k);
+    const std::vector<uint32_t> off = expected_chunk_offsets(BLOB_DIM, pq.chunks);
     for (uint32_t c = 0; c < pq.chunks; ++c) {
         for (uint32_t j = 0; j < pq.k; ++j) {
-            const float* pivot = pq.pivots.data() + (size_t(c) * pq.k + j) * pq.chunk_dim;
+            const float* pivot = expected_pivot(pq, off, c, j);
             float sum = 0.0f;
-            for (uint32_t d = 0; d < pq.chunk_dim; ++d) {
-                float diff = query[c * pq.chunk_dim + d] - pivot[d];
+            for (uint32_t d = 0; d < off[c + 1] - off[c]; ++d) {
+                float diff = query[off[c] + d] - pivot[d];
                 sum += diff * diff;
             }
             table[size_t(c) * pq.k + j] = sum;
@@ -627,13 +628,15 @@ template<typename T>
 bool test_pq_pivots_and_codes(const std::string& tag, const std::string& prefix,
                               const std::string& base_bin, const std::vector<T>& base,
                               uint32_t chunks) {
-    TestCase t(tag + ": PQ codes are the nearest pivots and PQ distances rank blobs correctly");
-    const uint32_t chunk_dim = BLOB_DIM / chunks;
+    TestCase t(tag + ": PQ codes are the nearest pivots and PQ distances rank blobs correctly (" +
+               std::to_string(BLOB_DIM) + " dims, " + std::to_string(chunks) + " chunks)");
+    const std::vector<uint32_t> off = expected_chunk_offsets(BLOB_DIM, chunks);
+    const uint32_t chunk_dim = BLOB_DIM % chunks == 0 ? BLOB_DIM / chunks : 0;
     train_ivf_pq_pivots<T>(base_bin, prefix, chunks, 1.0, NUM_K_MEANS_ITERS, TRAIN_SEED);
     encode_ivf_pq_codes<T>(base_bin, prefix, chunks);
     PQMetadata pq = load_ivf_pq(prefix);
-    if (!t.check(pq.chunks == chunks && pq.chunk_dim == chunk_dim && pq.k == NUM_PQ_CENTERS &&
-                     pq.pivots.size() == size_t(chunks) * NUM_PQ_CENTERS * chunk_dim &&
+    if (!t.check(pq.chunks == chunks && pq.chunk_dim == chunk_dim && pq.chunk_offsets == off &&
+                     pq.k == NUM_PQ_CENTERS && pq.pivots.size() == size_t(NUM_PQ_CENTERS) * BLOB_DIM &&
                      pq.codes.size() == size_t(NUM_POINTS) * chunks,
                  "unexpected PQ shape")) {
         return t.done();
@@ -655,7 +658,7 @@ bool test_pq_pivots_and_codes(const std::string& tag, const std::string& prefix,
         std::vector<float> table = pq_distance_table(point.data(), pq);
         for (uint32_t c = 0; c < chunks; ++c) {
             float centered_norm2 = 0.0f;
-            for (uint32_t d = c * chunk_dim; d < (c + 1) * chunk_dim; ++d) {
+            for (uint32_t d = off[c]; d < off[c + 1]; ++d) {
                 centered_norm2 += (point[d] - mean[d]) * (point[d] - mean[d]);
             }
             const float* row = table.data() + size_t(c) * pq.k;
@@ -708,7 +711,7 @@ bool test_pq_error_paths(const std::string& prefix, const std::string& base_bin)
     TestCase t("PQ rejects chunks == 0, dim % chunks != 0, a short sample, and missing files");
     std::string pre = prefix + "_pqerr";
     t.expect_throw("chunks == 0", [&] { train_ivf_pq_pivots<float>(base_bin, pre, 0); });
-    t.expect_throw("12 dims into 5 chunks", [&] { train_ivf_pq_pivots<float>(base_bin, pre, 5); });
+    t.expect_throw("13 chunks for 12 dims", [&] { train_ivf_pq_pivots<float>(base_bin, pre, BLOB_DIM + 1); });
     t.expect_throw("sample of ~0 rows", [&] {
         train_ivf_pq_pivots<float>(base_bin, pre, 4, 1e-6, NUM_K_MEANS_ITERS, TRAIN_SEED);
     });
@@ -850,26 +853,33 @@ bool test_index_file(const std::string& prefix, const std::string& base_bin, con
                 loaded.assignments.cluster_id == ix.assignments.cluster_id &&
                 loaded.lists.offsets == ix.lists.offsets && loaded.lists.ids == ix.lists.ids &&
                 loaded.pq.chunks == ix.pq.chunks && loaded.pq.chunk_dim == ix.pq.chunk_dim &&
-                loaded.pq.k == ix.pq.k && loaded.pq.pivots == ix.pq.pivots && loaded.pq.codes == ix.pq.codes &&
+                loaded.pq.k == ix.pq.k && loaded.pq.pivots == ix.pq.pivots && loaded.pq.codes.empty() &&
                 loaded.rid_table.rid.size() == ix.rid_table.rid.size() && rids_equal &&
                 loaded.heap_layout.slots_per_page == ix.heap_layout.slots_per_page &&
                 loaded.heap_pages == ix.heap_pages && loaded.heap_next_slot == ix.heap_next_slot,
             "loaded index differs from what was written");
 
-    // The loader lays the codes out by posting list; checked against the
-    // codes file as upstream wrote it, row = vector id.
+    // The loader keeps the codes once, transposed into blocks of 64 per
+    // posting list; read back here by hand and checked against the codes
+    // file as upstream wrote it, row = vector id.
     {
         uint8_t* file_codes = nullptr;
         size_t rows = 0, chunks = 0;
         diskann::load_bin<uint8_t>(ivf_pq_codes_path(pre), file_codes, rows, chunks);
-        size_t wrong = loaded.lists.codes.size() == rows * chunks ? 0 : 1;
-        for (size_t i = 0; wrong == 0 && i < loaded.lists.ids.size(); ++i) {
-            wrong += !std::equal(file_codes + size_t(loaded.lists.ids[i]) * chunks,
-                                 file_codes + size_t(loaded.lists.ids[i] + 1) * chunks,
-                                 loaded.lists.codes.begin() + i * chunks);
+        const IVFPQBlockedCodes& b = loaded.lists.blocked;
+        size_t wrong = loaded.lists.codes.empty() && b.chunks == chunks ? 0 : 1;
+        for (size_t p = 0; wrong == 0 && p + 1 < loaded.lists.offsets.size(); ++p) {
+            for (uint32_t i = loaded.lists.offsets[p]; i < loaded.lists.offsets[p + 1]; ++i) {
+                const uint32_t local = i - loaded.lists.offsets[p];
+                const uint8_t* block = b.blocks.data() + (b.block_start[p] + local / IVF_FASTSCAN_BLOCK) * chunks * IVF_FASTSCAN_BLOCK;
+                for (size_t c = 0; c < chunks; ++c) {
+                    wrong += block[c * IVF_FASTSCAN_BLOCK + local % IVF_FASTSCAN_BLOCK] !=
+                             file_codes[size_t(loaded.lists.ids[i]) * chunks + c];
+                }
+            }
         }
         delete[] file_codes;
-        t.check(wrong == 0, "loaded posting-list codes are not the codes file's rows in list order");
+        t.check(wrong == 0, "loaded blocked codes are not the codes file's rows in list order");
     }
 
     // What the loaded header says about the heap is enough to reopen it, and
@@ -891,6 +901,25 @@ bool test_index_file(const std::string& prefix, const std::string& base_bin, con
     // Writing again replaces the file in place and still loads.
     write_ivf_pq_index(pre, ix);
     t.check(load_ivf_pq_index(pre).lists.ids == ix.lists.ids, "rewrite did not replace cleanly");
+
+    // A loaded index has only the posting-order codes; writing it must give
+    // the same file as writing from the by-id codes did.
+    {
+        std::ifstream first(path, std::ios::binary);
+        const std::string from_by_id((std::istreambuf_iterator<char>(first)), {});
+        write_ivf_pq_index(pre, loaded);
+        std::ifstream second(path, std::ios::binary);
+        const std::string from_posting((std::istreambuf_iterator<char>(second)), {});
+        t.check(from_posting == from_by_id, "rewriting a loaded index changed the file");
+    }
+    {
+        IVFPQIndex no_codes = loaded;
+        no_codes.lists.codes.clear();
+        no_codes.lists.blocked = IVFPQBlockedCodes{};
+        t.expect_throw("writing an index with neither posting nor by-id codes",
+                       [&] { write_ivf_pq_index(pre + "_none", no_codes); });
+        ::unlink(ivf_pq_index_path(pre + "_none").c_str());
+    }
 
     // Each corruption is applied to a fresh copy and must be rejected.
     IVFPQIndexFileHeader h;
@@ -964,6 +993,7 @@ int main() {
         all_pass &= test_posting_codes_follow_lists();
         all_pass &= test_closest_centers_blocking();
         all_pass &= test_pq_pivots_and_codes<float>("float", prefix, base_f32, data_f32, 4);
+        all_pass &= test_pq_pivots_and_codes<float>("float uneven", prefix + "_uneven", base_f32, data_f32, 5);
         all_pass &= test_pq_error_paths(prefix, base_f32);
         all_pass &= test_index_file(prefix, base_f32, data_f32, meta);
 

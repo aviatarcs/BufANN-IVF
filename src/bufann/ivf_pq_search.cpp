@@ -4,6 +4,7 @@
 #include <omp.h>
 
 #include <algorithm>
+#include <cmath>
 #include <numeric>
 #include <shared_mutex>
 
@@ -45,15 +46,14 @@ void require_consistent(const IVFPQIndex& ix) {
                        ix.meta.centroids.size() == size_t(ix.meta.nlist) * ix.meta.aligned_dim &&
                        ix.meta.centroid_l2sq.size() == ix.meta.nlist,
                    "IVFMetadata is inconsistent (centroid_l2sq must be set; see set_ivf_centroid_norms)");
-    IVF_PQ_REQUIRE(ix.pq.chunks > 0 && ix.pq.k > 0 && ix.pq.chunks * ix.pq.chunk_dim == ix.meta.dim &&
-                       ix.pq.pivots.size() == size_t(ix.pq.chunks) * ix.pq.k * ix.pq.chunk_dim &&
-                       ix.pq.codes.size() == n_base * ix.pq.chunks,
+    IVF_PQ_REQUIRE(pq_shape_ok(ix.pq, ix.meta.dim),
                    "PQMetadata is inconsistent with the index");
     IVF_PQ_REQUIRE(ix.lists.offsets.size() == size_t(ix.meta.nlist) + 1 && ix.lists.offsets.front() == 0 &&
                        ix.lists.ids.size() == n_base,
                    "PostingLists are inconsistent with the index");
-    IVF_PQ_REQUIRE(ix.lists.codes.size() == n_base * ix.pq.chunks,
-                   "PostingLists codes do not cover the lists (see set_ivf_posting_codes)");
+    IVF_PQ_REQUIRE(ix.lists.codes.size() == n_base * ix.pq.chunks ||
+                       ivf_blocked_codes_cover(ix.lists.blocked, ix.lists, ix.pq.chunks),
+                   "neither posting-list nor blocked codes cover the lists (see set_ivf_posting_codes)");
 }
 
 void size_scratch(IVFPQSearchScratch& s, const IVFPQIndex& index) {
@@ -87,6 +87,102 @@ void centroid_distances(const IVFMetadata& meta, const float* queries_padded, ui
                 meta.centroids.data(), kdim, 1.0f, dist, n);
 }
 
+// Candidate generation by the SIMD scan: the rerank_m live codes with the
+// smallest quantized PQ distances in the probed lists (and the delta's
+// inserts there) into s.candidates / s.pq_dist, taking `delta_lock` (shared)
+// when there is a delta. The table's range is set from the rerank_m-th
+// smallest float distance among the first 2 x rerank_m live codes in probe
+// order, an upper bound on the final rerank_m-th; codes are kept on a
+// running threshold, so nothing beyond the top rerank_m is stored.
+void fast_candidates(const IVFPQIndex& ix, const IVFPQDelta* delta, uint32_t R, IVFPQSearchScratch& s,
+                     std::shared_lock<WriterPreferringSharedMutex>& delta_lock) {
+    const IVFPQBlockedCodes& bc = ix.lists.blocked;
+    const uint32_t chunks = ix.pq.chunks;
+    const size_t block_bytes = size_t(chunks) * IVF_FASTSCAN_BLOCK;
+    const float* table = s.pq_table.data();
+    if (delta != nullptr) delta_lock = std::shared_lock<WriterPreferringSharedMutex>(delta->mtx);
+    IVF_PQ_REQUIRE(ix.rid_table.rid.size() >= ivf_pq_num_base(ix), "RID table does not cover every base vector");
+    const tsl::robin_set<uint32_t>* dead =
+        delta != nullptr && !delta->lists.tombstones.empty() ? &delta->lists.tombstones : nullptr;
+    auto list_blocks = [&](uint32_t part) { return bc.blocks.data() + size_t(bc.block_start[part]) * block_bytes; };
+
+    s.sample.clear();
+    const size_t want = 2 * size_t(R);
+    for (uint32_t part : s.probe_order) {
+        const uint32_t begin = ix.lists.offsets[part], n = ix.lists.offsets[part + 1] - begin;
+        const uint8_t* first = list_blocks(part);
+        for (uint32_t i = 0; i < n && s.sample.size() < want; ++i) {
+            if (dead != nullptr && dead->count(ix.lists.ids[begin + i]) != 0) continue;
+            s.sample.push_back(adc_block_lane(first + size_t(i / IVF_FASTSCAN_BLOCK) * block_bytes, chunks,
+                                              i % IVF_FASTSCAN_BLOCK, table));
+        }
+        if (s.sample.size() >= want) break;
+    }
+    // Fewer live codes than R in the sample means fewer than R in the probed
+    // lists' first 2R: keep everything rather than bound by a distance.
+    const bool bounded = s.sample.size() >= R;
+    float dmax = 0.0f;
+    if (bounded) {
+        std::nth_element(s.sample.begin(), s.sample.begin() + (R - 1), s.sample.end());
+        dmax = s.sample[R - 1];
+    } else if (!s.sample.empty()) {
+        dmax = *std::max_element(s.sample.begin(), s.sample.end());
+    }
+    quantize_pq_table(table, chunks, dmax, s.qtable);
+    // A code no farther than dmax sums to at most 255, plus half a bin of
+    // rounding per sub-quantizer.
+    uint32_t threshold = bounded ? 256 + chunks / 2 : 0x10000;
+    s.top.clear();
+    auto push = [&](uint16_t q, uint32_t id) {
+        s.top.emplace_back(q, id);
+        std::push_heap(s.top.begin(), s.top.end());
+        if (s.top.size() > R) {
+            std::pop_heap(s.top.begin(), s.top.end());
+            s.top.pop_back();
+        }
+        if (s.top.size() == R) threshold = s.top.front().first;
+    };
+    s.block_sums.resize(IVF_FASTSCAN_BLOCK);
+    for (uint32_t part : s.probe_order) {
+        const uint32_t begin = ix.lists.offsets[part], n = ix.lists.offsets[part + 1] - begin;
+        const uint8_t* first = list_blocks(part);
+        for (uint32_t b = 0; b * IVF_FASTSCAN_BLOCK < n; ++b) {
+            scan_block(first + size_t(b) * block_bytes, s.qtable, s.block_sums.data());
+            const uint32_t lanes = std::min(IVF_FASTSCAN_BLOCK, n - b * IVF_FASTSCAN_BLOCK);
+            for (uint32_t lane = 0; lane < lanes; ++lane) {
+                const uint16_t q = s.block_sums[lane];
+                if (q >= threshold) continue;
+                const uint32_t id = ix.lists.ids[begin + b * IVF_FASTSCAN_BLOCK + lane];
+                if (dead != nullptr && dead->count(id) != 0) continue;
+                push(q, id);
+            }
+        }
+    }
+    if (delta != nullptr) {
+        const float inv = 1.0f / s.qtable.delta;
+        for (uint32_t part : s.probe_order) {
+            auto pending = delta->lists.pending_inserts.find(part);
+            if (pending == delta->lists.pending_inserts.end()) continue;
+            for (uint32_t id : pending->second) {
+                auto code = delta->codes.codes.find(id);
+                IVF_PQ_REQUIRE(code != delta->codes.codes.end() && code->second.size() == chunks,
+                               "inserted vector " + std::to_string(id) + " has no PQ code in the delta");
+                float d = 0.0f;
+                for (uint32_t c = 0; c < chunks; ++c) d += table[size_t(c) * 256 + code->second[c]];
+                const float q = std::nearbyint((d - s.qtable.dmin) * inv);
+                const uint16_t qq = uint16_t(std::clamp(q, 0.0f, 65535.0f));
+                if (qq < threshold) push(qq, id);
+            }
+        }
+    }
+    s.candidates.clear();
+    s.pq_dist.clear();
+    for (const auto& [q, id] : s.top) {
+        s.candidates.push_back(id);
+        s.pq_dist.push_back(s.qtable.dmin + float(q) * s.qtable.delta);
+    }
+}
+
 // Everything after choosing the partitions in scratch.probe_order: PQ table,
 // scan of the probed posting lists, selection, optional exact re-rank.
 template<typename T>
@@ -101,61 +197,80 @@ IVFPQSearchResult search_probes(const IVFPQIndex& ix, const RawVectorHeap& heap,
     RawVectorHeap::ReadGuard guard(heap);
 
     for (uint32_t c = 0; c < pq.chunks; ++c) {
+        const uint32_t len = pq_chunk_len(pq, c);
         for (uint32_t j = 0; j < pq.k; ++j) {
-            scratch.pq_table[size_t(c) * pq.k + j] =
-                sq_dist(query + c * pq.chunk_dim, pq.pivots.data() + (size_t(c) * pq.k + j) * pq.chunk_dim,
-                        pq.chunk_dim);
+            scratch.pq_table[size_t(c) * pq.k + j] = sq_dist(query + pq.chunk_offsets[c], pq_pivot(pq, c, j), len);
         }
     }
 
-    auto add_candidate = [&](uint32_t id, const uint8_t* code) {
-        float d = 0.0f;
-        for (uint32_t c = 0; c < pq.chunks; ++c) d += scratch.pq_table[size_t(c) * pq.k + code[c]];
-        scratch.candidates.push_back(id);
-        scratch.pq_dist.push_back(d);
-    };
-    scratch.candidates.clear();
-    scratch.pq_dist.clear();
-    for (uint32_t part : scratch.probe_order) {
-        for (uint32_t i = ix.lists.offsets[part]; i < ix.lists.offsets[part + 1]; ++i) {
-            add_candidate(ix.lists.ids[i], ix.lists.codes.data() + size_t(i) * pq.chunks);
-        }
-    }
-
-    // Inserts grow the delta and the RID table, so both are read under the
-    // delta's shared lock: here for the delta, again below for the
-    // shortlist's RIDs, with the selection between them unlocked so a
-    // waiting writer is held up by at most a scan.
+    const bool fast = rerank_m > 0 && pq.k == 256 && fastscan_enabled() && fastscan_simd_available() &&
+                      ix.lists.blocked.chunks == pq.chunks && !ix.lists.blocked.blocks.empty();
     std::shared_lock<WriterPreferringSharedMutex> delta_lock;
-    if (delta != nullptr) delta_lock = std::shared_lock<WriterPreferringSharedMutex>(delta->mtx);
-    IVF_PQ_REQUIRE(ix.rid_table.rid.size() >= ivf_pq_num_base(ix), "RID table does not cover every base vector");
-    if (delta != nullptr) {
-        // Deleted base vectors are still in the posting lists; dropped before
-        // selection so they cannot crowd live vectors out of the shortlist.
-        const tsl::robin_set<uint32_t>& tombstones = delta->lists.tombstones;
-        if (!tombstones.empty()) {
-            size_t live = 0;
-            for (size_t i = 0; i < scratch.candidates.size(); ++i) {
-                if (tombstones.count(scratch.candidates[i]) != 0) continue;
-                scratch.candidates[live] = scratch.candidates[i];
-                scratch.pq_dist[live] = scratch.pq_dist[i];
-                ++live;
+    if (fast) {
+        fast_candidates(ix, delta, rerank_m, scratch, delta_lock);
+    } else {
+        auto add_candidate = [&](uint32_t id, const uint8_t* code) {
+            float d = 0.0f;
+            for (uint32_t c = 0; c < pq.chunks; ++c) d += scratch.pq_table[size_t(c) * pq.k + code[c]];
+            scratch.candidates.push_back(id);
+            scratch.pq_dist.push_back(d);
+        };
+        scratch.candidates.clear();
+        scratch.pq_dist.clear();
+        if (!ix.lists.codes.empty()) {
+            for (uint32_t part : scratch.probe_order) {
+                for (uint32_t i = ix.lists.offsets[part]; i < ix.lists.offsets[part + 1]; ++i) {
+                    add_candidate(ix.lists.ids[i], ix.lists.codes.data() + size_t(i) * pq.chunks);
+                }
             }
-            scratch.candidates.resize(live);
-            scratch.pq_dist.resize(live);
+        } else {
+            // A loaded index keeps only the blocked layout.
+            const size_t block_bytes = size_t(pq.chunks) * IVF_FASTSCAN_BLOCK;
+            for (uint32_t part : scratch.probe_order) {
+                const uint32_t begin = ix.lists.offsets[part], n = ix.lists.offsets[part + 1] - begin;
+                const uint8_t* first = ivf_list_blocks(ix.lists.blocked, part);
+                for (uint32_t i = 0; i < n; ++i) {
+                    scratch.candidates.push_back(ix.lists.ids[begin + i]);
+                    scratch.pq_dist.push_back(adc_block_lane(first + size_t(i / IVF_FASTSCAN_BLOCK) * block_bytes,
+                                                             pq.chunks, i % IVF_FASTSCAN_BLOCK,
+                                                             scratch.pq_table.data()));
+                }
+            }
         }
-        for (uint32_t part : scratch.probe_order) {
-            auto pending = delta->lists.pending_inserts.find(part);
-            if (pending == delta->lists.pending_inserts.end()) continue;
-            for (uint32_t id : pending->second) {
-                auto code = delta->codes.codes.find(id);
-                IVF_PQ_REQUIRE(code != delta->codes.codes.end() && code->second.size() == pq.chunks,
-                               "inserted vector " + std::to_string(id) + " has no PQ code in the delta");
-                add_candidate(id, code->second.data());
+
+        // Inserts grow the delta and the RID table, so both are read under the
+        // delta's shared lock: here for the delta, again below for the
+        // shortlist's RIDs, with the selection between them unlocked so a
+        // waiting writer is held up by at most a scan.
+        if (delta != nullptr) delta_lock = std::shared_lock<WriterPreferringSharedMutex>(delta->mtx);
+        IVF_PQ_REQUIRE(ix.rid_table.rid.size() >= ivf_pq_num_base(ix), "RID table does not cover every base vector");
+        if (delta != nullptr) {
+            // Deleted base vectors are still in the posting lists; dropped before
+            // selection so they cannot crowd live vectors out of the shortlist.
+            const tsl::robin_set<uint32_t>& tombstones = delta->lists.tombstones;
+            if (!tombstones.empty()) {
+                size_t live = 0;
+                for (size_t i = 0; i < scratch.candidates.size(); ++i) {
+                    if (tombstones.count(scratch.candidates[i]) != 0) continue;
+                    scratch.candidates[live] = scratch.candidates[i];
+                    scratch.pq_dist[live] = scratch.pq_dist[i];
+                    ++live;
+                }
+                scratch.candidates.resize(live);
+                scratch.pq_dist.resize(live);
+            }
+            for (uint32_t part : scratch.probe_order) {
+                auto pending = delta->lists.pending_inserts.find(part);
+                if (pending == delta->lists.pending_inserts.end()) continue;
+                for (uint32_t id : pending->second) {
+                    auto code = delta->codes.codes.find(id);
+                    IVF_PQ_REQUIRE(code != delta->codes.codes.end() && code->second.size() == pq.chunks,
+                                   "inserted vector " + std::to_string(id) + " has no PQ code in the delta");
+                    add_candidate(id, code->second.data());
+                }
             }
         }
     }
-
     if (delta_lock.owns_lock()) delta_lock.unlock();
 
     // The active check covers a delete that landed while the lock was
