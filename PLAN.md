@@ -81,10 +81,17 @@ of all scanned codes, and 7-21% in heap reads
       1x beam gets 0.997 in 1.4 ms. Both are bound by reading centroid
       rows (memory bandwidth for the scan, misses for the graph), so a
       compact copy of the centroids would help either; the graph stays.)
-- [ ] **SIFT100M rerun.** With the items above, rerun the 2026-10-03
+- [x] **SIFT100M rerun.** With the items above, rerun the 2026-10-03
       comparison as it was (same BufANN results, same warmup, pools, nprobe
       grid) and record it next to the old one; add nprobes between the
       powers of two near the recall targets.
+      (Done: `benchmark_results/sift100m_2026-10-10.jsonl`, BufANN rerun
+      in the same session. Best q/s at recall >= 90 / 95 / 98 / 99, 1 GB
+      pool, RSS 5.5 GB both: BufANN 8784 / 6937 / 3972 / - (p99 6.4 / 7.7
+      / 10.1 ms); IVF-PQ nlist 131072 12376 / 9708 / 6440 / 3857 (p99 5.0 /
+      6.8 / 10.8 / 17.9 ms), nlist 262144 11780 / 9174 / 5802 / 3510.
+      IVF-PQ now leads 1.40-1.62x, and with the scan cheap the smaller
+      nlist wins. 8 GB pool: the same picture, every system 1-10% higher.)
 - [ ] **Other 100M datasets.** DEEP100M (float32, 96-d), SPACEV100M (int8,
       100-d), Turing100M (float32, 100-d), downloaded to /tmpdata/100m/.
       Needs: query files and exact ground truth over each 90M base
