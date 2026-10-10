@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "bufann/ivf_pq_build.h"
+#include "bufann/ivf_pq_fastscan.h"
 #include "bufann/ivf_pq_require.h"
 #include "utils.h"
 
@@ -258,6 +259,7 @@ IVFPQIndex load_ivf_pq_index(const std::string& index_prefix) {
     index.pq.k = h.pq_k;
     index.pq.pivots = in.read<float>(h.pq_pivots_offset, h.pq_pivots_bytes, "PQ pivots");
     index.lists.codes = in.read<uint8_t>(h.pq_codes_offset, h.pq_codes_bytes, "PQ codes");
+    index.lists.blocked = build_ivf_blocked_codes(index.lists, index.pq.chunks);
     std::vector<uint32_t> packed = in.read<uint32_t>(h.rid_table_offset, h.rid_table_bytes, "RID table");
     index.rid_table.rid.reserve(packed.size());
     for (uint32_t p : packed) index.rid_table.rid.push_back(RawVectorRID{p});

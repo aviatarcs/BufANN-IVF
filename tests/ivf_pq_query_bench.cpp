@@ -13,6 +13,10 @@
 //                      [--nprobes 8,16,32,64,128] [--rerank_m 100] [--k 10]
 //                      [--threads N] [--warmup N] [--graph_beams 2,4]
 //                      [--warmup_query_file <warmup.bin>] [--skip_exact 1]
+//                      [--scan simd|float]
+//
+// --scan float turns off the SIMD (Quicker ADC) PQ scan; with simd, the
+// default, it runs when the CPU has AVX-512 VBMI and rerank_m > 0.
 //                      [--buffer_pool_frames 262144]
 //
 // The heap is read through a BufANN buffer pool of --buffer_pool_frames
@@ -92,6 +96,10 @@ int run(int argc, char** argv) {
     const uint32_t rerank_m = uint32_t(std::stoul(get_arg(argc, argv, "--rerank_m", "100")));
     const int threads = std::stoi(get_arg(argc, argv, "--threads", std::to_string(omp_get_max_threads())));
     const std::vector<uint32_t> nprobes = parse_list(get_arg(argc, argv, "--nprobes", "8,16,32,64,128"));
+    const std::string scan = get_arg(argc, argv, "--scan", "simd");
+    if (scan != "simd" && scan != "float") throw diskann::ANNException("--scan must be simd or float", -1);
+    set_fastscan_enabled(scan == "simd");
+    const char* scan_used = fastscan_enabled() && fastscan_simd_available() ? "simd" : "float";
     // Beam factors may be fractional; the beam is ceil(factor x nprobe), at least nprobe.
     std::vector<double> graph_beams;
     {
@@ -265,12 +273,12 @@ int run(int argc, char** argv) {
                 ivf_pq_search_batch<T>(ix, heap, queries.data(), nq, k, nprobe, rerank_m);
             const double batch_wall = seconds_since(t0);
 
-            std::printf("{\"baseline\":\"IVF-PQ\",\"centroid_search\":\"exact\",\"N\":%zu,\"nlist\":%u,\"pq_chunks\":%u,"
+            std::printf("{\"baseline\":\"IVF-PQ\",\"scan\":\"%s\",\"centroid_search\":\"exact\",\"N\":%zu,\"nlist\":%u,\"pq_chunks\":%u,"
                         "\"nprobe\":%u,\"rerank_m\":%u,"
                         "\"query_threads\":%d,\"query_count\":%zu,\"query_qps\":%.1f,\"query_lat_avg_us\":%.1f,"
                         "\"query_lat_p50_us\":%.1f,\"query_lat_p99_us\":%.1f,\"recall\":%.3f,"
                         "\"batched_qps\":%.1f,\"batched_recall\":%.3f,\"rss_mb\":%.0f,%s}\n",
-                        n, ix.meta.nlist, ix.pq.chunks, nprobe, rerank_m, threads, nq, double(nq) / wall,
+                        scan_used, n, ix.meta.nlist, ix.pq.chunks, nprobe, rerank_m, threads, nq, double(nq) / wall,
                         avg * 1e6, percentile_us(lat, 0.50), percentile_us(lat, 0.99), recall,
                         double(nq) / batch_wall, recall_of(batch), rss_mb(), io_fields.c_str());
             std::fflush(stdout);
@@ -320,12 +328,12 @@ int run(int argc, char** argv) {
                     }
                 }
             }
-            std::printf("{\"baseline\":\"IVF-PQ\",\"centroid_search\":\"graph\",\"centroid_L\":%u,\"N\":%zu,"
+            std::printf("{\"baseline\":\"IVF-PQ\",\"scan\":\"%s\",\"centroid_search\":\"graph\",\"centroid_L\":%u,\"N\":%zu,"
                         "\"nlist\":%u,\"pq_chunks\":%u,\"nprobe\":%u,\"rerank_m\":%u,\"query_threads\":%d,"
                         "\"query_count\":%zu,\"query_qps\":%.1f,\"query_lat_avg_us\":%.1f,"
                         "\"query_lat_p50_us\":%.1f,\"query_lat_p99_us\":%.1f,\"recall\":%.3f,"
                         "\"probe_recall\":%.4f,\"rss_mb\":%.0f,%s}\n",
-                        beam, n, ix.meta.nlist, ix.pq.chunks, nprobe, rerank_m, threads, nq,
+                        scan_used, beam, n, ix.meta.nlist, ix.pq.chunks, nprobe, rerank_m, threads, nq,
                         double(nq) / graph_wall, graph_avg * 1e6, percentile_us(lat, 0.50),
                         percentile_us(lat, 0.99), recall_of(res), double(probe_hits) / double(nq * probes),
                         rss_mb(), graph_io_fields.c_str());

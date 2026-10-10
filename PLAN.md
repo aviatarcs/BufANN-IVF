@@ -54,6 +54,13 @@ of all scanned codes, and 7-21% in heap reads
       the same integer arithmetic exactly; end to end, recall within noise of
       the float scan at the same nprobe and rerank_m. Measure ns per code
       (48 now) and q/s-recall at 9M and 90M.
+      First step done in "Scan PQ codes with Quicker ADC split tables":
+      90M, nlist 262144, beam 1.25x, 1 GB pool, nprobe 128 / 256 / 512:
+      q/s 6138 / 3673 / 2083 -> 10982 / 8644 / 5757, recall 92.47 / 96.22 /
+      98.28 -> 92.45 / 96.21 / 98.25, p99 17.0 / 29.5 / 50.3 -> 4.8 / 6.7 /
+      10.8 ms. Still to do: the blocked codes are built at load beside the
+      posting-order ones (+3 GB at 90M); drop the latter after load, with
+      the float path and the writer reading the blocked layout.
 - [ ] **Two-level IVF for the centroid search.** Instead of the centroid
       graph, cluster the nlist centroids into ~sqrt(nlist) super-centroids
       (512 at 262144), probe the nearest super-lists and compute exact
