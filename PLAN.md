@@ -1,11 +1,66 @@
 # IVF-PQ plan
 
 The worker takes the first unchecked item whose dependencies are checked,
-unless `REVIEW.md` has open findings, which come first. Each item is one
+from the October queue before the earlier queue, unless `REVIEW.md` has
+open findings, which come first. Each item is one
 PR-sized change with tests. Check an item off in the same commit that
 completes it, citing the commit subject.
 
-## Queue
+## Queue: scan speed and centroid search (October 2026)
+
+Taken before the earlier queue below. Context: at SIFT100M (90M base, 1 GB
+pool) BufANN gets 1.25-2.0x IVF-PQ's q/s at recall 90-98, and a profile of
+IVF-PQ (nlist 262144) puts 57-71% of query time in the PQ code scan (~48 ns
+per code per thread, near the scalar instruction limit), 17-18% in the
+centroid graph search (beam 2 x nprobe), 5% in selecting the top rerank_m
+of all scanned codes, and 7-21% in heap reads
+(`benchmark_results/sift100m_2026-10-03.jsonl`).
+
+- [ ] **Narrower and heap-based centroid beam.** Accept a fractional beam
+      factor (centroid_L = ceil(f x nprobe)) in the API and the bench, and
+      measure probe-set recall and q/s for f in 1.0-2.0 at 100M; replace the
+      sorted-vector beam, whose inserts shift up to L entries, with a
+      structure whose insert does not (a bounded heap plus the expansion
+      order kept separately). Oracle: probe sets equal to the current beam's
+      at the same L; probe-set recall against the exact GEMM. Target: the
+      centroid share from ~18% to a few percent at no recall cost.
+- [ ] **Quicker ADC scan for the existing 32 x 8-bit codes.** Andre,
+      Kermarrec and Le Scouarnec, "Quicker ADC: Unlocking the Hidden
+      Potential of Product Quantization with SIMD" (TPAMI 2019,
+      arXiv:1812.09162), split tables: each 256-entry lookup table, with its
+      entries quantized to 8-bit integers per query, is held in four 512-bit
+      registers as two 128-entry halves; an 8-bit lookup for 64 codes is two
+      AVX-512 VBMI vpermi2b shuffles on the low 7 bits plus a blend on the
+      top bit, with saturating 8-bit (or 16-bit) accumulation. The PQ
+      codebooks and codes stay; only their layout changes: each posting list
+      is transposed into blocks of 64 codes, sub-code-major, done at load
+      (or persisted with an index version bump). The scan keeps a running
+      top-rerank_m on the quantized distances instead of storing every
+      candidate, which also removes the select step. Fall back to the scalar
+      scan on CPUs without VBMI (this node, Xeon Silver 4314, has it).
+      Oracle: the kernel's quantized distances equal a scalar reference of
+      the same integer arithmetic exactly; end to end, recall within noise of
+      the float scan at the same nprobe and rerank_m. Measure ns per code
+      (48 now) and q/s-recall at 9M and 90M.
+- [ ] **Two-level IVF for the centroid search.** Instead of the centroid
+      graph, cluster the nlist centroids into ~sqrt(nlist) super-centroids
+      (512 at 262144), probe the nearest super-lists and compute exact
+      distances to the centroids in them (a small GEMV) to pick nprobe lists.
+      Compare with the graph at equal probe-set recall: time, recall, build
+      cost. Oracle: the exact GEMM probe set.
+- [ ] **SIFT100M rerun.** With the items above, rerun the 2026-10-03
+      comparison as it was (same BufANN results, same warmup, pools, nprobe
+      grid) and record it next to the old one; add nprobes between the
+      powers of two near the recall targets.
+- [ ] **Other 100M datasets.** DEEP100M (float32, 96-d), SPACEV100M (int8,
+      100-d), Turing100M (float32, 100-d), downloaded to /tmpdata/100m/.
+      Needs: query files and exact ground truth over each 90M base
+      (`scripts/datasets/exact_gt.cpp` reads uint8 only; extend it to int8
+      and float), IVF-PQ builds (chunk counts dividing the dimension: 32 for
+      96-d, 25 or 50 for 100-d), BufANN's DiskANN build, PQ and conversion
+      for each (~4-5 h each at 90M on this node), then the same comparison.
+
+## Earlier queue
 
 - [x] **Heap reopen.** `RawVectorHeap::open_existing(path, layout, next_flat_slot, allocated_pages)`
       driven by `IVFPQIndexFileHeader`; refuse a file whose size disagrees
@@ -173,14 +228,15 @@ completes it, citing the commit subject.
       measured per-code time, plus measured centroid-search time; pick the
       minimum (paper section 4.1). Validate against the 9M measurements.
       Depends on the nlist measurement.
-- [ ] **4-bit fast-scan PQ.** The scan does one scalar table lookup per
+- [ ] **4-bit fast-scan PQ.** (Superseded by Quicker ADC split tables in
+      the October queue, which keep the existing 8-bit codes.) The scan does one scalar table lookup per
       chunk per code. 64 x 4-bit sub-quantizers are the same 32 B/vector as
       32 x 8-bit for SIFT, and their tables fit SIMD registers (PQFastScan,
       blocks of 32 codes). Prototype the kernel on the SIFT10M codes against
       the scalar scan as oracle, then compare QPS-recall end to end. Small
       lists (large nlist) leave partial blocks; measure at nlist 32768
       (~275 codes per list at 9M), the sweep's best.
-- [ ] **Raw-vector heap through BufANN's buffer pool.** The heap is read
+- [x] **Raw-vector heap through BufANN's buffer pool.** The heap is read
       with plain pread, so the query bench serves re-rank reads from an
       unbounded OS page cache (the 9M heap, 1.2 GB, is fully cached after
       warmup) while BufANN's runs pay 75 misses per query against a 1 GB
