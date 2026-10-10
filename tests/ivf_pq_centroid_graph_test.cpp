@@ -227,7 +227,7 @@ bool test_scratch_reuse(const IVFMetadata& meta, const IVFCentroidGraph& g, cons
         IVFCentroidGraphScratch s;
         search_ivf_centroid_graph(meta, g, other, 256, 64, s, fresh_other);
     }
-    scratch.epoch = std::numeric_limits<uint32_t>::max();
+    scratch.epoch = std::numeric_limits<decltype(scratch.epoch)>::max();
     search_ivf_centroid_graph(meta, g, other, 256, 64, scratch, got);
     t.check(got == fresh_other, "search at the epoch wrap differs from a fresh scratch");
     search_ivf_centroid_graph(meta, g, query, 256, 64, scratch, got);

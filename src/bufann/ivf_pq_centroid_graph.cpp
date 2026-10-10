@@ -1,5 +1,6 @@
 #include "bufann/ivf_pq_centroid_graph.h"
 
+#include <immintrin.h>
 #include <omp.h>
 
 #include <algorithm>
@@ -16,11 +17,45 @@ namespace {
 
 using Candidate = IVFCentroidGraphScratch::Candidate;
 
+#ifdef __AVX512F__
+__mmask16 tail_mask(uint32_t dim, uint32_t d) { return dim - d >= 16 ? __mmask16(0xFFFF) : __mmask16((1u << (dim - d)) - 1); }
+
+float sq_dist(const float* a, const float* b, uint32_t dim) {
+    __m512 acc = _mm512_setzero_ps();
+    for (uint32_t d = 0; d < dim; d += 16) {
+        const __mmask16 m = tail_mask(dim, d);
+        const __m512 x = _mm512_sub_ps(_mm512_maskz_loadu_ps(m, a + d), _mm512_maskz_loadu_ps(m, b + d));
+        acc = _mm512_fmadd_ps(x, x, acc);
+    }
+    return _mm512_reduce_add_ps(acc);
+}
+
+// FAISS's fvec_L2sqr_batch_4: four rows against one query with four
+// independent accumulators, so one row's loads overlap the others' adds.
+// Each distance is summed exactly as sq_dist sums it.
+void sq_dist4(const float* q, const float* const* rows, uint32_t dim, float* out) {
+    __m512 acc[4] = {_mm512_setzero_ps(), _mm512_setzero_ps(), _mm512_setzero_ps(), _mm512_setzero_ps()};
+    for (uint32_t d = 0; d < dim; d += 16) {
+        const __mmask16 m = tail_mask(dim, d);
+        const __m512 x = _mm512_maskz_loadu_ps(m, q + d);
+        for (int r = 0; r < 4; ++r) {
+            const __m512 t = _mm512_sub_ps(x, _mm512_maskz_loadu_ps(m, rows[r] + d));
+            acc[r] = _mm512_fmadd_ps(t, t, acc[r]);
+        }
+    }
+    for (int r = 0; r < 4; ++r) out[r] = _mm512_reduce_add_ps(acc[r]);
+}
+#else
 float sq_dist(const float* a, const float* b, uint32_t dim) {
     float s = 0.0f;
     for (uint32_t d = 0; d < dim; ++d) s += (a[d] - b[d]) * (a[d] - b[d]);
     return s;
 }
+
+void sq_dist4(const float* q, const float* const* rows, uint32_t dim, float* out) {
+    for (int r = 0; r < 4; ++r) out[r] = sq_dist(q, rows[r], dim);
+}
+#endif
 
 const float* centroid(const IVFMetadata& meta, uint32_t c) {
     return meta.centroids.data() + size_t(c) * meta.aligned_dim;
@@ -62,18 +97,30 @@ void beam_search(const IVFMetadata& meta, uint32_t entry, const float* query, ui
         if (s.best.size() == L && cur.dist > s.best.front().dist) break;
         if (expanded != nullptr) expanded->push_back({cur.dist, cur.id, true});
         neighbors_of(cur.id, s.nbrs);
-        // The centroids are far larger than the caches; ask for every
-        // unvisited neighbour's row before computing any distance.
+        // Keep the unvisited neighbours, marking them, and ask for their
+        // rows before computing any distance: the centroids are far larger
+        // than the caches.
         const size_t row_bytes = size_t(meta.dim) * sizeof(float);
-        for (uint32_t nb : s.nbrs) {
-            if (s.visited_epoch[nb] == s.epoch) continue;
-            const char* row = reinterpret_cast<const char*>(centroid(meta, nb));
-            for (size_t off = 0; off < row_bytes; off += 64) __builtin_prefetch(row + off);
-        }
+        size_t fresh = 0;
         for (uint32_t nb : s.nbrs) {
             if (s.visited_epoch[nb] == s.epoch) continue;
             s.visited_epoch[nb] = s.epoch;
-            const float d = sq_dist(query, centroid(meta, nb), meta.dim);
+            s.nbrs[fresh++] = nb;
+            const char* row = reinterpret_cast<const char*>(centroid(meta, nb));
+            for (size_t off = 0; off < row_bytes; off += 64) __builtin_prefetch(row + off);
+        }
+        s.nbrs.resize(fresh);
+        s.nbr_dist.resize(fresh);
+        size_t i = 0;
+        for (; i + 4 <= fresh; i += 4) {
+            const float* rows[4] = {centroid(meta, s.nbrs[i]), centroid(meta, s.nbrs[i + 1]),
+                                    centroid(meta, s.nbrs[i + 2]), centroid(meta, s.nbrs[i + 3])};
+            sq_dist4(query, rows, meta.dim, s.nbr_dist.data() + i);
+        }
+        for (; i < fresh; ++i) s.nbr_dist[i] = sq_dist(query, centroid(meta, s.nbrs[i]), meta.dim);
+        for (i = 0; i < fresh; ++i) {
+            const uint32_t nb = s.nbrs[i];
+            const float d = s.nbr_dist[i];
             if (s.best.size() == L && d >= s.best.front().dist) continue;
             s.best.push_back({d, nb, false});
             std::push_heap(s.best.begin(), s.best.end(), nearer);
