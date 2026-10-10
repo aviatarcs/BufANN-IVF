@@ -3,7 +3,8 @@
 // thread runs whole queries, and throughput, per-query latency and recall@k
 // against a DiskANN truthset are reported per nprobe, plus the batched path.
 // With --graph_beams, each nprobe is also run through a centroid graph
-// (built after load) with a beam of factor x nprobe, reporting in addition
+// (built after load) with a beam of ceil(factor x nprobe), factors possibly
+// fractional (e.g. --graph_beams 1,1.25,2), reporting in addition
 // the probe-set recall: the share of probed partitions no farther than the
 // exact nprobe-th nearest centroid.
 //
@@ -33,6 +34,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -90,7 +92,15 @@ int run(int argc, char** argv) {
     const uint32_t rerank_m = uint32_t(std::stoul(get_arg(argc, argv, "--rerank_m", "100")));
     const int threads = std::stoi(get_arg(argc, argv, "--threads", std::to_string(omp_get_max_threads())));
     const std::vector<uint32_t> nprobes = parse_list(get_arg(argc, argv, "--nprobes", "8,16,32,64,128"));
-    const std::vector<uint32_t> graph_beams = parse_list(get_arg(argc, argv, "--graph_beams", ""));
+    // Beam factors may be fractional; the beam is ceil(factor x nprobe), at least nprobe.
+    std::vector<double> graph_beams;
+    {
+        std::stringstream ss(get_arg(argc, argv, "--graph_beams", ""));
+        for (std::string tok; std::getline(ss, tok, ',');) graph_beams.push_back(std::stod(tok));
+        for (double f : graph_beams) {
+            if (!(f >= 1.0)) throw diskann::ANNException("--graph_beams factors must be at least 1", -1);
+        }
+    }
     const uint32_t pool_frames = uint32_t(std::stoul(get_arg(argc, argv, "--buffer_pool_frames", "262144")));
     for (const std::string& f : {ivf_pq_index_path(prefix), query_file, gt_file}) {
         if (!file_exists(f)) throw diskann::ANNException("missing file: " + f, -1);
@@ -266,9 +276,9 @@ int run(int argc, char** argv) {
             std::fflush(stdout);
         }
 
-        for (uint32_t factor : graph_beams) {
+        for (double factor : graph_beams) {
             const uint32_t probes = std::min(nprobe, ix.meta.nlist);
-            const uint32_t beam = factor * probes;
+            const uint32_t beam = std::max(probes, uint32_t(std::ceil(factor * probes)));
             auto concurrent_graph = [&](const float* qs, size_t count, bool timed) {
 #pragma omp parallel
                 {

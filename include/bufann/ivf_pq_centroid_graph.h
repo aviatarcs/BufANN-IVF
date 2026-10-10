@@ -41,7 +41,9 @@ struct IVFCentroidGraphScratch {
     };
     std::vector<uint32_t> visited_epoch;  // [nlist]; == epoch when visited by the current search
     uint32_t epoch = 0;
-    std::vector<Candidate> beam;          // ascending by dist
+    std::vector<Candidate> frontier;      // min-heap by dist: visited, not yet expanded
+    std::vector<Candidate> best;          // max-heap by dist: the L nearest visited so far
+    std::vector<uint32_t> nbrs;           // one centroid's out-edges
 };
 
 // The build is parallel (OpenMP), so which of two equally good edges a node

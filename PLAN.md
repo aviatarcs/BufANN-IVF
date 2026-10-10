@@ -16,7 +16,7 @@ centroid graph search (beam 2 x nprobe), 5% in selecting the top rerank_m
 of all scanned codes, and 7-21% in heap reads
 (`benchmark_results/sift100m_2026-10-03.jsonl`).
 
-- [ ] **Narrower and heap-based centroid beam.** Accept a fractional beam
+- [x] **Narrower and heap-based centroid beam.** Accept a fractional beam
       factor (centroid_L = ceil(f x nprobe)) in the API and the bench, and
       measure probe-set recall and q/s for f in 1.0-2.0 at 100M; replace the
       sorted-vector beam, whose inserts shift up to L entries, with a
@@ -24,6 +24,18 @@ of all scanned codes, and 7-21% in heap reads
       order kept separately). Oracle: probe sets equal to the current beam's
       at the same L; probe-set recall against the exact GEMM. Target: the
       centroid share from ~18% to a few percent at no recall cost.
+      (Done in "Search the centroid graph with heaps and prefetch whole
+      rows". The insert cost was not the bottleneck: the heap beam alone ran
+      at the sorted beam's speed. Cache misses on the 134 MB of centroids
+      were: prefetching every unvisited neighbour's whole row cut the search
+      13-17% at equal L. With beam 1x, 1.25x, 2x the end-to-end recall at
+      nprobe 128 / 256 / 512 (90M, nlist 262144) is 92.42 / 96.22 / 98.27,
+      92.47 / 96.22 / 98.28, 92.55 / 96.23 / 98.28, and q/s 5632 / 3754 /
+      2129, 6138 / 3673 / 2083, 5814 / 3497 / 1983 (about 3% run noise):
+      a narrower beam costs at most 0.13 points and gains 5-7%. Use 1.25x.
+      The search is still mostly centroid cache misses (1.4 ms per query at
+      nprobe 512, beam 1x); a compact copy of the centroids for the
+      traversal is the next lever, as LindormVector compresses them.)
 - [ ] **Quicker ADC scan for the existing 32 x 8-bit codes.** Andre,
       Kermarrec and Le Scouarnec, "Quicker ADC: Unlocking the Hidden
       Potential of Product Quantization with SIMD" (TPAMI 2019,
