@@ -6,6 +6,7 @@
 // against a per-lane comparison.
 
 #include "bufann/ivf_pq_fastscan.h"
+#include "bufann/ivf_pq_huge_pages.h"
 #include "ivf_pq_test_util.h"
 
 #include <algorithm>
@@ -185,6 +186,24 @@ bool test_lanes_below() {
     return t.done();
 }
 
+// The loader advises the codes it has just filled: the advice must leave
+// them as they were, and cover exactly the whole 2 MB pages inside the range.
+bool test_huge_page_advice() {
+    TestCase t("huge-page advice covers the whole 2 MB pages inside a range and keeps its contents");
+    const size_t MB = size_t(1) << 20;
+    std::vector<uint8_t> codes(9 * MB + 12345);
+    std::mt19937 gen(6);
+    for (uint8_t& c : codes) c = uint8_t(gen());
+    const std::vector<uint8_t> before = codes;
+    const uintptr_t p = reinterpret_cast<uintptr_t>(codes.data());
+    const size_t want = ((p + codes.size()) / (2 * MB) - (p + 2 * MB - 1) / (2 * MB)) * 2 * MB;
+    t.check(advise_huge_pages(codes.data(), codes.size()) == want, "advised bytes are not the whole huge pages inside");
+    t.check(codes == before, "advice changed the contents");
+    t.check(advise_huge_pages(codes.data() + 1, 2 * MB - 1) == 0, "a range shorter than a huge page was advised");
+    t.check(advise_huge_pages(codes.data(), 0) == 0, "an empty range was advised");
+    return t.done();
+}
+
 }  // namespace
 
 int main() {
@@ -195,6 +214,7 @@ int main() {
         all_pass &= test_quantized_table();
         all_pass &= test_kernel_matches_plain_sum();
         all_pass &= test_lanes_below();
+        all_pass &= test_huge_page_advice();
     } catch (const diskann::ANNException& e) {
         std::cout << "  FAIL: " << e.message() << std::endl;
         all_pass = false;

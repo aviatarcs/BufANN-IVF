@@ -8,6 +8,7 @@
 #include <numeric>
 #include <random>
 
+#include "bufann/ivf_pq_huge_pages.h"
 #include "bufann/ivf_pq_require.h"
 
 namespace diskann {
@@ -238,6 +239,7 @@ IVFCentroidGraph build_ivf_centroid_graph(const IVFMetadata& meta, const IVFCent
 
     g.neighbors.assign(size_t(nlist) * R, IVF_CENTROID_GRAPH_NONE);
     for (uint32_t c = 0; c < nlist; ++c) std::copy(adj[c].begin(), adj[c].end(), g.neighbors.begin() + size_t(c) * R);
+    advise_huge_pages(g.neighbors.data(), g.neighbors.size() * sizeof(uint32_t));
     return g;
 }
 
