@@ -92,6 +92,31 @@ of all scanned codes, and 7-21% in heap reads
       6.8 / 10.8 / 17.9 ms), nlist 262144 11780 / 9174 / 5802 / 3510.
       IVF-PQ now leads 1.40-1.62x, and with the scan cheap the smaller
       nlist wins. 8 GB pool: the same picture, every system 1-10% higher.)
+- [x] **Borrow FAISS designs for the scan and centroid search.** Compare
+      against the internal BufANN Quicker ADC kernel (vectordb-bench
+      `a9f031d`) and FAISS's IVF/HNSW search; adopt what measurably helps.
+      (Done in "Scan blocks in pairs and filter lanes with a SIMD mask",
+      "Use a byte visited table and four-row distances in the centroid
+      beam" and "Back the loaded index's codes, ids and centroids with huge
+      pages". The BufANN kernel is instruction for instruction ours (two
+      vpermi2b, a blend, vpmovzxbw into 16-bit sums); its quantization is
+      one global scale over a fixed PQ-PQ table, coarser than our per-query
+      range, and its dropped variants (uint16 entries, per-row scales) were
+      slower, so nothing to replace. Per phase, SIFT100M nlist 131072
+      nprobe 256, 8 threads: scan -28%, centroid search -17%, huge pages a
+      further ~5% each. End to end at 32 threads, the Oct-10 binary vs this
+      one alternated with the node otherwise idle: q/s +1-6% at nprobe
+      64-1024 for both nlists, p99 -6-10%, recall identical
+      (`benchmark_results/sift100m_faiss_borrow_2026-10-10.jsonl`). The
+      gain is small because at full load the scan is bound by DRAM, not
+      instructions: a query reads 7.5-28 MB of codes, the old kernel alone
+      already streams 113-118 GB/s against a ~130 GB/s ceiling on all
+      threads, and with the codes in cache it would sustain ~340 GB/s.
+      Further speed needs fewer bytes per query: fewer or shorter lists,
+      4-bit codes, or queries sharing list reads. A coarse brute-force
+      seed for the beam, in place of HNSW's upper layers, was slower and
+      changed probe sets; not adopted. No rebuild or rerun needed: the
+      file format is unchanged and the gain is within run noise.)
 - [ ] **Other 100M datasets.** DEEP100M (float32, 96-d), SPACEV100M (int8,
       100-d), Turing100M (float32, 100-d), downloaded to /tmpdata/100m/.
       Needs: query files and exact ground truth over each 90M base
