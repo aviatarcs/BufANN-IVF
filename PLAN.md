@@ -117,6 +117,24 @@ of all scanned codes, and 7-21% in heap reads
       seed for the beam, in place of HNSW's upper layers, was slower and
       changed probe sets; not adopted. No rebuild or rerun needed: the
       file format is unchanged and the gain is within run noise.)
+- [x] **Per-query probe depth.** With the scan DRAM-bound, fewer codes per
+      query is the lever left with 8-bit codes. (Done in "Cut each query's
+      probe set at a distance ratio to its 8th-nearest list": probe the
+      first 16 lists, then those within tau x the 8th-nearest's squared
+      centroid distance, capped at 1.25 x the fixed nprobe with the beam
+      at the cap, so the centroid search is as wide as before. SIFT100M,
+      1 GB pool, 32 threads, one process per setting, against fixed
+      nprobe in the same session, adaptive at equal or higher recall:
+      nlist 131072 nprobe 128 / 256 / 512 / 1024 (recall 94.6 / 97.4 /
+      98.8 / 99.4) +10 / +20 / +35 / +40% q/s, p99 5.5 -> 4.7, 8.4 -> 6.0,
+      13.7 -> 8.0, 22.7 -> 13.5 ms, scanning 1.5-1.8x fewer codes; nlist
+      262144 +7 / +12 / +20 / +25%. Best q/s at recall >= 90 / 95 / 98 /
+      99 is now 12842 / 11566 / 8406 / 5689 (nlist 131072), against
+      12376 / 9708 / 6440 / 3857 on Oct 10 and BufANN's 8784 / 6937 /
+      3972 / -. tau 1.35-1.7 spans recall 95-99.4; a learned or
+      distance-to-kth stopping rule could get closer to the oracle, which
+      needs 3-10x fewer codes.
+      `benchmark_results/sift100m_adaptive_probe_2026-10-11.jsonl`.)
 - [ ] **Other 100M datasets.** DEEP100M (float32, 96-d), SPACEV100M (int8,
       100-d), Turing100M (float32, 100-d), downloaded to /tmpdata/100m/.
       Needs: query files and exact ground truth over each 90M base
