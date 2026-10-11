@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <numeric>
 #include <shared_mutex>
 
@@ -361,17 +362,36 @@ IVFPQSearchResult ivf_pq_search(const IVFPQIndex& ix, const RawVectorHeap& heap,
                                         rerank_m, scratch);
 }
 
+uint32_t ivf_probe_count(const float* dist, uint32_t n, const IVFProbeCutoff& cutoff) {
+    if (cutoff.tau == 0.0f || n == 0) return n;
+    const float bound = cutoff.tau * dist[std::min(cutoff.ref, n) - 1];
+    uint32_t m = std::min(cutoff.min_probes, n);
+    while (m < n && dist[m] <= bound) ++m;
+    return m;
+}
+
 template<typename T>
 IVFPQSearchResult ivf_pq_search_graph(const IVFPQIndex& ix, const IVFCentroidGraph& graph, const RawVectorHeap& heap,
                                       const float* query, uint32_t k, uint32_t nprobe, uint32_t centroid_L,
-                                      uint32_t rerank_m, IVFPQSearchScratch& scratch, const IVFPQDelta* delta) {
+                                      uint32_t rerank_m, IVFPQSearchScratch& scratch, const IVFPQDelta* delta,
+                                      const IVFProbeCutoff& cutoff) {
     IVF_PQ_REQUIRE(query != nullptr, "query is null");
     require_search_args(ix, k, nprobe, rerank_m, heap.layout().elem_size, sizeof(T));
+    // tau < 1 would cut below the reference itself. NaN is tested on the
+    // bits: -Ofast lets the compiler assume float comparisons see no NaN.
+    uint32_t tau_bits;
+    std::memcpy(&tau_bits, &cutoff.tau, sizeof(tau_bits));
+    const bool tau_finite = (tau_bits & 0x7F800000u) != 0x7F800000u;
+    IVF_PQ_REQUIRE(tau_finite && (cutoff.tau == 0.0f || cutoff.tau >= 1.0f),
+                   "probe cutoff tau must be 0 (off) or a finite value of at least 1");
+    IVF_PQ_REQUIRE(cutoff.ref > 0, "probe cutoff reference rank must be at least 1");
     size_scratch(scratch, ix);
     // Throws unless centroid_L >= nprobe (clamped to nlist) and the graph
     // has the index's nlist.
     search_ivf_centroid_graph(ix.meta, graph, query, centroid_L, std::min(nprobe, ix.meta.nlist), scratch.graph,
-                              scratch.probe_order);
+                              scratch.probe_order, IVF_CENTROID_GRAPH_NONE, &scratch.probe_dist);
+    scratch.probe_order.resize(
+        ivf_probe_count(scratch.probe_dist.data(), uint32_t(scratch.probe_dist.size()), cutoff));
     return search_probes<T>(ix, heap, delta, query, k, rerank_m, scratch);
 }
 
@@ -424,7 +444,7 @@ IVFPQSearchResult ivf_pq_search(const IVFPQIndex& index, const RawVectorHeap& he
     template IVFPQSearchResult ivf_pq_search_graph<T>(const IVFPQIndex&, const IVFCentroidGraph&,           \
                                                       const RawVectorHeap&, const float*, uint32_t, uint32_t, \
                                                       uint32_t, uint32_t, IVFPQSearchScratch&,             \
-                                                      const IVFPQDelta*);                                  \
+                                                      const IVFPQDelta*, const IVFProbeCutoff&);           \
     template std::vector<IVFPQSearchResult> ivf_pq_search_batch<T>(const IVFPQIndex&, const RawVectorHeap&, \
                                                                    const float*, size_t, uint32_t, uint32_t, \
                                                                    uint32_t, uint32_t, const IVFPQDelta*);

@@ -59,10 +59,12 @@ IVFCentroidGraph build_ivf_centroid_graph(const IVFMetadata& meta, const IVFCent
 // exact squared distance. With L >= nlist it visits every centroid reachable
 // from the entry, which for a built graph is all of them. `start` other than
 // IVF_CENTROID_GRAPH_NONE begins the search there instead of at graph.entry:
-// from a point's previous centroid, a narrow beam suffices.
+// from a point's previous centroid, a narrow beam suffices. `out_dist`, when
+// non-null, receives the squared distances parallel to `out`.
 void search_ivf_centroid_graph(const IVFMetadata& meta, const IVFCentroidGraph& graph, const float* query,
                                uint32_t L, uint32_t n, IVFCentroidGraphScratch& scratch,
-                               std::vector<uint32_t>& out, uint32_t start = IVF_CENTROID_GRAPH_NONE);
+                               std::vector<uint32_t>& out, uint32_t start = IVF_CENTROID_GRAPH_NONE,
+                               std::vector<float>* out_dist = nullptr);
 
 }  // namespace inplace
 }  // namespace diskann

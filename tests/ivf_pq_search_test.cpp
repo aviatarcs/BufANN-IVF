@@ -374,6 +374,98 @@ bool test_graph_matches_reference(const std::string& tag, const Built& b, const 
     return t.done();
 }
 
+// ivf_probe_count against its definition, stated independently: the
+// partitions within tau x the ref-th distance form a prefix of the sorted
+// distances (upper_bound), never fewer than min(n, min_probes).
+bool test_probe_count() {
+    TestCase t("ivf_probe_count keeps min_probes, then every partition within tau x the ref-th distance");
+    std::mt19937 gen(11);
+    std::uniform_real_distribution<float> val(0.0f, 100.0f);
+    size_t wrong = 0;
+    for (int trial = 0; trial < 2000; ++trial) {
+        const uint32_t n = trial % 50;
+        std::vector<float> d(n);
+        for (float& v : d) v = val(gen);
+        // Repeated values put the bound exactly on a distance.
+        if (n > 4) d[3] = d[1];
+        std::sort(d.begin(), d.end());
+        IVFProbeCutoff c;
+        c.tau = trial % 5 == 0 ? 0.0f : 1.0f + float(trial % 7) * 0.25f;
+        c.ref = 1 + trial % 12;  // sometimes past n: the last partition is the reference
+        c.min_probes = trial % 9;
+        uint32_t want = n;
+        if (c.tau != 0.0f && n > 0) {
+            const float bound = c.tau * d[std::min(c.ref, n) - 1];
+            want = std::max<uint32_t>(std::min(c.min_probes, n), uint32_t(std::upper_bound(d.begin(), d.end(), bound) - d.begin()));
+        }
+        wrong += ivf_probe_count(d.data(), n, c) != want;
+    }
+    t.check(wrong == 0, std::to_string(wrong) + " counts differ from the definition");
+    return t.done();
+}
+
+// With a beam of nlist the graph's partitions are the exact nearest, so a
+// cut search must equal the reference search at nprobe = the count the
+// cutoff gives on brute-force centroid distances. Queries whose cut falls
+// within rounding of the bound, or on a tied probe boundary, are skipped.
+template<typename T>
+bool test_graph_probe_cutoff(const std::string& tag, const Built& b, const std::vector<float>& queries) {
+    TestCase t(tag + ": ivf_pq_search_graph with a probe cutoff equals the reference at the cut nprobe");
+    const IVFCentroidGraph graph = build_ivf_centroid_graph(b.index.meta);
+    IVFPQSearchScratch scratch;
+    size_t compared = 0, skipped = 0, cut = 0;
+    for (float tau : {1.0f, 1.2f, 1.5f, 3.0f}) {
+        IVFProbeCutoff c;
+        c.tau = tau;
+        c.ref = 2;
+        c.min_probes = 1;
+        for (uint32_t q = 0; q < NQ; ++q) {
+            const float* query = queries.data() + size_t(q) * DIM;
+            std::vector<float> d(NLIST);
+            for (uint32_t p = 0; p < NLIST; ++p) d[p] = sq_dist(query, b.index.meta.centroids.data() + size_t(p) * b.index.meta.aligned_dim, DIM);
+            std::sort(d.begin(), d.end());
+            const float bound = tau * d[c.ref - 1];
+            const bool near_bound = std::any_of(d.begin() + c.ref, d.end(), [&](float v) { return std::fabs(v - bound) <= 1e-5f * bound; });
+            const uint32_t m = std::max<uint32_t>(1, uint32_t(std::upper_bound(d.begin(), d.end(), bound) - d.begin()));
+            if (near_bound || probe_boundary_is_tied(b.index, query, m)) {
+                ++skipped;
+                continue;
+            }
+            ++compared;
+            cut += m < NLIST;
+            IVFPQSearchResult want = reference_search<T>(b.index, b.heap, query, K, m, RERANK_M);
+            IVFPQSearchResult got = ivf_pq_search_graph<T>(b.index, graph, b.heap, query, K, NLIST, NLIST, RERANK_M,
+                                                           scratch, nullptr, c);
+            if (!t.check(same_within_ties(got, want),
+                         "query " + std::to_string(q) + " tau " + std::to_string(tau) + " differs from nprobe " + std::to_string(m))) {
+                return t.done();
+            }
+        }
+    }
+    t.check(skipped < compared / 20, "too many queries near the bound for the comparison to mean anything");
+    t.check(cut > compared / 2, "the cutoff rarely cut; the test does not exercise it");
+    IVFProbeCutoff bad;
+    bad.tau = 0.5f;
+    t.expect_throw("tau below 1", [&] {
+        ivf_pq_search_graph<T>(b.index, graph, b.heap, queries.data(), K, 8, 16, RERANK_M, scratch, nullptr, bad);
+    });
+    bad.tau = std::numeric_limits<float>::quiet_NaN();
+    t.expect_throw("tau NaN", [&] {
+        ivf_pq_search_graph<T>(b.index, graph, b.heap, queries.data(), K, 8, 16, RERANK_M, scratch, nullptr, bad);
+    });
+    bad.tau = std::numeric_limits<float>::infinity();
+    t.expect_throw("tau infinite", [&] {
+        ivf_pq_search_graph<T>(b.index, graph, b.heap, queries.data(), K, 8, 16, RERANK_M, scratch, nullptr, bad);
+    });
+    bad.tau = 1.5f;
+    bad.ref = 0;
+    t.expect_throw("reference rank 0", [&] {
+        ivf_pq_search_graph<T>(b.index, graph, b.heap, queries.data(), K, 8, 16, RERANK_M, scratch, nullptr, bad);
+    });
+    std::cout << "  compared " << compared << " searches, " << cut << " cut below nlist" << std::endl;
+    return t.done();
+}
+
 // The SIMD scan keeps the rerank_m nearest by quantized PQ distance, so near
 // the boundary it may shortlist differently from the float scan. Checked
 // against brute force and the float reference: every returned distance is
@@ -490,6 +582,9 @@ int main() {
         all_pass &= test_inactive_rid_is_dropped<uint8_t>("u8", *u, queries);
         all_pass &= test_graph_matches_reference<float>("f32", *f, queries);
         all_pass &= test_graph_matches_reference<uint8_t>("u8", *u, queries);
+        all_pass &= test_probe_count();
+        all_pass &= test_graph_probe_cutoff<float>("f32", *f, queries);
+        all_pass &= test_graph_probe_cutoff<uint8_t>("u8", *u, queries);
         all_pass &= test_buffer_pool_matches_reference<float>("f32", *f, prefix_f, queries);
         all_pass &= test_buffer_pool_matches_reference<uint8_t>("u8", *u, prefix_u, queries);
         all_pass &= test_fastscan_end_to_end<float>("f32", *f, base_f, queries);
