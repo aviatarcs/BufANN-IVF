@@ -126,7 +126,8 @@ PostingLists load_ivf_posting_lists(const std::string& index_prefix);
 // Steps 4 and 5 wrap upstream DiskANN's PQ (generate_pq_pivots /
 // generate_pq_data_from_pivots) and its files, so a codebook built by
 // benchmark/scripts/build_pq.sh for the graph index is usable as-is.
-// dim must be a multiple of `chunks`: PQMetadata assumes a uniform chunk_dim.
+// `chunks` may not divide dim; the first chunks then hold one dimension more
+// (pq_chunk_offsets).
 
 // Step 4. Trains NUM_PQ_CENTERS pivots per chunk on a random sample of
 // `data_bin` and writes ivf_pq_pivots_path(index_prefix). sampling_rate 0

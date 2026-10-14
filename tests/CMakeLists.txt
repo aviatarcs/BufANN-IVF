@@ -92,6 +92,10 @@ target_link_libraries(ivf_pq_mutation_bench ${PROJECT_NAME} aio -ltcmalloc)
 add_executable(ivf_pq_centroid_graph_test ivf_pq_centroid_graph_test.cpp)
 target_link_libraries(ivf_pq_centroid_graph_test ${PROJECT_NAME} aio -ltcmalloc)
 
+# The SIMD scan's layout, table quantization and kernel against references.
+add_executable(ivf_pq_fastscan_test ivf_pq_fastscan_test.cpp)
+target_link_libraries(ivf_pq_fastscan_test ${PROJECT_NAME} aio -ltcmalloc)
+
 # Query throughput, latency and recall of a persisted index, BufANN-query style.
 add_executable(ivf_pq_query_bench ivf_pq_query_bench.cpp)
 target_link_libraries(ivf_pq_query_bench ${PROJECT_NAME} aio -ltcmalloc)
@@ -109,3 +113,4 @@ add_test(NAME ivf_pq_mutate COMMAND ivf_pq_mutate_test)
 add_test(NAME ivf_pq_api COMMAND ivf_pq_api_test)
 add_test(NAME ivf_pq_search COMMAND ivf_pq_search_test)
 add_test(NAME ivf_pq_centroid_graph COMMAND ivf_pq_centroid_graph_test)
+add_test(NAME ivf_pq_fastscan COMMAND ivf_pq_fastscan_test)

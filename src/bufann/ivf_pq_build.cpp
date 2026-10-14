@@ -445,8 +445,7 @@ void train_ivf_pq_pivots(const std::string& data_bin, const std::string& index_p
     IVF_PQ_REQUIRE(chunks > 0, "pq_chunks must be greater than zero");
     size_t npts = 0, dim = 0;
     get_bin_metadata(data_bin, npts, dim);
-    IVF_PQ_REQUIRE(dim % chunks == 0, "dim " + std::to_string(dim) + " is not a multiple of pq_chunks " +
-                                          std::to_string(chunks));
+    IVF_PQ_REQUIRE(chunks <= dim, "pq_chunks " + std::to_string(chunks) + " exceeds dim " + std::to_string(dim));
 
     uint32_t rng_seed = seed.has_value() ? *seed : std::random_device{}();
     size_t num_train = 0;
@@ -492,25 +491,21 @@ PQMetadata load_ivf_pq(const std::string& index_prefix) {
     PQMetadata pq;
     pq.k = k;
     pq.chunks = uint32_t(chunk_offsets.size() - 1);
-    pq.chunk_dim = uint32_t(dim / pq.chunks);
-    IVF_PQ_REQUIRE(dim % pq.chunks == 0, "PQ pivot file dim is not a multiple of its chunk count");
+    pq.chunk_dim = dim % pq.chunks == 0 ? uint32_t(dim / pq.chunks) : 0;
     for (uint32_t d = 0; d < dim; ++d) {
         IVF_PQ_REQUIRE(rearrangement[d] == d, "PQ pivot file rearranges dimensions; unsupported");
     }
-    for (uint32_t c = 0; c <= pq.chunks; ++c) {
-        IVF_PQ_REQUIRE(chunk_offsets[c] == c * pq.chunk_dim,
-                       "PQ pivot file has non-uniform chunks; unsupported");
-    }
+    pq.chunk_offsets = pq_chunk_offsets(uint32_t(dim), pq.chunks);
+    IVF_PQ_REQUIRE(chunk_offsets == pq.chunk_offsets,
+                   "PQ pivot file splits dimensions other than pq_chunk_offsets does; unsupported");
 
-    // [k x dim] with the mean subtracted -> [chunks x k x chunk_dim] on raw vectors.
-    pq.pivots.resize(size_t(pq.chunks) * k * pq.chunk_dim);
+    // [k x dim] with the mean subtracted -> chunk by chunk, k pivots each, on raw vectors.
+    pq.pivots.resize(size_t(k) * dim);
     for (uint32_t c = 0; c < pq.chunks; ++c) {
+        const uint32_t first = pq.chunk_offsets[c], len = pq_chunk_len(pq, c);
         for (uint32_t j = 0; j < k; ++j) {
-            for (uint32_t d = 0; d < pq.chunk_dim; ++d) {
-                uint32_t dim_index = c * pq.chunk_dim + d;
-                pq.pivots[(size_t(c) * k + j) * pq.chunk_dim + d] =
-                    full_pivots[size_t(j) * dim + dim_index] + mean[dim_index];
-            }
+            float* pivot = pq.pivots.data() + size_t(k) * first + size_t(j) * len;
+            for (uint32_t d = 0; d < len; ++d) pivot[d] = full_pivots[size_t(j) * dim + first + d] + mean[first + d];
         }
     }
 

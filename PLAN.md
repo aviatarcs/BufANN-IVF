@@ -16,7 +16,7 @@ centroid graph search (beam 2 x nprobe), 5% in selecting the top rerank_m
 of all scanned codes, and 7-21% in heap reads
 (`benchmark_results/sift100m_2026-10-03.jsonl`).
 
-- [ ] **Narrower and heap-based centroid beam.** Accept a fractional beam
+- [x] **Narrower and heap-based centroid beam.** Accept a fractional beam
       factor (centroid_L = ceil(f x nprobe)) in the API and the bench, and
       measure probe-set recall and q/s for f in 1.0-2.0 at 100M; replace the
       sorted-vector beam, whose inserts shift up to L entries, with a
@@ -24,7 +24,19 @@ of all scanned codes, and 7-21% in heap reads
       order kept separately). Oracle: probe sets equal to the current beam's
       at the same L; probe-set recall against the exact GEMM. Target: the
       centroid share from ~18% to a few percent at no recall cost.
-- [ ] **Quicker ADC scan for the existing 32 x 8-bit codes.** Andre,
+      (Done in "Search the centroid graph with heaps and prefetch whole
+      rows". The insert cost was not the bottleneck: the heap beam alone ran
+      at the sorted beam's speed. Cache misses on the 134 MB of centroids
+      were: prefetching every unvisited neighbour's whole row cut the search
+      13-17% at equal L. With beam 1x, 1.25x, 2x the end-to-end recall at
+      nprobe 128 / 256 / 512 (90M, nlist 262144) is 92.42 / 96.22 / 98.27,
+      92.47 / 96.22 / 98.28, 92.55 / 96.23 / 98.28, and q/s 5632 / 3754 /
+      2129, 6138 / 3673 / 2083, 5814 / 3497 / 1983 (about 3% run noise):
+      a narrower beam costs at most 0.13 points and gains 5-7%. Use 1.25x.
+      The search is still mostly centroid cache misses (1.4 ms per query at
+      nprobe 512, beam 1x); a compact copy of the centroids for the
+      traversal is the next lever, as LindormVector compresses them.)
+- [x] **Quicker ADC scan for the existing 32 x 8-bit codes.** Andre,
       Kermarrec and Le Scouarnec, "Quicker ADC: Unlocking the Hidden
       Potential of Product Quantization with SIMD" (TPAMI 2019,
       arXiv:1812.09162), split tables: each 256-entry lookup table, with its
@@ -42,16 +54,44 @@ of all scanned codes, and 7-21% in heap reads
       the same integer arithmetic exactly; end to end, recall within noise of
       the float scan at the same nprobe and rerank_m. Measure ns per code
       (48 now) and q/s-recall at 9M and 90M.
-- [ ] **Two-level IVF for the centroid search.** Instead of the centroid
+      First step done in "Scan PQ codes with Quicker ADC split tables":
+      90M, nlist 262144, beam 1.25x, 1 GB pool, nprobe 128 / 256 / 512:
+      q/s 6138 / 3673 / 2083 -> 10982 / 8644 / 5757, recall 92.47 / 96.22 /
+      98.28 -> 92.45 / 96.21 / 98.25, p99 17.0 / 29.5 / 50.3 -> 4.8 / 6.7 /
+      10.8 ms. Then "Keep a loaded index's PQ codes only in the blocked
+      layout": the loader streams the file's codes into the blocks 64K rows
+      at a time and keeps no posting-order copy; the float path and the
+      writer read the blocked layout. 90M load RSS 6.6 GB (both copies, or
+      the freed one held by tcmalloc) -> 4.6 GB; running RSS at the 1 GB
+      pool 5.3-5.5 GB, BufANN's 5.5 GB; q/s unchanged (11020 / 5800 at
+      nprobe 128 / 512). Note: the IVF-PQ binaries link the system
+      tcmalloc (the dev_env shim is a symlink to it), like bufann_driver;
+      an earlier note that the bench used glibc malloc was wrong.
+- [x] **Two-level IVF for the centroid search.** Instead of the centroid
       graph, cluster the nlist centroids into ~sqrt(nlist) super-centroids
       (512 at 262144), probe the nearest super-lists and compute exact
       distances to the centroids in them (a small GEMV) to pick nprobe lists.
       Compare with the graph at equal probe-set recall: time, recall, build
       cost. Oracle: the exact GEMM probe set.
-- [ ] **SIFT100M rerun.** With the items above, rerun the 2026-10-03
+      (Tried, not adopted. Prototype at 90M, nlist 262144, nprobe 512,
+      supers by k-means over the centroids (1.8-12 s), member centroids
+      contiguous per super-list: 512 supers need 33K centroids scanned for
+      probe recall 0.985 (3.8 ms per query per thread), 4096 supers 17K for
+      0.982 (2.3 ms), 2048 supers 33K for 0.995 (4.0 ms); the graph with a
+      1x beam gets 0.997 in 1.4 ms. Both are bound by reading centroid
+      rows (memory bandwidth for the scan, misses for the graph), so a
+      compact copy of the centroids would help either; the graph stays.)
+- [x] **SIFT100M rerun.** With the items above, rerun the 2026-10-03
       comparison as it was (same BufANN results, same warmup, pools, nprobe
       grid) and record it next to the old one; add nprobes between the
       powers of two near the recall targets.
+      (Done: `benchmark_results/sift100m_2026-10-10.jsonl`, BufANN rerun
+      in the same session. Best q/s at recall >= 90 / 95 / 98 / 99, 1 GB
+      pool, RSS 5.5 GB both: BufANN 8784 / 6937 / 3972 / - (p99 6.4 / 7.7
+      / 10.1 ms); IVF-PQ nlist 131072 12376 / 9708 / 6440 / 3857 (p99 5.0 /
+      6.8 / 10.8 / 17.9 ms), nlist 262144 11780 / 9174 / 5802 / 3510.
+      IVF-PQ now leads 1.40-1.62x, and with the scan cheap the smaller
+      nlist wins. 8 GB pool: the same picture, every system 1-10% higher.)
 - [ ] **Other 100M datasets.** DEEP100M (float32, 96-d), SPACEV100M (int8,
       100-d), Turing100M (float32, 100-d), downloaded to /tmpdata/100m/.
       Needs: query files and exact ground truth over each 90M base

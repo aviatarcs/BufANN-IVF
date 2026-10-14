@@ -12,6 +12,7 @@
 
 #include "bufann/ivf_pq.h"
 #include "bufann/ivf_pq_centroid_graph.h"
+#include "bufann/ivf_pq_fastscan.h"
 #include "bufann/ivf_pq_raw_vector_heap.h"
 
 namespace diskann {
@@ -43,6 +44,14 @@ struct IVFPQSearchScratch {
     std::vector<uint32_t> owners;       // parallel to shortlist
     std::vector<float> vector;          // [dim]
     IVFCentroidGraphScratch graph;      // ivf_pq_search_graph only
+    // The SIMD scan (ivf_pq_fastscan.h), used when rerank_m > 0, the codes
+    // are 8-bit, the index has blocked codes, the CPU has AVX-512 VBMI and
+    // fastscan_enabled(). It keeps the rerank_m nearest by quantized PQ
+    // distance, which can differ from the float scan's near the boundary.
+    IVFPQQuantizedTable qtable;
+    std::vector<float> sample;          // float PQ distances that set the table's range
+    std::vector<uint16_t> block_sums;   // [IVF_FASTSCAN_BLOCK]
+    std::vector<std::pair<uint16_t, uint32_t>> top;  // max-heap: quantized distance, candidate id
 };
 
 // T is the raw vector element type the heap holds (float, uint8_t, int8_t);

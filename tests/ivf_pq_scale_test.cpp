@@ -150,7 +150,8 @@ int main(int argc, char** argv) {
                          ix.rid_table.rid.size() == rid_table.rid.size() && ix.lists.ids == lists.ids &&
                          ix.lists.offsets == lists.offsets && ix.heap_pages == heap.allocated_pages() &&
                          ix.heap_next_slot == heap.next_flat_slot() && ix.pq.codes.empty() &&
-                         ix.lists.codes.size() == size_t(p.n) * p.chunks;
+                         ix.lists.codes.empty() && ix.lists.blocked.chunks == p.chunks &&
+                         ix.lists.blocked.blocks.size() >= size_t(p.n) * p.chunks;
         });
 
         TestCase t("invariants over every vector");
