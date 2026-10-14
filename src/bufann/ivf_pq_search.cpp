@@ -142,19 +142,28 @@ void fast_candidates(const IVFPQIndex& ix, const IVFPQDelta* delta, uint32_t R, 
         }
         if (s.top.size() == R) threshold = s.top.front().first;
     };
-    s.block_sums.resize(IVF_FASTSCAN_BLOCK);
-    for (uint32_t part : s.probe_order) {
+    for (size_t i = 0; i < s.probe_order.size(); ++i) {
+        // The next list is a random jump in memory; ask for its start now.
+        if (i + 1 < s.probe_order.size()) {
+            const uint8_t* next = list_blocks(s.probe_order[i + 1]);
+            for (size_t off = 0; off < 2 * block_bytes; off += 64) __builtin_prefetch(next + off);
+        }
+        const uint32_t part = s.probe_order[i];
         const uint32_t begin = ix.lists.offsets[part], n = ix.lists.offsets[part + 1] - begin;
-        const uint8_t* first = list_blocks(part);
-        for (uint32_t b = 0; b * IVF_FASTSCAN_BLOCK < n; ++b) {
-            scan_block(first + size_t(b) * block_bytes, s.qtable, s.block_sums.data());
-            const uint32_t lanes = std::min(IVF_FASTSCAN_BLOCK, n - b * IVF_FASTSCAN_BLOCK);
-            for (uint32_t lane = 0; lane < lanes; ++lane) {
-                const uint16_t q = s.block_sums[lane];
-                if (q >= threshold) continue;
-                const uint32_t id = ix.lists.ids[begin + b * IVF_FASTSCAN_BLOCK + lane];
-                if (dead != nullptr && dead->count(id) != 0) continue;
-                push(q, id);
+        const uint32_t nblocks = (n + IVF_FASTSCAN_BLOCK - 1) / IVF_FASTSCAN_BLOCK;
+        if (s.block_sums.size() < size_t(nblocks) * IVF_FASTSCAN_BLOCK) s.block_sums.resize(size_t(nblocks) * IVF_FASTSCAN_BLOCK);
+        scan_blocks(list_blocks(part), nblocks, s.qtable, s.block_sums.data());
+        for (uint32_t b = 0; b < nblocks; ++b) {
+            const uint16_t* sums = s.block_sums.data() + size_t(b) * IVF_FASTSCAN_BLOCK;
+            const uint32_t* ids = ix.lists.ids.data() + begin + size_t(b) * IVF_FASTSCAN_BLOCK;
+            // Most lanes are over the threshold; visit only those under it.
+            uint64_t under = lanes_below(sums, std::min(IVF_FASTSCAN_BLOCK, n - b * IVF_FASTSCAN_BLOCK), threshold);
+            for (; under != 0; under &= under - 1) {
+                const uint32_t lane = uint32_t(__builtin_ctzll(under));
+                // An earlier push in this block may have lowered the threshold.
+                if (sums[lane] >= threshold) continue;
+                if (dead != nullptr && dead->count(ids[lane]) != 0) continue;
+                push(sums[lane], ids[lane]);
             }
         }
     }

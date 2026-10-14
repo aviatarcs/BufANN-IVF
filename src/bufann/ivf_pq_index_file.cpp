@@ -10,6 +10,7 @@
 
 #include "bufann/ivf_pq_build.h"
 #include "bufann/ivf_pq_fastscan.h"
+#include "bufann/ivf_pq_huge_pages.h"
 #include "bufann/ivf_pq_require.h"
 #include "utils.h"
 
@@ -301,6 +302,13 @@ IVFPQIndex load_ivf_pq_index(const std::string& index_prefix) {
     std::vector<uint32_t> packed = in.read<uint32_t>(h.rid_table_offset, h.rid_table_bytes, "RID table");
     index.rid_table.rid.reserve(packed.size());
     for (uint32_t p : packed) index.rid_table.rid.push_back(RawVectorRID{p});
+
+    // Every query reads the centroids (and the graph over them) and jumps
+    // between posting lists' codes and ids.
+    advise_huge_pages(index.meta.centroids.data(), index.meta.centroids.size() * sizeof(float));
+    advise_huge_pages(index.lists.ids.data(), index.lists.ids.size() * sizeof(uint32_t));
+    advise_huge_pages(index.lists.blocked.blocks.data(), index.lists.blocked.blocks.size());
+    advise_huge_pages(index.lists.codes.data(), index.lists.codes.size());
 
     index.heap_layout = compute_raw_vector_heap_layout(h.raw_vector_page_size, h.raw_vector_elem_size);
     index.heap_pages = uint32_t(h.raw_vectors_bytes / h.raw_vector_page_size);

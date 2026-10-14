@@ -39,11 +39,15 @@ struct IVFCentroidGraphScratch {
         uint32_t id;
         bool expanded;
     };
-    std::vector<uint32_t> visited_epoch;  // [nlist]; == epoch when visited by the current search
-    uint32_t epoch = 0;
+    // [nlist]; == epoch when visited by the current search. One byte, as
+    // FAISS's VisitedTable: at 1M centroids it stays in L2, and the clear
+    // every 255 searches is cheap next to them.
+    std::vector<uint8_t> visited_epoch;
+    uint8_t epoch = 0;
     std::vector<Candidate> frontier;      // min-heap by dist: visited, not yet expanded
     std::vector<Candidate> best;          // max-heap by dist: the L nearest visited so far
     std::vector<uint32_t> nbrs;           // one centroid's out-edges
+    std::vector<float> nbr_dist;          // distances to the unvisited ones among them
 };
 
 // The build is parallel (OpenMP), so which of two equally good edges a node

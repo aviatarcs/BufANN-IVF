@@ -50,7 +50,7 @@ struct IVFPQSearchScratch {
     // distance, which can differ from the float scan's near the boundary.
     IVFPQQuantizedTable qtable;
     std::vector<float> sample;          // float PQ distances that set the table's range
-    std::vector<uint16_t> block_sums;   // [IVF_FASTSCAN_BLOCK]
+    std::vector<uint16_t> block_sums;   // one list's sums, [IVF_FASTSCAN_BLOCK x its blocks]
     std::vector<std::pair<uint16_t, uint32_t>> top;  // max-heap: quantized distance, candidate id
 };
 
