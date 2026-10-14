@@ -26,7 +26,11 @@ Queries are BigANN's `query.public.10K.u8bin` (stored as `query.10K.bin`).
 - **DEEP100M, SPACEV100M, Turing100M**: the first 100M rows of each 1B base
   from big-ann-benchmarks, unshuffled (BufANN's convention); the first 90M
   are the query base, and the first 10K of each provided query set are the
-  queries.
+  queries (the files vectordb-baselines keeps under
+  `benchmark/datasets/1b/`). `fetch_prefix.sh <url> <rows> <elem_bytes>
+  <out>` downloads such a prefix with parallel range requests (~5 min for
+  all three bases); the URLs are in vectordb-baselines'
+  `benchmark/datasets/1b/README.md`.
 
   BufANN's own `gen_deep_gt.sh` (DiskANN's compute_groundtruth over the
   full 100M) ran out of memory on a 125 GB node; the query comparison only
