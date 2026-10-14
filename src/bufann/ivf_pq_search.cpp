@@ -46,8 +46,7 @@ void require_consistent(const IVFPQIndex& ix) {
                        ix.meta.centroid_l2sq.size() == ix.meta.nlist,
                    "IVFMetadata is inconsistent (centroid_l2sq must be set; see set_ivf_centroid_norms)");
     IVF_PQ_REQUIRE(ix.pq.chunks > 0 && ix.pq.k > 0 && ix.pq.chunks * ix.pq.chunk_dim == ix.meta.dim &&
-                       ix.pq.pivots.size() == size_t(ix.pq.chunks) * ix.pq.k * ix.pq.chunk_dim &&
-                       ix.pq.codes.size() == n_base * ix.pq.chunks,
+                       ix.pq.pivots.size() == size_t(ix.pq.chunks) * ix.pq.k * ix.pq.chunk_dim,
                    "PQMetadata is inconsistent with the index");
     IVF_PQ_REQUIRE(ix.lists.offsets.size() == size_t(ix.meta.nlist) + 1 && ix.lists.offsets.front() == 0 &&
                        ix.lists.ids.size() == n_base,

@@ -215,6 +215,9 @@ std::unique_ptr<Built> build_index(const std::string& prefix, const std::vector<
     }
     auto built = std::make_unique<Built>();
     built->index = load_ivf_pq_index(prefix);
+    // The oracles read codes by id. A loaded index keeps them only in posting
+    // order, so take them from the encoder's own file, not the index file.
+    built->index.pq.codes = load_ivf_pq(prefix).codes;
     built->heap.open_existing(ivf_raw_vectors_path(prefix), built->index.heap_layout, built->index.heap_next_slot,
                               built->index.heap_pages);
     ::unlink(base_bin.c_str());

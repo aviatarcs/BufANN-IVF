@@ -391,7 +391,6 @@ bool test_guards(const Built& b, const std::vector<float>& queries) {
         t.expect_throw(what, [&] { ivf_pq_search<float>(copy, b.heap, query, K, 4, RERANK_M); });
     };
     corrupt("RID table short by one", [](IVFPQIndex& c) { c.rid_table.rid.pop_back(); });
-    corrupt("PQ codes short by one row", [](IVFPQIndex& c) { c.pq.codes.resize(c.pq.codes.size() - CHUNKS); });
     corrupt("posting-list codes short by one row",
             [](IVFPQIndex& c) { c.lists.codes.resize(c.lists.codes.size() - CHUNKS); });
     corrupt("posting-list codes never set", [](IVFPQIndex& c) { c.lists.codes.clear(); });
