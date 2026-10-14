@@ -245,7 +245,7 @@ IVFCentroidGraph build_ivf_centroid_graph(const IVFMetadata& meta, const IVFCent
 
 void search_ivf_centroid_graph(const IVFMetadata& meta, const IVFCentroidGraph& graph, const float* query,
                                uint32_t L, uint32_t n, IVFCentroidGraphScratch& scratch,
-                               std::vector<uint32_t>& out, uint32_t start) {
+                               std::vector<uint32_t>& out, uint32_t start, std::vector<float>* out_dist) {
     IVF_PQ_REQUIRE(graph.nlist == meta.nlist && graph.degree > 0 && graph.entry < graph.nlist &&
                        graph.neighbors.size() == size_t(graph.nlist) * graph.degree,
                    "centroid graph does not match the index's nlist");
@@ -259,7 +259,11 @@ void search_ivf_centroid_graph(const IVFMetadata& meta, const IVFCentroidGraph& 
     beam_search(meta, start == IVF_CENTROID_GRAPH_NONE ? graph.entry : start, query, L, scratch, neighbors_of,
                 nullptr);
     out.clear();
-    for (size_t i = 0; i < scratch.best.size() && out.size() < n; ++i) out.push_back(scratch.best[i].id);
+    if (out_dist != nullptr) out_dist->clear();
+    for (size_t i = 0; i < scratch.best.size() && out.size() < n; ++i) {
+        out.push_back(scratch.best[i].id);
+        if (out_dist != nullptr) out_dist->push_back(scratch.best[i].dist);
+    }
 }
 
 }  // namespace inplace

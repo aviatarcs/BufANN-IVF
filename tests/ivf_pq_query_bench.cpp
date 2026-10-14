@@ -13,7 +13,11 @@
 //                      [--nprobes 8,16,32,64,128] [--rerank_m 100] [--k 10]
 //                      [--threads N] [--warmup N] [--graph_beams 2,4]
 //                      [--warmup_query_file <warmup.bin>] [--skip_exact 1]
-//                      [--scan simd|float]
+//                      [--scan simd|float] [--probe_taus 0,1.3,1.4]
+//
+// --probe_taus runs each graph setting once per tau with the per-query probe
+// cutoff (IVFProbeCutoff: nprobe becomes the cap; 0 is off), reporting the
+// mean partitions probed and codes scanned per query.
 //
 // --scan float turns off the SIMD (Quicker ADC) PQ scan; with simd, the
 // default, it runs when the CPU has AVX-512 VBMI and rerank_m > 0.
@@ -101,6 +105,11 @@ int run(int argc, char** argv) {
     set_fastscan_enabled(scan == "simd");
     const char* scan_used = fastscan_enabled() && fastscan_simd_available() ? "simd" : "float";
     // Beam factors may be fractional; the beam is ceil(factor x nprobe), at least nprobe.
+    std::vector<float> probe_taus;
+    {
+        std::stringstream ss(get_arg(argc, argv, "--probe_taus", "0"));
+        for (std::string tok; std::getline(ss, tok, ',');) probe_taus.push_back(std::stof(tok));
+    }
     std::vector<double> graph_beams;
     {
         std::stringstream ss(get_arg(argc, argv, "--graph_beams", ""));
@@ -285,6 +294,9 @@ int run(int argc, char** argv) {
         }
 
         for (double factor : graph_beams) {
+        for (float tau : probe_taus) {
+            IVFProbeCutoff cutoff;
+            cutoff.tau = tau;
             const uint32_t probes = std::min(nprobe, ix.meta.nlist);
             const uint32_t beam = std::max(probes, uint32_t(std::ceil(factor * probes)));
             auto concurrent_graph = [&](const float* qs, size_t count, bool timed) {
@@ -295,7 +307,7 @@ int run(int argc, char** argv) {
                     for (size_t q = 0; q < count; ++q) {
                         auto s = std::chrono::steady_clock::now();
                         IVFPQSearchResult r = ivf_pq_search_graph<T>(ix, graph, heap, qs + q * dim, k, nprobe, beam,
-                                                                     rerank_m, scratch);
+                                                                     rerank_m, scratch, nullptr, cutoff);
                         if (timed) res[q] = std::move(r), lat[q] = seconds_since(s);
                     }
                 }
@@ -310,16 +322,23 @@ int run(int argc, char** argv) {
             graph_avg /= double(nq);
             const std::string graph_io_fields = io_json(nq, graph_avg);
 
-            size_t probe_hits = 0;
-#pragma omp parallel reduction(+ : probe_hits)
+            // Probe recall of each query's probed set against its exact
+            // nearest as many, and the partitions and codes it scans.
+            size_t probe_hits = 0, probed_total = 0, codes_total = 0;
+#pragma omp parallel reduction(+ : probe_hits, probed_total, codes_total)
             {
                 IVFCentroidGraphScratch gs;
                 std::vector<uint32_t> probed;
+                std::vector<float> probed_dist;
 #pragma omp for schedule(dynamic, 16)
                 for (size_t q = 0; q < nq; ++q) {
                     const float* query = queries.data() + q * dim;
-                    search_ivf_centroid_graph(ix.meta, graph, query, beam, probes, gs, probed);
-                    const float nth = exact_nth[q * max_nprobe + probes - 1];
+                    search_ivf_centroid_graph(ix.meta, graph, query, beam, probes, gs, probed, IVF_CENTROID_GRAPH_NONE,
+                                              &probed_dist);
+                    probed.resize(ivf_probe_count(probed_dist.data(), uint32_t(probed_dist.size()), cutoff));
+                    probed_total += probed.size();
+                    for (uint32_t c : probed) codes_total += ix.lists.offsets[c + 1] - ix.lists.offsets[c];
+                    const float nth = exact_nth[q * max_nprobe + probed.size() - 1];
                     for (uint32_t c : probed) {
                         const float* cen = ix.meta.centroids.data() + size_t(c) * ix.meta.aligned_dim;
                         float s = 0.0f;
@@ -329,15 +348,18 @@ int run(int argc, char** argv) {
                 }
             }
             std::printf("{\"baseline\":\"IVF-PQ\",\"scan\":\"%s\",\"centroid_search\":\"graph\",\"centroid_L\":%u,\"N\":%zu,"
-                        "\"nlist\":%u,\"pq_chunks\":%u,\"nprobe\":%u,\"rerank_m\":%u,\"query_threads\":%d,"
+                        "\"nlist\":%u,\"pq_chunks\":%u,\"nprobe\":%u,\"probe_tau\":%.3f,\"probes_avg\":%.1f,"
+                        "\"codes_avg\":%.0f,\"rerank_m\":%u,\"query_threads\":%d,"
                         "\"query_count\":%zu,\"query_qps\":%.1f,\"query_lat_avg_us\":%.1f,"
                         "\"query_lat_p50_us\":%.1f,\"query_lat_p99_us\":%.1f,\"recall\":%.3f,"
                         "\"probe_recall\":%.4f,\"rss_mb\":%.0f,%s}\n",
-                        scan_used, beam, n, ix.meta.nlist, ix.pq.chunks, nprobe, rerank_m, threads, nq,
+                        scan_used, beam, n, ix.meta.nlist, ix.pq.chunks, nprobe, tau, double(probed_total) / double(nq),
+                        double(codes_total) / double(nq), rerank_m, threads, nq,
                         double(nq) / graph_wall, graph_avg * 1e6, percentile_us(lat, 0.50),
-                        percentile_us(lat, 0.99), recall_of(res), double(probe_hits) / double(nq * probes),
+                        percentile_us(lat, 0.99), recall_of(res), double(probe_hits) / double(probed_total),
                         rss_mb(), graph_io_fields.c_str());
             std::fflush(stdout);
+        }
         }
     }
     delete[] gt_ids;
@@ -355,7 +377,7 @@ int main(int argc, char** argv) {
         get_arg(argc, argv, "--gt_file", "").empty()) {
         std::cerr << "Usage: ivf_pq_query_bench --data_type float|int8|uint8 --index_prefix <prefix> "
                      "--query_file <query.bin> --gt_file <truthset.bin> [--nprobes 8,16,32,64,128] "
-                     "[--rerank_m 100] [--k 10] [--threads N] [--warmup N] [--graph_beams 2,4] "
+                     "[--rerank_m 100] [--k 10] [--threads N] [--warmup N] [--graph_beams 2,4] [--probe_taus 0,1.4] "
                      "[--warmup_query_file <warmup.bin>] [--skip_exact 1] "
                      "[--buffer_pool_frames 262144]"
                   << std::endl;
