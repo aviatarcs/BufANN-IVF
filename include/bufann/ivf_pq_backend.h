@@ -28,6 +28,9 @@ struct BufANNConfig;
 
 struct IVFPQBackend {
     IVFPQIndex index;
+    // Over index.meta's centroids, when config.ivf_centroid_beam > 0; the
+    // centroids are fixed until a rebuild, which must rebuild it too.
+    IVFCentroidGraph centroid_graph;
     RawVectorHeap heap;
     std::string index_prefix;
     IVFPQDelta delta;
@@ -37,9 +40,14 @@ struct IVFPQBackend {
     tsl::robin_map<TagType, uint32_t> inserted_id;  // tag -> id
 };
 
-// Validates the IVF-PQ fields of `config` (nlist, pq_chunks > 0; dim a
-// multiple of pq_chunks). Throws std::invalid_argument.
+// Validates the IVF-PQ fields of `config` (nlist, pq_chunks > 0 and pq_chunks
+// at most dim). Throws std::invalid_argument.
 void require_ivf_pq_config(const BufANNConfig& config, const char* where);
+
+// Validates the search fields of `config`: ivf_centroid_beam 0 or a finite
+// value >= 1, ivf_probe_tau 0 or a finite value >= 1 and only with a beam.
+// Throws std::invalid_argument.
+void require_ivf_pq_search_config(const BufANNConfig& config, const char* where);
 
 // Runs build steps 1-6 on `data_bin`, writing the index file, the raw-vector
 // heap and the PQ files under `index_prefix`, and returns the loaded backend.
@@ -63,7 +71,10 @@ void ivf_pq_backend_insert(IVFPQBackend& backend, TagType tag, const T* coords);
 void ivf_pq_backend_delete(IVFPQBackend& backend, TagType tag);
 
 // Top-k search. `nprobe` 0 means config.ivf_nprobe; `rerank_m` 0 means
-// config.ivf_rerank_m, itself 0 meaning max(100, 10 * topK). Writes at most
+// config.ivf_rerank_m, itself 0 meaning max(100, 10 * topK). The partitions
+// come from the centroid graph when config.ivf_centroid_beam > 0 (the
+// backend must have been loaded with it), cut by config.ivf_probe_tau, and
+// the re-rank follows config.ivf_rerank_batch / _patience. Writes at most
 // topK tags (ascending by distance) and returns how many.
 template<typename T>
 uint32_t ivf_pq_backend_query(IVFPQBackend& backend, const BufANNConfig& config, const T* query, uint32_t topK,

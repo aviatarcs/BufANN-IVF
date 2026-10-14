@@ -250,12 +250,16 @@ of all scanned codes, and 7-21% in heap reads
       graph). A 4 x beam costs 8-17% q/s for no recall. PCA not tried:
       the graph visits a few hundred 128-d centroids, not the cost.
       Logs: `/var/tmp/bufann-ivf-evpeng/nlist/bench_graph_n*.log`.)
-- [ ] **Graph centroid search in the backend.** The backend and the batched
+- [x] **Graph centroid search in the backend.** The backend and the batched
       path still use the exact GEMM/GEMV. Build the graph when the backend
       loads an index (or persist it in the index file if load time
       matters at 90M+), rebuild it with the centroids, and expose
       centroid_L (as a multiple of nprobe, default 2) next to nprobe.
       Test through the public API against the exact path at a full beam.
+      (Done in "Search the centroid graph, probe cutoff and batched
+      re-rank through the API": BufANNConfig::ivf_centroid_beam, 0 = exact
+      by default, the graph built at load; ivf_probe_tau and the re-rank
+      schedule are exposed too. The batched path stays exact.)
 - [ ] **nlist sweep with graph search.** With the per-query centroid cost
       gone, the sweep's optimum may move up: rerun
       `GRAPH_BEAMS=2 scripts/nlist_sweep.sh` at 9M over nlist 32768,
