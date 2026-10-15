@@ -135,13 +135,30 @@ of all scanned codes, and 7-21% in heap reads
       distance-to-kth stopping rule could get closer to the oracle, which
       needs 3-10x fewer codes.
       `benchmark_results/sift100m_adaptive_probe_2026-10-11.jsonl`.)
-- [ ] **Other 100M datasets.** DEEP100M (float32, 96-d), SPACEV100M (int8,
+- [x] **Other 100M datasets.** DEEP100M (float32, 96-d), SPACEV100M (int8,
       100-d), Turing100M (float32, 100-d), downloaded to /tmpdata/100m/.
       Needs: query files and exact ground truth over each 90M base
       (`scripts/datasets/exact_gt.cpp` reads uint8 only; extend it to int8
       and float), IVF-PQ builds (chunk counts dividing the dimension: 32 for
       96-d, 25 or 50 for 100-d), BufANN's DiskANN build, PQ and conversion
       for each (~4-5 h each at 90M on this node), then the same comparison.
+      (Done in "Record the 100M comparison on SIFT, DEEP, SPACEV and
+      Turing", with SIFT100M rerun on the same node. Best q/s IVF-PQ /
+      BufANN at recall >= 90 / 95 / 98 / 99: SIFT 12597/8088, 11791/6288,
+      8405/3727, 6242/2047; DEEP 13643/6309, 11870/3715, 6574/2019,
+      4110/1504; SPACEV 12891/10701, 5753/6463, 1803/2067, -/-; Turing
+      9065/7396, 3487/3593, -/1500, -/-. IVF-PQ leads 1.6-3.3x on SIFT
+      and DEEP and loses at >= 95 on SPACEV and Turing, whose neighbours
+      spread over more partitions: their recall stops at 98.4 / 97.6 at
+      nprobe 2048-2560, and neither a deeper re-rank nor a 3x centroid
+      beam raises it. DEEP's ceiling is the re-rank (100 -> 98.0, 400 ->
+      99.5). Batched re-rank with early stop does not beat one batch.)
+- [ ] **Recall ceiling on SPACEV and Turing.** At nlist 131072 their
+      recall stops at 98.4 / 97.6 while probe cost grows: scanning ~1.4M
+      codes per query at nprobe 2048 gives Turing +1.5 points. Try a
+      smaller nlist (fewer, larger lists keep more neighbours together),
+      multi-assignment of base vectors near a boundary (SPANN-style
+      closure), or more PQ bytes; measure against BufANN's 98.8 / 98.2.
 
 ## Earlier queue
 
