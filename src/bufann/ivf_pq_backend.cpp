@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
+#include <cstring>
 #include <mutex>
 #include <shared_mutex>
 #include <stdexcept>
@@ -38,6 +40,26 @@ void require_ivf_pq_config(const BufANNConfig& config, const char* where) {
     if (config.ivf_pq_chunks > config.dim) {
         fail("config.ivf_pq_chunks " + std::to_string(config.ivf_pq_chunks) + " exceeds config.dim " +
              std::to_string(config.dim));
+    }
+    require_ivf_pq_search_config(config, where);
+}
+
+void require_ivf_pq_search_config(const BufANNConfig& config, const char* where) {
+    auto fail = [&](const std::string& msg) { throw std::invalid_argument(std::string(where) + ": " + msg); };
+    // On the bits: -Ofast lets the compiler assume comparisons see no NaN.
+    auto finite = [](float v) {
+        uint32_t bits;
+        std::memcpy(&bits, &v, sizeof(bits));
+        return (bits & 0x7F800000u) != 0x7F800000u;
+    };
+    if (!finite(config.ivf_centroid_beam) || (config.ivf_centroid_beam != 0.0f && config.ivf_centroid_beam < 1.0f)) {
+        fail("config.ivf_centroid_beam must be 0 (exact) or a finite factor of at least 1");
+    }
+    if (!finite(config.ivf_probe_tau) || (config.ivf_probe_tau != 0.0f && config.ivf_probe_tau < 1.0f)) {
+        fail("config.ivf_probe_tau must be 0 (off) or a finite value of at least 1");
+    }
+    if (config.ivf_probe_tau != 0.0f && config.ivf_centroid_beam == 0.0f) {
+        fail("config.ivf_probe_tau needs config.ivf_centroid_beam (the cutoff orders partitions by the graph search)");
     }
 }
 
@@ -91,6 +113,7 @@ std::unique_ptr<IVFPQBackend> ivf_pq_backend_build(const std::string& data_bin, 
 template<typename T>
 std::unique_ptr<IVFPQBackend> ivf_pq_backend_load(const std::string& index_prefix, const BufANNConfig& config) {
     if (config.dim == 0) throw std::invalid_argument("bufann_load: config.dim must be non-zero");
+    require_ivf_pq_search_config(config, "bufann_load");
     return as_std_exception([&] {
     auto backend = std::make_unique<IVFPQBackend>();
     backend->index_prefix = index_prefix;
@@ -109,6 +132,7 @@ std::unique_ptr<IVFPQBackend> ivf_pq_backend_load(const std::string& index_prefi
     backend->heap.open_existing(ivf_raw_vectors_path(index_prefix), ix.heap_layout, ix.heap_next_slot, ix.heap_pages,
                                 RawVectorHeapCache{config.buffer_pool_frames, nullptr});
     ivf_pq_recover_deletes(backend->index, backend->heap, backend->delta);
+    if (config.ivf_centroid_beam > 0.0f) backend->centroid_graph = build_ivf_centroid_graph(ix.meta);
     return backend;
     });
 }
@@ -224,8 +248,19 @@ uint32_t ivf_pq_backend_query(IVFPQBackend& backend, const BufANNConfig& config,
     // out first: ivf_pq_search overwrites scratch.vector during the re-rank.
     std::vector<float> q(scratch.vector.begin(), scratch.vector.end());
 
+    const IVFRerankSchedule schedule{config.ivf_rerank_batch, config.ivf_rerank_patience};
     IVFPQSearchResult r = as_std_exception([&] {
-        return ivf_pq_search<T>(backend.index, backend.heap, q.data(), topK, nprobe, rerank_m, scratch, &backend.delta);
+        if (config.ivf_centroid_beam == 0.0f) {
+            return ivf_pq_search<T>(backend.index, backend.heap, q.data(), topK, nprobe, rerank_m, scratch,
+                                    &backend.delta, schedule);
+        }
+        const uint32_t nlist = backend.index.meta.nlist, probes = std::min(nprobe, nlist);
+        const uint32_t beam =
+            std::min(nlist, std::max(probes, uint32_t(std::ceil(double(config.ivf_centroid_beam) * probes))));
+        IVFProbeCutoff cutoff;
+        cutoff.tau = config.ivf_probe_tau;
+        return ivf_pq_search_graph<T>(backend.index, backend.centroid_graph, backend.heap, q.data(), topK, nprobe,
+                                      beam, rerank_m, scratch, &backend.delta, cutoff, schedule);
     });
     const uint32_t n = uint32_t(std::min<size_t>(topK, r.ids.size()));
     if (out_tags != nullptr) {

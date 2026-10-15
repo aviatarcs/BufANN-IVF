@@ -14,10 +14,17 @@
 //                      [--threads N] [--warmup N] [--graph_beams 2,4]
 //                      [--warmup_query_file <warmup.bin>] [--skip_exact 1]
 //                      [--scan simd|float] [--probe_taus 0,1.3,1.4]
+//                      [--rerank_schedules 0:0,10:2]
 //
 // --probe_taus runs each graph setting once per tau with the per-query probe
 // cutoff (IVFProbeCutoff: nprobe becomes the cap; 0 is off), reporting the
 // mean partitions probed and codes scanned per query.
+//
+// --rerank_m takes a list, and --rerank_schedules a list of batch:patience
+// (IVFRerankSchedule; 0:0, the default, fetches the shortlist in one batch);
+// each graph setting runs once per pair. Graph lines report where the
+// threads' time went (IVFPQSearchTimes), as microseconds per query summed
+// over the phases, and the mean vectors re-ranked and fetch batches.
 //
 // --scan float turns off the SIMD (Quicker ADC) PQ scan; with simd, the
 // default, it runs when the CPU has AVX-512 VBMI and rerank_m > 0.
@@ -97,7 +104,17 @@ int run(int argc, char** argv) {
     const std::string query_file = get_arg(argc, argv, "--query_file", "");
     const std::string gt_file = get_arg(argc, argv, "--gt_file", "");
     const uint32_t k = uint32_t(std::stoul(get_arg(argc, argv, "--k", "10")));
-    const uint32_t rerank_m = uint32_t(std::stoul(get_arg(argc, argv, "--rerank_m", "100")));
+    const std::vector<uint32_t> rerank_ms = parse_list(get_arg(argc, argv, "--rerank_m", "100"));
+    const uint32_t rerank_m = rerank_ms.front();  // the exact path's
+    std::vector<IVFRerankSchedule> schedules;
+    {
+        std::stringstream ss(get_arg(argc, argv, "--rerank_schedules", "0:0"));
+        for (std::string tok; std::getline(ss, tok, ',');) {
+            const size_t colon = tok.find(':');
+            if (colon == std::string::npos) throw diskann::ANNException("--rerank_schedules wants batch:patience", -1);
+            schedules.push_back({uint32_t(std::stoul(tok.substr(0, colon))), uint32_t(std::stoul(tok.substr(colon + 1)))});
+        }
+    }
     const int threads = std::stoi(get_arg(argc, argv, "--threads", std::to_string(omp_get_max_threads())));
     const std::vector<uint32_t> nprobes = parse_list(get_arg(argc, argv, "--nprobes", "8,16,32,64,128"));
     const std::string scan = get_arg(argc, argv, "--scan", "simd");
@@ -299,28 +316,6 @@ int run(int argc, char** argv) {
             cutoff.tau = tau;
             const uint32_t probes = std::min(nprobe, ix.meta.nlist);
             const uint32_t beam = std::max(probes, uint32_t(std::ceil(factor * probes)));
-            auto concurrent_graph = [&](const float* qs, size_t count, bool timed) {
-#pragma omp parallel
-                {
-                    IVFPQSearchScratch scratch;
-#pragma omp for schedule(dynamic, 1)
-                    for (size_t q = 0; q < count; ++q) {
-                        auto s = std::chrono::steady_clock::now();
-                        IVFPQSearchResult r = ivf_pq_search_graph<T>(ix, graph, heap, qs + q * dim, k, nprobe, beam,
-                                                                     rerank_m, scratch, nullptr, cutoff);
-                        if (timed) res[q] = std::move(r), lat[q] = seconds_since(s);
-                    }
-                }
-            };
-            concurrent_graph(warmup_queries.data(), warmup, false);
-            reset_io();
-            t0 = std::chrono::steady_clock::now();
-            concurrent_graph(queries.data(), nq, true);
-            const double graph_wall = seconds_since(t0);
-            double graph_avg = 0;
-            for (double l : lat) graph_avg += l;
-            graph_avg /= double(nq);
-            const std::string graph_io_fields = io_json(nq, graph_avg);
 
             // Probe recall of each query's probed set against its exact
             // nearest as many, and the partitions and codes it scans.
@@ -347,18 +342,53 @@ int run(int argc, char** argv) {
                     }
                 }
             }
+            for (uint32_t rm : rerank_ms) {
+            for (const IVFRerankSchedule& sched : schedules) {
+            IVFPQSearchTimes times;
+            auto concurrent_graph = [&](const float* qs, size_t count, bool timed) {
+#pragma omp parallel
+                {
+                    IVFPQSearchScratch scratch;
+#pragma omp for schedule(dynamic, 1)
+                    for (size_t q = 0; q < count; ++q) {
+                        auto s = std::chrono::steady_clock::now();
+                        IVFPQSearchResult r = ivf_pq_search_graph<T>(ix, graph, heap, qs + q * dim, k, nprobe, beam,
+                                                                     rm, scratch, nullptr, cutoff, sched);
+                        if (timed) res[q] = std::move(r), lat[q] = seconds_since(s);
+                    }
+#pragma omp critical
+                    if (timed) times += scratch.times;
+                }
+            };
+            concurrent_graph(warmup_queries.data(), warmup, false);
+            reset_io();
+            t0 = std::chrono::steady_clock::now();
+            concurrent_graph(queries.data(), nq, true);
+            const double graph_wall = seconds_since(t0);
+            double graph_avg = 0;
+            for (double l : lat) graph_avg += l;
+            graph_avg /= double(nq);
+            const std::string graph_io_fields = io_json(nq, graph_avg);
+            const double per_q = 1e3 * double(nq);  // ns totals -> us per query
             std::printf("{\"baseline\":\"IVF-PQ\",\"scan\":\"%s\",\"centroid_search\":\"graph\",\"centroid_L\":%u,\"N\":%zu,"
                         "\"nlist\":%u,\"pq_chunks\":%u,\"nprobe\":%u,\"probe_tau\":%.3f,\"probes_avg\":%.1f,"
-                        "\"codes_avg\":%.0f,\"rerank_m\":%u,\"query_threads\":%d,"
+                        "\"codes_avg\":%.0f,\"rerank_m\":%u,\"rerank_batch\":%u,\"rerank_patience\":%u,"
+                        "\"reranked_avg\":%.1f,\"fetch_batches_avg\":%.2f,\"query_threads\":%d,"
                         "\"query_count\":%zu,\"query_qps\":%.1f,\"query_lat_avg_us\":%.1f,"
                         "\"query_lat_p50_us\":%.1f,\"query_lat_p99_us\":%.1f,\"recall\":%.3f,"
-                        "\"probe_recall\":%.4f,\"rss_mb\":%.0f,%s}\n",
+                        "\"probe_recall\":%.4f,\"t_centroid_us\":%.1f,\"t_table_us\":%.1f,\"t_scan_us\":%.1f,"
+                        "\"t_select_us\":%.1f,\"t_fetch_us\":%.1f,\"t_rerank_us\":%.1f,\"rss_mb\":%.0f,%s}\n",
                         scan_used, beam, n, ix.meta.nlist, ix.pq.chunks, nprobe, tau, double(probed_total) / double(nq),
-                        double(codes_total) / double(nq), rerank_m, threads, nq,
+                        double(codes_total) / double(nq), rm, sched.batch, sched.patience,
+                        double(times.reranked) / double(nq), double(times.fetch_batches) / double(nq), threads, nq,
                         double(nq) / graph_wall, graph_avg * 1e6, percentile_us(lat, 0.50),
                         percentile_us(lat, 0.99), recall_of(res), double(probe_hits) / double(probed_total),
-                        rss_mb(), graph_io_fields.c_str());
+                        times.centroid_ns / per_q, times.table_ns / per_q, times.scan_ns / per_q,
+                        times.select_ns / per_q, times.fetch_ns / per_q, times.rerank_ns / per_q, rss_mb(),
+                        graph_io_fields.c_str());
             std::fflush(stdout);
+            }
+            }
         }
         }
     }
@@ -378,7 +408,7 @@ int main(int argc, char** argv) {
         std::cerr << "Usage: ivf_pq_query_bench --data_type float|int8|uint8 --index_prefix <prefix> "
                      "--query_file <query.bin> --gt_file <truthset.bin> [--nprobes 8,16,32,64,128] "
                      "[--rerank_m 100] [--k 10] [--threads N] [--warmup N] [--graph_beams 2,4] [--probe_taus 0,1.4] "
-                     "[--warmup_query_file <warmup.bin>] [--skip_exact 1] "
+                     "[--warmup_query_file <warmup.bin>] [--skip_exact 1] [--rerank_schedules 0:0,10:2] "
                      "[--buffer_pool_frames 262144]"
                   << std::endl;
         return 2;
