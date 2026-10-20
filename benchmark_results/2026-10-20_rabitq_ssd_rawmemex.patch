@@ -1,0 +1,389 @@
+From c8ca0535bf3d712bd06dcfd065171b666eb55e78 Mon Sep 17 00:00:00 2001
+From: evpeng <ericvpeng@gmail.com>
+Date: Mon, 19 Oct 2026 12:50:07 -0500
+Subject: [PATCH] Keep a B-bit RaBitQ code in RAM and prune with its bound
+ before reading raw vectors
+
+store=rawmemex (STORE_ENV=rawmemex B_ENV=B): the SSD records are the raw
+vectors, as with store=raw, and the extra-precision code (B-1 bits per
+dimension, with its two factors) is kept in RAM next to the 1-bit code.
+The scan refines every candidate that passes the 1-bit bound with the
+B-bit estimate (split_distance_boosting) and prunes it when the B-bit
+lower bound, est_B - f_error*g_error / 2^(B-1) (the same error term
+split_single_fulldist uses, f_error*g_error being est_1 - low_1), exceeds
+the current k-th distance; survivors carry the tighter bound into page
+scheduling and are re-ranked exactly. Requires MEMDIM = padded_dim.
+
+Validation on a 1M DEEP slice (C 977, 16 threads, nprobe 4-256), recall
+against raw at the same nprobe: B=2 within 0.02 points everywhere, with
+2.0-4.1x fewer pages and 1.8-2.3x the q/s; B=3 within 0.06 points, 2.7-7x
+fewer pages; B=9 loses up to 1 point at low nprobe, so the 2^-(B-1)
+scaling is optimistic at high B. RAM: 54 B/vector at B=2 vs 31 B for raw.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01PHh2So74gbsJt7baRykiVp
+---
+ apps/build_invlist.cpp                        | 15 ++-
+ .../ivf/ivf_ssd_boundary_qd_ms_common.hpp     | 27 +++++-
+ .../ivf/ivf_ssd_boundary_qd_ms_common.tpp     | 91 ++++++++++++++++---
+ scripts/_params.sh                            |  9 +-
+ scripts/build_index/_build_lib.sh             |  1 +
+ 5 files changed, 126 insertions(+), 17 deletions(-)
+
+diff --git a/apps/build_invlist.cpp b/apps/build_invlist.cpp
+index 34c80f9..5820d01 100644
+--- a/apps/build_invlist.cpp
++++ b/apps/build_invlist.cpp
+@@ -188,10 +188,14 @@ int main(int argc, char **argv)
+                 {
+                     ssd_store = SsdStore::Raw;
+                 }
++                else if (v == "rawmemex")
++                {
++                    ssd_store = SsdStore::RawMemEx;
++                }
+                 else
+                 {
+                     std::cerr << "Invalid store value: " << arg
+-                              << " (expect store=exbits or store=raw)\n";
++                              << " (expect store=exbits, store=raw or store=rawmemex)\n";
+                     return 1;
+                 }
+                 continue;
+@@ -266,6 +270,11 @@ int main(int argc, char **argv)
+         std::cout << "SSD store: raw (" << rabitqlib::elem_type_name(data_elem)
+                   << " records; total_bits is ignored)\n";
+     }
++    else if (ssd_store == SsdStore::RawMemEx)
++    {
++        std::cout << "SSD store: rawmemex (" << rabitqlib::elem_type_name(data_elem)
++                  << " records; total_bits=" << total_bits << " codes in RAM)\n";
++    }
+     else
+     {
+         std::cout << "SSD store: exbits (total_bits=" << total_bits << ")\n";
+@@ -395,9 +404,9 @@ int main(int argc, char **argv)
+                              (ssd_store == SsdStore::Raw) ? 1 : total_bits,
+                              ssd_index_file, metric_type,
+                              rabitqlib::RotatorType::FhtKacRotator, mem_dim);
+-    if (ssd_store == SsdStore::Raw)
++    if (ssd_store != SsdStore::ExBits)
+     {
+-        ivf_ssd_index.set_ssd_store(SsdStore::Raw, data_elem);
++        ivf_ssd_index.set_ssd_store(ssd_store, data_elem);
+     }
+     if (!streaming)
+     {
+diff --git a/rabitqlib/index/ivf/ivf_ssd_boundary_qd_ms_common.hpp b/rabitqlib/index/ivf/ivf_ssd_boundary_qd_ms_common.hpp
+index 5963cd6..51c218a 100644
+--- a/rabitqlib/index/ivf/ivf_ssd_boundary_qd_ms_common.hpp
++++ b/rabitqlib/index/ivf/ivf_ssd_boundary_qd_ms_common.hpp
+@@ -61,10 +61,17 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
+     //             exact distance to the unrotated query. The in-memory prefix
+     //             and its bounds are the same as for ExBits, so the scan,
+     //             pruning and I/O pipeline are shared unchanged.
++    //   RawMemEx -> Raw records on SSD, plus the extra-precision code
++    //             (B-1 bits per dimension) kept in RAM next to the 1-bit code.
++    //             The scan refines each candidate that passes the 1-bit bound
++    //             with the B-bit estimate and its bound, f_error * g_error /
++    //             2^(B-1) (as split_single_fulldist), before any page is read;
++    //             re-ranking is exact, as for Raw. Requires MEMDIM = padded_dim.
+     enum class SsdStore : uint8_t
+     {
+         ExBits = 0,
+         Raw = 1,
++        RawMemEx = 2,
+     };
+ 
+     // Cluster scan is batched: for each 32-point batch the scan refreshes
+@@ -482,6 +489,15 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
+         ivf::Initializer *initer_ = nullptr;
+         char *mem_batch_data_ = nullptr;
+         PID *ids_ = nullptr;
++        // RawMemEx only: num_ ExDataMap records (ex-code + 2 factors), in the
++        // same stored order as ids_.
++        char *mem_ex_data_ = nullptr;
++        // SSD records are the vectors themselves (Raw or RawMemEx).
++        [[nodiscard]] bool raw_records() const
++        {
++            return ssd_store_ == SsdStore::Raw || ssd_store_ == SsdStore::RawMemEx;
++        }
++        [[nodiscard]] bool mem_ex() const { return ssd_store_ == SsdStore::RawMemEx; }
+         size_t num_ = 0;
+         size_t dim_ = 0;
+         size_t padded_dim_ = 0;
+@@ -551,6 +567,8 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
+             mem_batch_data_ = nullptr;
+             std::free(ids_);
+             ids_ = nullptr;
++            std::free(mem_ex_data_);
++            mem_ex_data_ = nullptr;
+         }
+ 
+         std::shared_ptr<LinuxAlignedFileReader> file_reader_;
+@@ -840,7 +858,9 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
+         // "exbits" or "raw", the spelling build_invlist's store= option takes.
+         [[nodiscard]] const char *ssd_store_name() const
+         {
+-            return ssd_store_ == SsdStore::Raw ? "raw" : "exbits";
++            return ssd_store_ == SsdStore::Raw        ? "raw"
++                   : ssd_store_ == SsdStore::RawMemEx ? "rawmemex"
++                                                      : "exbits";
+         }
+         // One line for logs, e.g. "exbits (B=9)" or "raw (uint8 records)".
+         [[nodiscard]] std::string ssd_store_description() const
+@@ -849,6 +869,11 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
+             {
+                 return std::string("raw (") + elem_type_name(raw_elem_) + " records)";
+             }
++            if (ssd_store_ == SsdStore::RawMemEx)
++            {
++                return std::string("rawmemex (") + elem_type_name(raw_elem_) +
++                       " records, B=" + std::to_string(ex_bits_ + 1) + " codes in RAM)";
++            }
+             return "exbits (B=" + std::to_string(ex_bits_ + 1) + ")";
+         }
+ 
+diff --git a/rabitqlib/index/ivf/ivf_ssd_boundary_qd_ms_common.tpp b/rabitqlib/index/ivf/ivf_ssd_boundary_qd_ms_common.tpp
+index 2e45267..119beb5 100644
+--- a/rabitqlib/index/ivf/ivf_ssd_boundary_qd_ms_common.tpp
++++ b/rabitqlib/index/ivf/ivf_ssd_boundary_qd_ms_common.tpp
+@@ -592,6 +592,12 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
+             // the extra-precision code, so no ex-code is computed or stored.
+             ex_bits_ = 0;
+         }
++        if (store == SsdStore::RawMemEx && ex_bits_ == 0)
++        {
++            LOG(ERROR) << "store=rawmemex needs total_bits >= 2: the RAM-resident "
++                          "extra-precision code is what it adds to store=raw";
++            std::exit(1);
++        }
+         init_layout_metadata();
+         log_ssd_layout();
+     }
+@@ -668,7 +674,7 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
+         uint32_t elem_u = 0;
+         input.read(reinterpret_cast<char *>(&store_u), sizeof(uint32_t));
+         input.read(reinterpret_cast<char *>(&elem_u), sizeof(uint32_t));
+-        if (!input || store_u > static_cast<uint32_t>(SsdStore::Raw) ||
++        if (!input || store_u > static_cast<uint32_t>(SsdStore::RawMemEx) ||
+             elem_u > static_cast<uint32_t>(VecElemType::U8))
+         {
+             LOG(ERROR) << "Base index has an unknown SSD store (" << store_u
+@@ -683,6 +689,12 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
+                        << ex_bits_ << ": " << base_index_file;
+             std::exit(1);
+         }
++        if (ssd_store_ == SsdStore::RawMemEx && ex_bits_ == 0)
++        {
++            LOG(ERROR) << "Base index claims RAM-resident ex-codes but ex_bits=0: "
++                       << base_index_file;
++            std::exit(1);
++        }
+     }
+ 
+     template <class PendingSet>
+@@ -793,7 +805,13 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
+         // the part of that code that is not memory-resident. The Raw store
+         // simply does not write it: its record is the vector itself.
+         ssd_dim_ = padded_dim_ - mem_dim_;
+-        if (ssd_store_ == SsdStore::Raw)
++        if (mem_ex() && ssd_dim_ != 0)
++        {
++            LOG(ERROR) << "store=rawmemex needs MEMDIM = padded_dim (" << padded_dim_
++                       << "): its B-bit estimate uses the whole 1-bit code";
++            std::exit(1);
++        }
++        if (raw_records())
+         {
+             empty_ssd_ = false;
+         }
+@@ -805,7 +823,7 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
+         LOG(INFO) << "mem_dim_ = " << mem_dim_ << "    ssd_dim_ = " << ssd_dim_;
+         LOG(INFO) << "empty_ssd_=" << empty_ssd_;
+ 
+-        if (ssd_store_ == SsdStore::Raw)
++        if (raw_records())
+         {
+             // The input vector, zero-padded to padded_dim.
+             one_data_ssd_bytes_ = padded_dim_ * elem_type_bytes(raw_elem_);
+@@ -851,6 +869,11 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
+         mem_batch_data_ = memory::align_allocate<64, char, true>(
+             mem_batch_data_bytes(cluster_sizes));
+         ids_ = memory::align_allocate<64, PID, true>(ids_bytes());
++        if (mem_ex())
++        {
++            mem_ex_data_ = memory::align_allocate<64, char, true>(
++                num_ * ExDataMap<float>::data_bytes(padded_dim_, ex_bits_));
++        }
+         ip_func_ = select_excode_ipfunc(ex_bits_);
+     }
+ 
+@@ -997,6 +1020,15 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
+                 ssd_bin_data_ptr, ex_data_ptr, metric_type_, config);
+         }
+ 
++        if (mem_ex())
++        {
++            // ex_data_tmp is in stored order, as cp.ids(), whose offset in
++            // ids_ is this cluster's first position in mem_ex_data_.
++            const size_t first = static_cast<size_t>(cp.ids() - ids_);
++            std::memcpy(mem_ex_data_ + first * ex_bytes_per_point, ex_data_tmp,
++                        num_points * ex_bytes_per_point);
++        }
++
+         if (one_data_ssd_bytes_ == 0)
+         {
+             std::free(ssd_bin_data_tmp);
+@@ -1045,7 +1077,7 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
+                 char *buf_ptr = page_buf + q * write_len;
+                 for (size_t i = 0; i < points_in_page; ++i)
+                 {
+-                    if (ssd_store_ == SsdStore::Raw)
++                    if (raw_records())
+                     {
+                         // fetch_row(k) is the k-th point in stored order, the
+                         // same order as cp.ids(), before any rotation.
+@@ -1985,6 +2017,12 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
+                      static_cast<long>(mem_batch_data_bytes(cluster_sizes)));
+         output.write(reinterpret_cast<const char *>(ids_),
+                      static_cast<long>(ids_bytes()));
++        if (mem_ex())
++        {
++            output.write(mem_ex_data_,
++                         static_cast<long>(num_ * ExDataMap<float>::data_bytes(
++                                                      padded_dim_, ex_bits_)));
++        }
+         output.close();
+     }
+ 
+@@ -2216,6 +2254,12 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
+                                         mem_batch_data_bytes(cluster_sizes)));
+         input.read(reinterpret_cast<char *>(ids_),
+                    static_cast<std::streamsize>(ids_bytes()));
++        if (mem_ex())
++        {
++            input.read(mem_ex_data_,
++                       static_cast<std::streamsize>(
++                           num_ * ExDataMap<float>::data_bytes(padded_dim_, ex_bits_)));
++        }
+         if (!input)
+         {
+             LOG(ERROR) << "Failed to read base index payload (MEMDIM="
+@@ -2341,7 +2385,7 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
+         buf.rotated_query =
+             memory::align_allocate<64, float, true>(padded_dim_ * sizeof(float));
+         buf.raw_query =
+-            (ssd_store_ == SsdStore::Raw)
++            raw_records()
+                 ? memory::align_allocate<64, float, true>(padded_dim_ * sizeof(float))
+                 : nullptr;
+         buf.request_slot_bytes = page_num_per_io_ * SECTOR_LEN;
+@@ -2520,6 +2564,30 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
+                 continue;
+             }
+ 
++            float low = query_buf->low_distance[idx];
++            float est = query_buf->est_distance[idx];
++            if (mem_ex())
++            {
++                // B-bit refinement from RAM, before any page is read. The
++                // 1-bit error term is est - low = f_error * g_error; the
++                // B-bit estimate's is that over 2^(B-1) (split_single_fulldist).
++                const size_t pos = static_cast<size_t>(state.ids - ids_) +
++                                   static_cast<size_t>(state.cur_inner_pid);
++                const char *ex_ptr =
++                    mem_ex_data_ + pos * ExDataMap<float>::data_bytes(padded_dim_, ex_bits_);
++                const float est_b = split_distance_boosting(
++                    ex_ptr, ip_func_, q_obj, probe_idx, padded_dim_, ex_bits_,
++                    query_buf->ip_x0_qr[idx]);
++                const float low_b =
++                    est_b - (est - low) / static_cast<float>(1U << ex_bits_);
++                if (low_b > distk)
++                {
++                    continue;
++                }
++                low = std::max(low, low_b);
++                est = est_b;
++            }
++
+             const size_t prefetch_pid =
+                 static_cast<size_t>(state.cur_inner_pid + 32);
+             if (prefetch_pid < cur_cluster.num())
+@@ -2546,7 +2614,7 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
+                 page_cand.probe_idx = static_cast<CID>(probe_idx);
+                 page_cand.page_id = cur_page_id;
+                 page_cand.candidate_num = 0;
+-                page_cand.page_lower_bound = query_buf->low_distance[idx];
++                page_cand.page_lower_bound = low;
+             }
+ 
+             PageCandidates &page_cand =
+@@ -2558,11 +2626,10 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
+             ++state.scan_cand_inserted_local;
+             cand.true_data_id = true_data_id;
+             cand.in_page_idx = cur_in_page_idx;
+-            cand.mem_low_dist_ = query_buf->low_distance[idx];
+-            cand.mem_est_dist_ = query_buf->est_distance[idx];
++            cand.mem_low_dist_ = low;
++            cand.mem_est_dist_ = est;
+             cand.mem_ip_x0_qr_ = query_buf->ip_x0_qr[idx];
+-            page_cand.page_lower_bound = std::min(
+-                page_cand.page_lower_bound, query_buf->low_distance[idx]);
++            page_cand.page_lower_bound = std::min(page_cand.page_lower_bound, low);
+         }
+ 
+         if (iter + 1 < n_iter)
+@@ -2612,7 +2679,7 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
+         void *ctx = file_reader_->get_ctx();
+ 
+         rotator_->rotate(query, query_buf->rotated_query);
+-        if (ssd_store_ == SsdStore::Raw)
++        if (raw_records())
+         {
+             // Raw records are compared with the query as given.
+             std::memcpy(query_buf->raw_query, query, dim_ * sizeof(float));
+@@ -2948,7 +3015,7 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
+         // submission upstream.
+         float distk = knns.top_dist();
+ 
+-        if (ssd_store_ == SsdStore::Raw)
++        if (raw_records())
+         {
+             // Raw records: the exact distance to the unrotated query, on the
+             // scale the in-memory estimator uses (squared L2, or 1 - <q, o>
+diff --git a/scripts/_params.sh b/scripts/_params.sh
+index 2c7c4c1..809886c 100644
+--- a/scripts/_params.sh
++++ b/scripts/_params.sh
+@@ -96,7 +96,14 @@ derive_params() {
+                 return 1
+             fi
+             STORE_TAG=raw ;;
+-        *) echo "[FATAL] STORE_ENV must be exbits or raw, got '${STORE}'" >&2; return 1 ;;
++        rawmemex)
++            # Raw records on SSD plus a B-bit code in RAM; B is set explicitly.
++            if [[ -z "${B_ENV:-}" ]]; then
++                echo "[FATAL] STORE_ENV=rawmemex needs B_ENV (bits per dimension kept in RAM, 2-9)" >&2
++                return 1
++            fi
++            STORE_TAG=rawmemexB${B} ;;
++        *) echo "[FATAL] STORE_ENV must be exbits, raw or rawmemex, got '${STORE}'" >&2; return 1 ;;
+     esac
+     case ${METRIC} in
+         l2|ip) ;;
+diff --git a/scripts/build_index/_build_lib.sh b/scripts/build_index/_build_lib.sh
+index 07e172a..6e448c4 100644
+--- a/scripts/build_index/_build_lib.sh
++++ b/scripts/build_index/_build_lib.sh
+@@ -91,6 +91,7 @@ build_index() {
+ 
+     local STORE_DESC="B=${B} (ex_bits=$((B-1)))"
+     [[ ${STORE} == raw ]] && STORE_DESC="store=raw"
++    [[ ${STORE} == rawmemex ]] && STORE_DESC="store=rawmemex(B=${B})"
+     echo "================ build ${DATASET} C=${C} ${STORE_DESC%% *} memdim=${MEMDIM} metric=${METRIC} coarse=${COARSE_KIND} ================"
+     echo "  start  : $(date -Is)"
+     echo "  outdir : ${OUTDIR}"
+-- 
+2.43.0
+
