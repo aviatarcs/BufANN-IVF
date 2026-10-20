@@ -93,6 +93,11 @@ int run(int argc, char** argv) {
 }
 
 int main(int argc, char** argv) {
+    // This file's loops use GCC's OpenMP; MKL's default Intel threading layer
+    // brings a second OpenMP runtime, and with both active the multi-threaded
+    // GEMM returned wrong distances at d = 512 (10K queries; negative squared
+    // L2). MKL on the GNU layer shares the one runtime and is exact.
+    mkl_set_threading_layer(MKL_THREADING_GNU);
     if (argc != 6 && argc != 7) {
         std::fprintf(stderr, "exact_gt uint8|int8|float base.bin query.bin K out.bin [N]\n");
         return 2;
