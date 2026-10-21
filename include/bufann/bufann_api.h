@@ -44,8 +44,26 @@ struct BufANNConfig {
     // --- IVF-PQ parameters (only used when index_type == IvfPq) ---
     uint32_t ivf_nlist     = 0;  // number of coarse-quantizer partitions
     uint32_t ivf_nprobe    = 0;  // partitions probed per search (search_L overrides it per query)
-    uint32_t ivf_pq_chunks = 0;  // PQ subvector count for IVF-PQ codes/pivots; dim must be a multiple
+    uint32_t ivf_pq_chunks = 0;  // PQ subvector count for IVF-PQ codes/pivots; at most dim
     uint32_t ivf_rerank_m  = 0;  // PQ candidates re-ranked exactly per query; 0 = max(100, 10 * topK)
+    // How a query finds its nprobe partitions. 0: exact distances to every
+    // centroid (a GEMV over nlist x dim floats per query). A factor >= 1:
+    // a search of a proximity graph over the centroids, built at load (about
+    // a second at nlist 131072), with a beam of ceil(factor x nprobe); it
+    // visits a few hundred centroids and may miss a partition the GEMV would
+    // probe. 1.25 lost at most 0.13 recall points on SIFT100M.
+    float    ivf_centroid_beam = 0.0f;
+    // Per-query probe depth, with ivf_centroid_beam only (IVFProbeCutoff):
+    // nprobe becomes a cap, and a query probes its first 16 partitions and
+    // then those within tau x the 8th nearest's squared distance. 0 = off;
+    // otherwise >= 1 (1.35-1.7 spanned recall 95-99.4 on SIFT100M).
+    float    ivf_probe_tau = 0.0f;
+    // Exact re-rank fetches (IVFRerankSchedule): 0 = the whole shortlist in
+    // one buffer-pool batch; otherwise this many at a time in PQ order,
+    // stopping after ivf_rerank_patience batches in a row (0 = never) that
+    // do not change the top k.
+    uint32_t ivf_rerank_batch    = 0;
+    uint32_t ivf_rerank_patience = 0;
 
     // --- graph parameters ---
     uint32_t R           = 64;  // max graph degree (used for build and insert pruning)

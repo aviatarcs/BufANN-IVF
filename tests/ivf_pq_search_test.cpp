@@ -38,10 +38,14 @@ const uint32_t TRAIN_SEED = 7;
 const float TIE_ULPS = 8.0f;
 
 // The reference search, written without the GEMM expansion. rerank_m == 0
-// ranks by PQ distance, as in ivf_pq_search.
+// ranks by PQ distance, as in ivf_pq_search. With a schedule, the re-rank
+// keeps the shortlist's prefix (PQ order) up to the end of the `patience`-th
+// batch in a row with no exact distance below the k-th smallest before it;
+// `reranked`, when given, receives that prefix's length.
 template<typename T>
 IVFPQSearchResult reference_search(const IVFPQIndex& ix, const RawVectorHeap& heap, const float* q, uint32_t k,
-                                   uint32_t nprobe, uint32_t rerank_m) {
+                                   uint32_t nprobe, uint32_t rerank_m, IVFRerankSchedule schedule = {},
+                                   size_t* reranked = nullptr) {
     std::vector<float> centroid_dist(ix.meta.nlist);
     for (uint32_t c = 0; c < ix.meta.nlist; ++c) {
         centroid_dist[c] = sq_dist(q, ix.meta.centroids.data() + size_t(c) * ix.meta.aligned_dim, DIM);
@@ -81,6 +85,23 @@ IVFPQSearchResult reference_search(const IVFPQIndex& ix, const RawVectorHeap& he
         shortlist.push_back(candidates[i]);
         exact.push_back(sq_dist(q, to_float(raw.data(), DIM).data(), DIM));
     }
+    if (schedule.batch > 0 && schedule.patience > 0) {
+        uint32_t idle = 0;
+        for (size_t start = 0; start < exact.size(); start += schedule.batch) {
+            const size_t end = std::min(exact.size(), start + schedule.batch);
+            std::vector<float> before(exact.begin(), exact.begin() + start);
+            std::sort(before.begin(), before.end());
+            const float kth = before.size() >= k ? before[k - 1] : std::numeric_limits<float>::infinity();
+            const bool improved = std::any_of(exact.begin() + start, exact.begin() + end, [&](float d) { return d < kth; });
+            idle = improved ? 0 : idle + 1;
+            if (idle == schedule.patience) {
+                shortlist.resize(end);
+                exact.resize(end);
+                break;
+            }
+        }
+    }
+    if (reranked != nullptr) *reranked = exact.size();
     for (uint32_t i : top_k(exact, k)) {
         result.ids.push_back(shortlist[i]);
         result.dists.push_back(exact[i]);
@@ -466,6 +487,46 @@ bool test_graph_probe_cutoff(const std::string& tag, const Built& b, const std::
     return t.done();
 }
 
+// A re-rank in batches without a stop must be the one-batch re-rank, and
+// with patience the reference's prefix re-rank: the same results, as many
+// vectors re-ranked and ceil(prefix / batch) fetches. With a beam of nlist
+// the graph's partitions are the reference's.
+template<typename T>
+bool test_rerank_schedule(const std::string& tag, const Built& b, const std::vector<float>& queries) {
+    TestCase t(tag + ": a batched re-rank equals the reference's, stopping after `patience` idle batches");
+    const IVFCentroidGraph graph = build_ivf_centroid_graph(b.index.meta);
+    size_t compared = 0, stopped = 0;
+    for (IVFRerankSchedule s : {IVFRerankSchedule{1, 0}, {7, 0}, {RERANK_M + 3, 0}, {1, 1}, {5, 1}, {5, 2}, {10, 3}}) {
+        for (uint32_t nprobe : {3u, 8u}) {
+            for (uint32_t q = 0; q < NQ; ++q) {
+                const float* query = queries.data() + size_t(q) * DIM;
+                if (probe_boundary_is_tied(b.index, query, nprobe)) continue;
+                ++compared;
+                size_t want_reranked = 0;
+                IVFPQSearchResult want =
+                    reference_search<T>(b.index, b.heap, query, K, nprobe, RERANK_M, s, &want_reranked);
+                IVFPQSearchScratch scratch;
+                IVFPQSearchResult got = ivf_pq_search_graph<T>(b.index, graph, b.heap, query, K, nprobe, NLIST,
+                                                               RERANK_M, scratch, nullptr, {}, s);
+                stopped += want_reranked < RERANK_M;
+                const std::string what = "query " + std::to_string(q) + " nprobe " + std::to_string(nprobe) +
+                                         " batch " + std::to_string(s.batch) + " patience " + std::to_string(s.patience);
+                if (!t.check(same_within_ties(got, want), what + ": results differ") ||
+                    !t.check(scratch.times.reranked == want_reranked,
+                             what + ": re-ranked " + std::to_string(scratch.times.reranked) + ", want " +
+                                 std::to_string(want_reranked)) ||
+                    !t.check(scratch.times.fetch_batches == (want_reranked + s.batch - 1) / s.batch,
+                             what + ": " + std::to_string(scratch.times.fetch_batches) + " fetches")) {
+                    return t.done();
+                }
+            }
+        }
+    }
+    t.check(stopped > compared / 10, "patience rarely stopped a re-rank; the test does not exercise it");
+    std::cout << "  compared " << compared << " searches, " << stopped << " stopped early" << std::endl;
+    return t.done();
+}
+
 // The SIMD scan keeps the rerank_m nearest by quantized PQ distance, so near
 // the boundary it may shortlist differently from the float scan. Checked
 // against brute force and the float reference: every returned distance is
@@ -585,6 +646,8 @@ int main() {
         all_pass &= test_probe_count();
         all_pass &= test_graph_probe_cutoff<float>("f32", *f, queries);
         all_pass &= test_graph_probe_cutoff<uint8_t>("u8", *u, queries);
+        all_pass &= test_rerank_schedule<float>("f32", *f, queries);
+        all_pass &= test_rerank_schedule<uint8_t>("u8", *u, queries);
         all_pass &= test_buffer_pool_matches_reference<float>("f32", *f, prefix_f, queries);
         all_pass &= test_buffer_pool_matches_reference<uint8_t>("u8", *u, prefix_u, queries);
         all_pass &= test_fastscan_end_to_end<float>("f32", *f, base_f, queries);

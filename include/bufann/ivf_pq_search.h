@@ -43,10 +43,40 @@ struct IVFProbeCutoff {
 // probes: n when it is off; otherwise at least min(n, min_probes).
 uint32_t ivf_probe_count(const float* dist, uint32_t n, const IVFProbeCutoff& cutoff);
 
+// How the shortlist's raw vectors are fetched for the exact re-rank. By
+// default (batch 0) all of them in one buffer-pool batch, whose misses are
+// read concurrently. Otherwise `batch` at a time, nearest by PQ distance
+// first, each batch's misses read concurrently; with patience > 0 the
+// re-rank stops once `patience` batches in a row put nothing into the exact
+// top k, so a query whose PQ order is already right reads a prefix of its
+// shortlist. Batches without a stop only add round trips.
+struct IVFRerankSchedule {
+    uint32_t batch = 0;
+    uint32_t patience = 0;
+};
+
+// Where a thread's queries spent their time, summed over the queries searched
+// with one scratch: choosing the partitions (GEMV or graph), building the PQ
+// table, scanning the codes, picking the shortlist and its RIDs, fetching its
+// raw vectors (buffer-pool pins, I/O included) and computing exact distances.
+// The phases are back to back, so their sum is the search's own time.
+struct IVFPQSearchTimes {
+    uint64_t centroid_ns = 0, table_ns = 0, scan_ns = 0, select_ns = 0, fetch_ns = 0, rerank_ns = 0;
+    uint64_t queries = 0, reranked = 0, fetch_batches = 0;
+
+    IVFPQSearchTimes& operator+=(const IVFPQSearchTimes& o) {
+        centroid_ns += o.centroid_ns, table_ns += o.table_ns, scan_ns += o.scan_ns, select_ns += o.select_ns;
+        fetch_ns += o.fetch_ns, rerank_ns += o.rerank_ns;
+        queries += o.queries, reranked += o.reranked, fetch_batches += o.fetch_batches;
+        return *this;
+    }
+};
+
 // Buffers one thread reuses across queries; sized to the index on every
 // search (no-ops once they fit), so a scratch may be used on any index but
 // not shared between threads.
 struct IVFPQSearchScratch {
+    IVFPQSearchTimes times;             // accumulated, never reset by a search
     std::vector<float> query_padded;    // [aligned_dim], zero beyond dim
     std::vector<float> centroid_dist;   // [nlist]
     std::vector<uint32_t> probe_order;  // [nlist] partition ids, nearest first
@@ -58,6 +88,7 @@ struct IVFPQSearchScratch {
     std::vector<uint32_t> shortlist;    // ids kept for the re-rank
     std::vector<uint32_t> shortlist_slot;  // their heap slots, parallel to shortlist
     std::vector<float> exact_dist;      // parallel to shortlist
+    std::vector<float> top_exact;       // max-heap of the k smallest exact distances so far
     std::vector<char> raw_vectors;      // [shortlist x heap elem_size]
     std::vector<uint32_t> owners;       // parallel to shortlist
     std::vector<float> vector;          // [dim]
@@ -82,11 +113,13 @@ struct IVFPQSearchScratch {
 // when given, contributes the vectors inserted since the index file was
 // written (ivf_pq_insert), scanned in the probed partitions like the base
 // vectors, and withholds the deleted ones (ivf_pq_delete); searches may run
-// concurrently with inserts into and deletes from it.
+// concurrently with inserts into and deletes from it. `rerank` sets how the
+// re-rank fetches its vectors (IVFRerankSchedule).
 template<typename T>
 IVFPQSearchResult ivf_pq_search(const IVFPQIndex& index, const RawVectorHeap& heap, const float* query,
                                 uint32_t k, uint32_t nprobe, uint32_t rerank_m,
-                                IVFPQSearchScratch& scratch, const IVFPQDelta* delta = nullptr);
+                                IVFPQSearchScratch& scratch, const IVFPQDelta* delta = nullptr,
+                                const IVFRerankSchedule& rerank = {});
 
 // As ivf_pq_search, but the probed partitions are the nprobe nearest
 // centroids that a search of `graph` with a beam of centroid_L >= nprobe
@@ -94,12 +127,14 @@ IVFPQSearchResult ivf_pq_search(const IVFPQIndex& index, const RawVectorHeap& he
 // a GEMV over every centroid. It visits a few hundred centroids instead of
 // all nlist, and may miss a partition the GEMV would probe. `graph` must be
 // built from index.meta; only its nlist is checked. With `cutoff` on, the
-// nprobe partitions found are cut per query (IVFProbeCutoff).
+// nprobe partitions found are cut per query (IVFProbeCutoff); `rerank` sets
+// how the re-rank fetches its vectors (IVFRerankSchedule).
 template<typename T>
 IVFPQSearchResult ivf_pq_search_graph(const IVFPQIndex& index, const IVFCentroidGraph& graph,
                                       const RawVectorHeap& heap, const float* query, uint32_t k, uint32_t nprobe,
                                       uint32_t centroid_L, uint32_t rerank_m, IVFPQSearchScratch& scratch,
-                                      const IVFPQDelta* delta = nullptr, const IVFProbeCutoff& cutoff = {});
+                                      const IVFPQDelta* delta = nullptr, const IVFProbeCutoff& cutoff = {},
+                                      const IVFRerankSchedule& rerank = {});
 
 // Allocates a scratch per call; for one-off queries.
 template<typename T>

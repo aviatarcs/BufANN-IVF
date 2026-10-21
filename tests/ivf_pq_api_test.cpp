@@ -402,6 +402,99 @@ bool test_tag_churn_under_queries(const std::string& tag_name, const std::string
     return t.done();
 }
 
+// The centroid graph through the API. A beam as wide as nlist makes the
+// graph's partitions the exact nearest nprobe, so the API must then answer
+// as the exact path does, except where the nprobe-th and next centroids are
+// within rounding of each other. A narrow beam, the probe cutoff and a
+// re-rank schedule must reach ivf_pq_search_graph as the config states
+// them; a reload rebuilds the graph and inserts are still searched.
+template<typename T>
+bool test_centroid_graph(const std::string& tag, const std::string& prefix) {
+    TestCase t(tag + ": ivf_centroid_beam searches the centroid graph through the API");
+    const std::string base_bin = prefix + "_base.bin";
+    std::vector<T> base = synthetic<T>(N, 1, 1.0f), queries = synthetic<T>(NQ, 2, 1.0f);
+    diskann::save_bin<T>(base_bin, base.data(), N, DIM);
+    const std::vector<float> queriesf = to_float(queries.data(), queries.size());
+    BufANNConfig exact_cfg = ivf_config<T>();
+    BufANNIndex<T>* exact = bufann_build<T>(base_bin, prefix, exact_cfg);
+    t.check(exact->ivf->centroid_graph.nlist == 0, "the exact path built a centroid graph it does not use");
+
+    BufANNConfig full_cfg = exact_cfg;
+    full_cfg.ivf_centroid_beam = float(NLIST);
+    BufANNIndex<T>* full = bufann_load<T>(prefix, full_cfg);
+    t.check(full->ivf->centroid_graph.nlist == NLIST, "no centroid graph after a load with ivf_centroid_beam");
+    size_t compared = 0, mismatches = 0;
+    for (uint32_t q = 0; q < NQ; ++q) {
+        const float* qf = queriesf.data() + size_t(q) * DIM;
+        std::vector<float> d(NLIST);
+        for (uint32_t c = 0; c < NLIST; ++c) d[c] = sq_dist(qf, full->ivf->index.meta.centroids.data() + size_t(c) * full->ivf->index.meta.aligned_dim, DIM);
+        std::sort(d.begin(), d.end());
+        const uint32_t p = exact_cfg.ivf_nprobe;
+        if (d[p] - d[p - 1] <= 1e-5f * d[p]) continue;
+        ++compared;
+        const T* query = queries.data() + size_t(q) * DIM;
+        mismatches += bufann_query<T>(*full, query, K) != bufann_query<T>(*exact, query, K);
+    }
+    t.check(compared > NQ * 9 / 10, "too many tied probe boundaries for the comparison to mean anything");
+    t.check(mismatches == 0, std::to_string(mismatches) + " of " + std::to_string(compared) +
+                                 " queries differ between a full beam and the exact path");
+    bufann_free<T>(full);
+
+    // ceil(1.25 x 6) = 8, the cutoff and a schedule, against a direct call.
+    BufANNConfig narrow_cfg = exact_cfg;
+    narrow_cfg.ivf_nprobe = 6;
+    narrow_cfg.ivf_centroid_beam = 1.25f;
+    narrow_cfg.ivf_probe_tau = 1.5f;
+    narrow_cfg.ivf_rerank_batch = 10;
+    narrow_cfg.ivf_rerank_patience = 2;
+    BufANNIndex<T>* narrow = bufann_load<T>(prefix, narrow_cfg);
+    IVFProbeCutoff cutoff;
+    cutoff.tau = 1.5f;
+    IVFPQSearchScratch scratch;
+    size_t narrow_mismatches = 0;
+    for (uint32_t q = 0; q < NQ; ++q) {
+        std::vector<TagType> got = bufann_query<T>(*narrow, queries.data() + size_t(q) * DIM, K);
+        IVFPQSearchResult direct = ivf_pq_search_graph<T>(narrow->ivf->index, narrow->ivf->centroid_graph, narrow->ivf->heap,
+                                                          queriesf.data() + size_t(q) * DIM, K, 6, 8,
+                                                          std::max<uint32_t>(100, 10 * K), scratch, nullptr, cutoff,
+                                                          IVFRerankSchedule{10, 2});
+        narrow_mismatches += !(got.size() == direct.ids.size() && std::equal(got.begin(), got.end(), direct.ids.begin()));
+    }
+    t.check(narrow_mismatches == 0, std::to_string(narrow_mismatches) + " queries differ from ivf_pq_search_graph "
+                                                                         "with the config's beam, cutoff and schedule");
+    t.check(scratch.times.reranked < uint64_t(NQ) * std::max<uint32_t>(100, 10 * K),
+            "a patience of 2 never stopped a re-rank");
+
+    // Inserts are searched through the graph path (the delta reaches it).
+    const TagType FIRST_TAG = 1000000;
+    std::vector<T> extra = synthetic<T>(50, 5, 1.0f);
+    size_t self_hits = 0;
+    for (uint32_t i = 0; i < 50; ++i) bufann_insert<T>(*narrow, FIRST_TAG + i, extra.data() + size_t(i) * DIM);
+    for (uint32_t i = 0; i < 50; ++i) {
+        std::vector<TagType> got = bufann_query<T>(*narrow, extra.data() + size_t(i) * DIM, 1, NLIST);
+        self_hits += got.size() == 1 && got[0] == FIRST_TAG + i;
+    }
+    t.check(self_hits == 50, std::to_string(50 - self_hits) + " inserted vectors not found through the graph path");
+    bufann_free<T>(narrow);
+    bufann_free<T>(exact);
+
+    auto bad = [&](const char* what, auto&& mutate) {
+        BufANNConfig c = exact_cfg;
+        mutate(c);
+        t.expect_throw_any(std::string(what) + " at build", [&] { bufann_build<T>(base_bin, prefix + "_bad", c); });
+        t.expect_throw_any(std::string(what) + " at load", [&] { bufann_load<T>(prefix, c); });
+    };
+    bad("ivf_centroid_beam below 1", [](BufANNConfig& c) { c.ivf_centroid_beam = 0.5f; });
+    bad("ivf_centroid_beam NaN", [](BufANNConfig& c) { c.ivf_centroid_beam = std::numeric_limits<float>::quiet_NaN(); });
+    bad("ivf_centroid_beam infinite", [](BufANNConfig& c) { c.ivf_centroid_beam = std::numeric_limits<float>::infinity(); });
+    bad("ivf_probe_tau below 1", [](BufANNConfig& c) { c.ivf_centroid_beam = 2.0f, c.ivf_probe_tau = 0.5f; });
+    bad("ivf_probe_tau without a beam", [](BufANNConfig& c) { c.ivf_probe_tau = 1.5f; });
+    ::unlink(base_bin.c_str());
+    remove_index_files(prefix);
+    remove_index_files(prefix + "_bad");
+    return t.done();
+}
+
 bool test_config_validation(const std::string& prefix) {
     TestCase t("IVF-PQ config validation and type mismatch on load");
     const std::string base_bin = prefix + "_base.bin";
@@ -445,6 +538,8 @@ int main() {
         all_pass &= test_build_query_load<uint8_t>("uint8", prefix + "_u8");
         all_pass &= test_deletes_survive_reload<float>("float", prefix + "_reload");
         all_pass &= test_tag_churn_under_queries<float>("float", prefix + "_churn");
+        all_pass &= test_centroid_graph<float>("float", prefix + "_graph_f32");
+        all_pass &= test_centroid_graph<uint8_t>("uint8", prefix + "_graph_u8");
         all_pass &= test_config_validation(prefix + "_cfg");
     } catch (const std::exception& e) {
         std::cout << "  FAIL: " << e.what() << std::endl;
