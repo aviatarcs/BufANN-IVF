@@ -2,10 +2,11 @@
 //
 //   ivf_pq_build_index --data_type float|int8|uint8 --data_file <base.bin>
 //                      --index_prefix <prefix> --dim N --ivf_nlist N
-//                      --ivf_pq_chunks N [--page_size N]
+//                      --ivf_pq_chunks N [--page_size N] [--ex_bits 9]
 //
 // Writes <prefix>_ivf_pq_index.bin, <prefix>_ivf_raw_vectors.bin and the
-// upstream-format <prefix>_pq_pivots.bin / _pq_compressed.bin.
+// upstream-format <prefix>_pq_pivots.bin / _pq_compressed.bin; with
+// --ex_bits 9 also the 9-bit ex-code store <prefix>_ivf_excodes.bin.
 
 #include "bufann/bufann_api.h"
 
@@ -49,9 +50,10 @@ int main(int argc, char** argv) {
     cfg.ivf_nlist = uint32_t(std::stoul(get_arg(argc, argv, "--ivf_nlist", "0")));
     cfg.ivf_pq_chunks = uint32_t(std::stoul(get_arg(argc, argv, "--ivf_pq_chunks", "0")));
     cfg.page_size = uint32_t(std::stoul(get_arg(argc, argv, "--page_size", "4096")));
+    cfg.ivf_ex_bits = uint32_t(std::stoul(get_arg(argc, argv, "--ex_bits", "0")));
     if (data_file.empty() || prefix.empty() || cfg.dim == 0 || cfg.ivf_nlist == 0 || cfg.ivf_pq_chunks == 0) {
         std::cerr << "Usage: ivf_pq_build_index --data_type float|int8|uint8 --data_file <base.bin> "
-                     "--index_prefix <prefix> --dim N --ivf_nlist N --ivf_pq_chunks N [--page_size N]"
+                     "--index_prefix <prefix> --dim N --ivf_nlist N --ivf_pq_chunks N [--page_size N] [--ex_bits 9]"
                   << std::endl;
         return 2;
     }

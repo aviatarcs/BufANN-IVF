@@ -26,6 +26,15 @@
 // threads' time went (IVFPQSearchTimes), as microseconds per query summed
 // over the phases, and the mean vectors re-ranked and fetch batches.
 //
+// --rerank_sources raw,ex9 runs each graph setting once per re-rank source:
+// raw re-ranks the shortlist exactly from the raw-vector heap; ex9 ranks it
+// by the index's 9-bit ex-code store (IVFExRerank; the index must have been
+// built with --ex_bits 9) and re-ranks exactly the nearest --ex_exact of them
+// (a list; 0 = none). The store is read through its own buffer pool of
+// --ex_buffer_pool_frames (default: --buffer_pool_frames). Every graph line
+// reports the pages each query touched in each store (IVFPQQueryIO: what a
+// reader without a cache would fetch) and each pool's misses.
+//
 // --scan float turns off the SIMD (Quicker ADC) PQ scan; with simd, the
 // default, it runs when the CPU has AVX-512 VBMI and rerank_m > 0.
 //                      [--buffer_pool_frames 262144]
@@ -40,6 +49,7 @@
 #include "bufann/inplace_backend.h"
 #include "bufann/ivf_pq_build.h"
 #include "bufann/ivf_pq_centroid_graph.h"
+#include "bufann/ivf_pq_excode.h"
 #include "bufann/ivf_pq_index_file.h"
 #include "bufann/ivf_pq_search.h"
 #include "utils.h"
@@ -136,6 +146,17 @@ int run(int argc, char** argv) {
         }
     }
     const uint32_t pool_frames = uint32_t(std::stoul(get_arg(argc, argv, "--buffer_pool_frames", "262144")));
+    const uint32_t ex_pool_frames =
+        uint32_t(std::stoul(get_arg(argc, argv, "--ex_buffer_pool_frames", std::to_string(pool_frames))));
+    std::vector<std::string> sources;
+    {
+        std::stringstream ss(get_arg(argc, argv, "--rerank_sources", "raw"));
+        for (std::string tok; std::getline(ss, tok, ',');) {
+            if (tok != "raw" && tok != "ex9") throw diskann::ANNException("--rerank_sources takes raw and ex9", -1);
+            sources.push_back(tok);
+        }
+    }
+    const std::vector<uint32_t> ex_exacts = parse_list(get_arg(argc, argv, "--ex_exact", "0"));
     for (const std::string& f : {ivf_pq_index_path(prefix), query_file, gt_file}) {
         if (!file_exists(f)) throw diskann::ANNException("missing file: " + f, -1);
     }
@@ -185,6 +206,17 @@ int run(int argc, char** argv) {
     RawVectorHeap heap;
     heap.open_existing(ivf_raw_vectors_path(prefix), ix.heap_layout, ix.heap_next_slot, ix.heap_pages,
                        RawVectorHeapCache{pool_frames, &io});
+    InPlaceIOStats ex_io;
+    RawVectorHeap ex_store;
+    const bool want_ex = std::find(sources.begin(), sources.end(), "ex9") != sources.end();
+    if (want_ex) {
+        if (ix.excodes.bits == 0) throw diskann::ANNException("--rerank_sources ex9: the index has no ex-code store", -1);
+        ex_store.open_existing(ivf_excodes_path(prefix), ix.excodes.layout, ix.excodes.next_slot, ix.excodes.pages,
+                               RawVectorHeapCache{ex_pool_frames, &ex_io});
+        std::printf("ex-code store: %u pages of %u B, %u records of %u B per page, through a buffer pool of %u frames\n",
+                    ix.excodes.pages, ix.excodes.layout.page_size, ix.excodes.layout.slots_per_page,
+                    ix.excodes.layout.elem_size, ex_pool_frames);
+    }
     const size_t n = ix.assignments.cluster_id.size();
     if (dim != ix.meta.dim) {
         throw diskann::ANNException("query dim " + std::to_string(dim) + " != index dim " +
@@ -238,6 +270,8 @@ int run(int argc, char** argv) {
     auto reset_io = [&] {
         drain_query_cache_hits(io);
         io.reset();
+        drain_query_cache_hits(ex_io);
+        ex_io.reset();
     };
     auto io_json = [&](size_t queries, double avg_latency_s) {
         drain_query_cache_hits(io);
@@ -344,6 +378,9 @@ int run(int argc, char** argv) {
             }
             for (uint32_t rm : rerank_ms) {
             for (const IVFRerankSchedule& sched : schedules) {
+            for (const std::string& source : sources) {
+            for (uint32_t ex_exact : source == "ex9" ? ex_exacts : std::vector<uint32_t>{0}) {
+            const IVFExRerank ex{source == "ex9" ? &ex_store : nullptr, ex_exact};
             IVFPQSearchTimes times;
             auto concurrent_graph = [&](const float* qs, size_t count, bool timed) {
 #pragma omp parallel
@@ -353,7 +390,7 @@ int run(int argc, char** argv) {
                     for (size_t q = 0; q < count; ++q) {
                         auto s = std::chrono::steady_clock::now();
                         IVFPQSearchResult r = ivf_pq_search_graph<T>(ix, graph, heap, qs + q * dim, k, nprobe, beam,
-                                                                     rm, scratch, nullptr, cutoff, sched);
+                                                                     rm, scratch, nullptr, cutoff, sched, ex);
                         if (timed) res[q] = std::move(r), lat[q] = seconds_since(s);
                     }
 #pragma omp critical
@@ -369,6 +406,9 @@ int run(int argc, char** argv) {
             for (double l : lat) graph_avg += l;
             graph_avg /= double(nq);
             const std::string graph_io_fields = io_json(nq, graph_avg);
+            drain_query_cache_hits(ex_io);
+            const uint64_t ex_misses = ex_io.cache_misses.load();
+            const double pages_avg = double(times.ex_pages + times.raw_pages) / double(nq);
             const double per_q = 1e3 * double(nq);  // ns totals -> us per query
             std::printf("{\"baseline\":\"IVF-PQ\",\"scan\":\"%s\",\"centroid_search\":\"graph\",\"centroid_L\":%u,\"N\":%zu,"
                         "\"nlist\":%u,\"pq_chunks\":%u,\"nprobe\":%u,\"probe_tau\":%.3f,\"probes_avg\":%.1f,"
@@ -377,16 +417,26 @@ int run(int argc, char** argv) {
                         "\"query_count\":%zu,\"query_qps\":%.1f,\"query_lat_avg_us\":%.1f,"
                         "\"query_lat_p50_us\":%.1f,\"query_lat_p99_us\":%.1f,\"recall\":%.3f,"
                         "\"probe_recall\":%.4f,\"t_centroid_us\":%.1f,\"t_table_us\":%.1f,\"t_scan_us\":%.1f,"
-                        "\"t_select_us\":%.1f,\"t_fetch_us\":%.1f,\"t_rerank_us\":%.1f,\"rss_mb\":%.0f,%s}\n",
+                        "\"t_select_us\":%.1f,\"t_fetch_us\":%.1f,\"t_rerank_us\":%.1f,\"rerank_source\":\"%s\","
+                        "\"ex_exact\":%u,\"ex_records_avg\":%.1f,\"ex_pages_avg\":%.2f,\"raw_pages_avg\":%.2f,"
+                        "\"pages_avg\":%.2f,\"read_kb_avg\":%.1f,\"t_ex_fetch_us\":%.1f,\"t_ex_estimate_us\":%.1f,"
+                        "\"ex_buffer_pool_frames\":%u,\"ex_cache_misses\":%llu,\"ex_misses_per_query\":%.2f,"
+                        "\"rss_mb\":%.0f,%s}\n",
                         scan_used, beam, n, ix.meta.nlist, ix.pq.chunks, nprobe, tau, double(probed_total) / double(nq),
                         double(codes_total) / double(nq), rm, sched.batch, sched.patience,
                         double(times.reranked) / double(nq), double(times.fetch_batches) / double(nq), threads, nq,
                         double(nq) / graph_wall, graph_avg * 1e6, percentile_us(lat, 0.50),
                         percentile_us(lat, 0.99), recall_of(res), double(probe_hits) / double(probed_total),
                         times.centroid_ns / per_q, times.table_ns / per_q, times.scan_ns / per_q,
-                        times.select_ns / per_q, times.fetch_ns / per_q, times.rerank_ns / per_q, rss_mb(),
-                        graph_io_fields.c_str());
+                        times.select_ns / per_q, times.fetch_ns / per_q, times.rerank_ns / per_q, source.c_str(),
+                        ex_exact, double(times.ex_records) / double(nq), double(times.ex_pages) / double(nq),
+                        double(times.raw_pages) / double(nq), pages_avg,
+                        pages_avg * double(ix.heap_layout.page_size) / 1024.0, times.ex_fetch_ns / per_q,
+                        times.ex_estimate_ns / per_q, want_ex ? ex_pool_frames : 0u, (unsigned long long)ex_misses,
+                        double(ex_misses) / double(nq), rss_mb(), graph_io_fields.c_str());
             std::fflush(stdout);
+            }
+            }
             }
             }
         }
@@ -396,6 +446,7 @@ int run(int argc, char** argv) {
     delete[] gt_dists;
     delete[] gt_tags;
     heap.close();
+    if (want_ex) ex_store.close();
     return 0;
 }
 
@@ -409,7 +460,8 @@ int main(int argc, char** argv) {
                      "--query_file <query.bin> --gt_file <truthset.bin> [--nprobes 8,16,32,64,128] "
                      "[--rerank_m 100] [--k 10] [--threads N] [--warmup N] [--graph_beams 2,4] [--probe_taus 0,1.4] "
                      "[--warmup_query_file <warmup.bin>] [--skip_exact 1] [--rerank_schedules 0:0,10:2] "
-                     "[--buffer_pool_frames 262144]"
+                     "[--buffer_pool_frames 262144] [--rerank_sources raw,ex9] [--ex_exact 0,20] "
+                     "[--ex_buffer_pool_frames N]"
                   << std::endl;
         return 2;
     }
