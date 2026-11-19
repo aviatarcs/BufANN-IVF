@@ -32,6 +32,8 @@ struct IVFPQBackend {
     // centroids are fixed until a rebuild, which must rebuild it too.
     IVFCentroidGraph centroid_graph;
     RawVectorHeap heap;
+    // The 9-bit ex-code store, open only when config.ivf_ex_rerank.
+    RawVectorHeap excodes;
     std::string index_prefix;
     IVFPQDelta delta;
     // Tags of inserted vectors, both ways; base vectors are the identity.
@@ -41,7 +43,7 @@ struct IVFPQBackend {
 };
 
 // Validates the IVF-PQ fields of `config` (nlist, pq_chunks > 0 and pq_chunks
-// at most dim). Throws std::invalid_argument.
+// at most dim, ivf_ex_bits 0 or 9). Throws std::invalid_argument.
 void require_ivf_pq_config(const BufANNConfig& config, const char* where);
 
 // Validates the search fields of `config`: ivf_centroid_beam 0 or a finite
@@ -55,7 +57,8 @@ template<typename T>
 std::unique_ptr<IVFPQBackend> ivf_pq_backend_build(const std::string& data_bin, const std::string& index_prefix,
                                                    const BufANNConfig& config);
 
-// Loads a backend written by ivf_pq_backend_build; config.dim must match.
+// Loads a backend written by ivf_pq_backend_build; config.dim must match,
+// and with config.ivf_ex_rerank the index must have an ex-code store.
 template<typename T>
 std::unique_ptr<IVFPQBackend> ivf_pq_backend_load(const std::string& index_prefix, const BufANNConfig& config);
 

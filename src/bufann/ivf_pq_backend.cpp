@@ -11,6 +11,7 @@
 #include "ann_exception.h"
 #include "bufann/bufann_api.h"
 #include "bufann/ivf_pq_build.h"
+#include "bufann/ivf_pq_excode.h"
 #include "bufann/ivf_pq_index_file.h"
 #include "bufann/ivf_pq_mutate.h"
 
@@ -40,6 +41,9 @@ void require_ivf_pq_config(const BufANNConfig& config, const char* where) {
     if (config.ivf_pq_chunks > config.dim) {
         fail("config.ivf_pq_chunks " + std::to_string(config.ivf_pq_chunks) + " exceeds config.dim " +
              std::to_string(config.dim));
+    }
+    if (config.ivf_ex_bits != 0 && config.ivf_ex_bits != IVF_EXCODE_BITS) {
+        fail("config.ivf_ex_bits must be 0 (no ex-code store) or " + std::to_string(IVF_EXCODE_BITS));
     }
     require_ivf_pq_search_config(config, where);
 }
@@ -102,6 +106,10 @@ std::unique_ptr<IVFPQBackend> ivf_pq_backend_build(const std::string& data_bin, 
     encode_ivf_pq_codes<T>(data_bin, index_prefix, config.ivf_pq_chunks);
     step_done("PQ encoding");
     ix.pq = load_ivf_pq(index_prefix);
+    if (config.ivf_ex_bits != 0) {
+        build_ivf_excode_store<T>(data_bin, index_prefix, ix, config.page_size);
+        step_done("ex-code store");
+    }
     write_ivf_pq_index(index_prefix, ix);
     step_done("index file write");
     auto backend = ivf_pq_backend_load<T>(index_prefix, config);
@@ -131,6 +139,15 @@ std::unique_ptr<IVFPQBackend> ivf_pq_backend_load(const std::string& index_prefi
     // the budget the graph backend gets, not the unbounded page cache.
     backend->heap.open_existing(ivf_raw_vectors_path(index_prefix), ix.heap_layout, ix.heap_next_slot, ix.heap_pages,
                                 RawVectorHeapCache{config.buffer_pool_frames, nullptr});
+    if (config.ivf_ex_rerank) {
+        if (ix.excodes.bits == 0) {
+            throw std::invalid_argument("bufann_load: config.ivf_ex_rerank needs an index built with ivf_ex_bits");
+        }
+        const uint32_t frames =
+            config.ivf_ex_buffer_pool_frames != 0 ? config.ivf_ex_buffer_pool_frames : config.buffer_pool_frames;
+        backend->excodes.open_existing(ivf_excodes_path(index_prefix), ix.excodes.layout, ix.excodes.next_slot,
+                                       ix.excodes.pages, RawVectorHeapCache{frames, nullptr});
+    }
     ivf_pq_recover_deletes(backend->index, backend->heap, backend->delta);
     if (config.ivf_centroid_beam > 0.0f) backend->centroid_graph = build_ivf_centroid_graph(ix.meta);
     return backend;
@@ -249,10 +266,18 @@ uint32_t ivf_pq_backend_query(IVFPQBackend& backend, const BufANNConfig& config,
     std::vector<float> q(scratch.vector.begin(), scratch.vector.end());
 
     const IVFRerankSchedule schedule{config.ivf_rerank_batch, config.ivf_rerank_patience};
+    IVFExRerank ex;
+    if (config.ivf_ex_rerank) {
+        if (backend.excodes.layout().elem_size == 0) {
+            throw std::invalid_argument("bufann_query: config.ivf_ex_rerank, but the index was loaded without it");
+        }
+        ex.store = &backend.excodes;
+        ex.exact = config.ivf_ex_exact == 0 ? 0 : std::max(config.ivf_ex_exact, topK);
+    }
     IVFPQSearchResult r = as_std_exception([&] {
         if (config.ivf_centroid_beam == 0.0f) {
             return ivf_pq_search<T>(backend.index, backend.heap, q.data(), topK, nprobe, rerank_m, scratch,
-                                    &backend.delta, schedule);
+                                    &backend.delta, schedule, ex);
         }
         const uint32_t nlist = backend.index.meta.nlist, probes = std::min(nprobe, nlist);
         const uint32_t beam =
@@ -260,7 +285,7 @@ uint32_t ivf_pq_backend_query(IVFPQBackend& backend, const BufANNConfig& config,
         IVFProbeCutoff cutoff;
         cutoff.tau = config.ivf_probe_tau;
         return ivf_pq_search_graph<T>(backend.index, backend.centroid_graph, backend.heap, q.data(), topK, nprobe,
-                                      beam, rerank_m, scratch, &backend.delta, cutoff, schedule);
+                                      beam, rerank_m, scratch, &backend.delta, cutoff, schedule, ex);
     });
     const uint32_t n = uint32_t(std::min<size_t>(topK, r.ids.size()));
     if (out_tags != nullptr) {

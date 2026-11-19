@@ -64,6 +64,17 @@ struct BufANNConfig {
     // do not change the top k.
     uint32_t ivf_rerank_batch    = 0;
     uint32_t ivf_rerank_patience = 0;
+    // 9-bit ex-code store (ivf_pq_excode.h). Build: ivf_ex_bits 9 writes one
+    // record per base vector (8 + 9 dim / 8 bytes) in posting order next to
+    // the raw vectors; 0 writes none. Search: with ivf_ex_rerank the
+    // shortlist is ranked by those records' estimates, read through a buffer
+    // pool of ivf_ex_buffer_pool_frames (0 = buffer_pool_frames), and only
+    // the ivf_ex_exact nearest (0 = none, else raised to topK) are re-ranked
+    // from the raw vectors (IVFExRerank). Needs an index built with the store.
+    uint32_t ivf_ex_bits               = 0;
+    bool     ivf_ex_rerank             = false;
+    uint32_t ivf_ex_exact              = 0;
+    uint32_t ivf_ex_buffer_pool_frames = 0;
 
     // --- graph parameters ---
     uint32_t R           = 64;  // max graph degree (used for build and insert pruning)

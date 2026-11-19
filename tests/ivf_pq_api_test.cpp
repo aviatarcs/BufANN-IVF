@@ -495,6 +495,68 @@ bool test_centroid_graph(const std::string& tag, const std::string& prefix) {
     return t.done();
 }
 
+// The ex-code re-rank through the API: the config's store, exact count and
+// probe path must reach ivf_pq_search as stated; an exact count covering the
+// whole shortlist answers as the raw re-rank does; an index without a store
+// and a bit width other than 9 are refused.
+template<typename T>
+bool test_ex_rerank(const std::string& tag, const std::string& prefix) {
+    TestCase t(tag + ": ivf_ex_bits / ivf_ex_rerank through the API");
+    const std::string base_bin = prefix + "_base.bin";
+    std::vector<T> base = synthetic<T>(N, 1, 1.0f), queries = synthetic<T>(NQ, 2, 1.0f);
+    diskann::save_bin<T>(base_bin, base.data(), N, DIM);
+    const std::vector<float> queriesf = to_float(queries.data(), queries.size());
+    const uint32_t rerank_m = std::max<uint32_t>(100, 10 * K);
+    BufANNConfig build_cfg = ivf_config<T>();
+    build_cfg.ivf_ex_bits = 9;
+    BufANNIndex<T>* plain = bufann_build<T>(base_bin, prefix, build_cfg);
+    t.check(plain->ivf->index.excodes.bits == 9 && plain->ivf->excodes.layout().elem_size == 0,
+            "a build with ivf_ex_bits has no store, or opened it without ivf_ex_rerank");
+
+    BufANNConfig est_cfg = ivf_config<T>();
+    est_cfg.ivf_ex_rerank = true;
+    BufANNIndex<T>* est = bufann_load<T>(prefix, est_cfg);
+    BufANNConfig all_cfg = est_cfg;
+    all_cfg.ivf_ex_exact = rerank_m;
+    BufANNIndex<T>* all = bufann_load<T>(prefix, all_cfg);
+    IVFPQSearchScratch scratch;
+    size_t est_mismatches = 0, all_mismatches = 0;
+    for (uint32_t q = 0; q < NQ; ++q) {
+        const T* query = queries.data() + size_t(q) * DIM;
+        std::vector<TagType> got = bufann_query<T>(*est, query, K);
+        IVFPQSearchResult direct = ivf_pq_search<T>(est->ivf->index, est->ivf->heap, queriesf.data() + size_t(q) * DIM, K,
+                                                    est_cfg.ivf_nprobe, rerank_m, scratch, nullptr, {},
+                                                    IVFExRerank{&est->ivf->excodes, 0});
+        est_mismatches += !(got.size() == direct.ids.size() && std::equal(got.begin(), got.end(), direct.ids.begin()));
+        // uint8 distances are integers and tie often; the two re-ranks see
+        // the shortlist in different orders, so compare distances.
+        auto dists = [&](const std::vector<TagType>& tags) {
+            std::vector<float> d;
+            for (TagType id : tags) d.push_back(sq_dist(queriesf.data() + size_t(q) * DIM, to_float(base.data() + size_t(id) * DIM, DIM).data(), DIM));
+            return d;
+        };
+        all_mismatches += dists(bufann_query<T>(*all, query, K)) != dists(bufann_query<T>(*plain, query, K));
+    }
+    t.check(est_mismatches == 0, std::to_string(est_mismatches) + " queries differ from ivf_pq_search with the store");
+    t.check(all_mismatches == 0, std::to_string(all_mismatches) +
+                                     " queries' distances differ between an exact count of rerank_m and the raw re-rank");
+    bufann_free<T>(all);
+    bufann_free<T>(est);
+    bufann_free<T>(plain);
+
+    BufANNConfig bad_bits = ivf_config<T>();
+    bad_bits.ivf_ex_bits = 8;
+    t.expect_throw_any("ivf_ex_bits 8", [&] { bufann_build<T>(base_bin, prefix + "_bad", bad_bits); });
+    BufANNIndex<T>* none = bufann_build<T>(base_bin, prefix + "_none", ivf_config<T>());
+    bufann_free<T>(none);
+    t.expect_throw_any("ivf_ex_rerank on an index without a store", [&] { bufann_load<T>(prefix + "_none", est_cfg); });
+    ::unlink(base_bin.c_str());
+    remove_index_files(prefix);
+    remove_index_files(prefix + "_bad");
+    remove_index_files(prefix + "_none");
+    return t.done();
+}
+
 bool test_config_validation(const std::string& prefix) {
     TestCase t("IVF-PQ config validation and type mismatch on load");
     const std::string base_bin = prefix + "_base.bin";
@@ -540,6 +602,8 @@ int main() {
         all_pass &= test_tag_churn_under_queries<float>("float", prefix + "_churn");
         all_pass &= test_centroid_graph<float>("float", prefix + "_graph_f32");
         all_pass &= test_centroid_graph<uint8_t>("uint8", prefix + "_graph_u8");
+        all_pass &= test_ex_rerank<float>("float", prefix + "_ex_f32");
+        all_pass &= test_ex_rerank<uint8_t>("uint8", prefix + "_ex_u8");
         all_pass &= test_config_validation(prefix + "_cfg");
     } catch (const std::exception& e) {
         std::cout << "  FAIL: " << e.what() << std::endl;
