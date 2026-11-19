@@ -215,6 +215,17 @@ struct IVFPQDelta {
     RawVectorFreeList free_list;
 };
 
+// The index's 9-bit ex-code store (ivf_pq_excode.h); bits == 0 means it
+// has none. Its file holds one record per base vector, slot i the vector at
+// posting position i.
+struct IVFExCodes {
+    uint32_t bits = 0;
+    std::vector<float> rotation;  // P, [dim x dim] row-major, orthogonal
+    RawVectorHeapLayout layout;
+    uint32_t pages = 0;
+    uint32_t next_slot = 0;
+};
+
 // IVFPQIndex: everything the combined index file persists, in memory. The
 // raw vectors themselves stay in the heap file; heap_layout, heap_pages and
 // heap_next_slot describe it and are what RawVectorHeap::open_existing needs.
@@ -229,6 +240,7 @@ struct IVFPQIndex {
     RawVectorHeapLayout heap_layout;
     uint32_t heap_pages     = 0;
     uint32_t heap_next_slot = 0;  // RawVectorHeap::next_flat_slot() when the file was written
+    IVFExCodes excodes;
 };
 
 // Vectors the posting lists and PQ codes cover; ids from here on are inserts.
@@ -242,9 +254,11 @@ inline uint32_t ivf_pq_num_base(const IVFPQIndex& index) {
 // grew that page header from 8 to 16 bytes to record page_size and elem_size,
 // which moves every slot in the heap file; version 4 added the per-page
 // owner-id array between the bitmap and the slots, which moves them again;
-// version 5 stores the PQ codes in posting-list order, not by vector id.
+// version 5 stores the PQ codes in posting-list order, not by vector id;
+// version 6 describes the optional 9-bit ex-code store (IVFExCodes) and
+// appends its rotation after the RID table.
 constexpr uint32_t IVF_PQ_INDEX_MAGIC   = 0x51465649;  // "IVFQ" little-endian
-constexpr uint32_t IVF_PQ_INDEX_VERSION = 5;
+constexpr uint32_t IVF_PQ_INDEX_VERSION = 6;
 
 struct IVFPQIndexFileHeader {
     uint32_t magic   = 0;
@@ -283,8 +297,18 @@ struct IVFPQIndexFileHeader {
     uint32_t raw_vector_page_size = 0;
     uint64_t raw_vectors_bytes    = 0;
     uint64_t raw_vector_next_slot = 0;
+
+    // All zero when the index has no ex-code store.
+    uint32_t excode_bits      = 0;
+    uint32_t excode_elem_size = 0;
+    uint32_t excode_page_size = 0;
+    uint32_t excode_reserved  = 0;
+    uint64_t excode_rotation_offset = 0;
+    uint64_t excode_rotation_bytes  = 0;
+    uint64_t excodes_bytes          = 0;  // the store file's size
+    uint64_t excode_next_slot       = 0;
 };
-static_assert(sizeof(IVFPQIndexFileHeader) == 176, "header layout is part of the file format");
+static_assert(sizeof(IVFPQIndexFileHeader) == 224, "header layout is part of the file format");
 
 }  // namespace inplace
 }  // namespace diskann

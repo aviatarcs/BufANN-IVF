@@ -144,7 +144,7 @@ void fast_candidates(const IVFPQIndex& ix, const IVFPQDelta* delta, uint32_t R, 
     // rounding per sub-quantizer.
     uint32_t threshold = bounded ? 256 + chunks / 2 : 0x10000;
     s.top.clear();
-    auto push = [&](uint16_t q, uint32_t id) {
+    auto push = [&](uint16_t q, uint64_t id) {
         s.top.emplace_back(q, id);
         std::push_heap(s.top.begin(), s.top.end());
         if (s.top.size() > R) {
@@ -153,6 +153,9 @@ void fast_candidates(const IVFPQIndex& ix, const IVFPQDelta* delta, uint32_t R, 
         }
         if (s.top.size() == R) threshold = s.top.front().first;
     };
+    // The heap orders by (distance, id) as it always has; the posting
+    // position rides below the id (IVF_NO_POSTING_POS for inserts).
+    auto entry = [](uint32_t id, uint32_t pos) { return (uint64_t(id) << 32) | pos; };
     for (size_t i = 0; i < s.probe_order.size(); ++i) {
         // The next list is a random jump in memory; ask for its start now.
         if (i + 1 < s.probe_order.size()) {
@@ -174,7 +177,7 @@ void fast_candidates(const IVFPQIndex& ix, const IVFPQDelta* delta, uint32_t R, 
                 // An earlier push in this block may have lowered the threshold.
                 if (sums[lane] >= threshold) continue;
                 if (dead != nullptr && dead->count(ids[lane]) != 0) continue;
-                push(sums[lane], ids[lane]);
+                push(sums[lane], entry(ids[lane], begin + b * IVF_FASTSCAN_BLOCK + lane));
             }
         }
     }
@@ -191,16 +194,108 @@ void fast_candidates(const IVFPQIndex& ix, const IVFPQDelta* delta, uint32_t R, 
                 for (uint32_t c = 0; c < chunks; ++c) d += table[size_t(c) * 256 + code->second[c]];
                 const float q = std::nearbyint((d - s.qtable.dmin) * inv);
                 const uint16_t qq = uint16_t(std::clamp(q, 0.0f, 65535.0f));
-                if (qq < threshold) push(qq, id);
+                if (qq < threshold) push(qq, entry(id, IVF_NO_POSTING_POS));
             }
         }
     }
     s.candidates.clear();
+    s.candidate_pos.clear();
     s.pq_dist.clear();
-    for (const auto& [q, id] : s.top) {
-        s.candidates.push_back(id);
+    for (const auto& [q, v] : s.top) {
+        s.candidates.push_back(uint32_t(v >> 32));
+        s.candidate_pos.push_back(uint32_t(v));
         s.pq_dist.push_back(s.qtable.dmin + float(q) * s.qtable.delta);
     }
+}
+
+// How many distinct pages the first n of `slots` lie on.
+uint32_t distinct_pages(const RawVectorHeapLayout& layout, const uint32_t* slots, size_t n,
+                        std::vector<uint32_t>& pages) {
+    pages.resize(n);
+    for (size_t i = 0; i < n; ++i) pages[i] = layout.page_of(slots[i]);
+    std::sort(pages.begin(), pages.end());
+    return uint32_t(std::unique(pages.begin(), pages.end()) - pages.begin());
+}
+
+void require_ex_args(const IVFPQIndex& ix, const IVFExRerank& ex, uint32_t k) {
+    if (ex.store == nullptr) return;
+    IVF_PQ_REQUIRE(ix.excodes.bits == IVF_EXCODE_BITS, "ex-code re-rank on an index without an ex-code store");
+    IVF_PQ_REQUIRE(ex.store->layout().elem_size == ix.excodes.layout.elem_size &&
+                       ex.store->layout().page_size == ix.excodes.layout.page_size &&
+                       ex.store->next_flat_slot() == ivf_pq_num_base(ix),
+                   "ex-code store does not match the index's (open it with index.excodes' geometry)");
+    IVF_PQ_REQUIRE(ex.exact == 0 || ex.exact >= k, "ex-code exact re-rank count must be 0 or at least k");
+}
+
+// The ex-code stage of a re-rank (IVFExRerank): estimates the shortlist's
+// vectors that have records, read in posting order so a page is pinned once
+// per query, then leaves in the shortlist (nearest estimate first) only the
+// `exact` nearest of them and the inserts, which have no record; with exact
+// 0 the others go to approx_ids/approx_dists with their estimates.
+void excode_stage(const IVFPQIndex& ix, const RawVectorHeap& store, uint32_t exact, const float* query,
+                  IVFPQSearchScratch& s, IVFPQQueryIO& io, Clock::time_point& t) {
+    const uint32_t dim = ix.meta.dim;
+    const size_t rec = store.layout().elem_size;
+    IVFPQSearchTimes& times = s.times;
+    s.ex_index.clear();
+    for (uint32_t i = 0; i < s.shortlist.size(); ++i) {
+        if (s.shortlist_pos[i] != IVF_NO_POSTING_POS) s.ex_index.push_back(i);
+    }
+    std::sort(s.ex_index.begin(), s.ex_index.end(),
+              [&](uint32_t a, uint32_t b) { return s.shortlist_pos[a] < s.shortlist_pos[b]; });
+    const size_t m = s.ex_index.size();
+    s.ex_slots.resize(m);
+    for (size_t j = 0; j < m; ++j) s.ex_slots[j] = s.shortlist_pos[s.ex_index[j]];
+    s.ex_records.resize(m * rec);
+    s.ex_owners.resize(m);
+    store.read_vectors(s.ex_slots.data(), m, s.ex_records.data(), s.ex_owners.data());
+    io.ex_records = uint32_t(m);
+    io.ex_pages = distinct_pages(store.layout(), s.ex_slots.data(), m, s.pages);
+    times.ex_records += io.ex_records;
+    times.ex_pages += io.ex_pages;
+    lap(t, times.ex_fetch_ns);
+
+    ivf_excode_prepare_query(ix.excodes, dim, query, s.ex_query);
+    s.ex_est.resize(m);
+    // Positions ascend, so the partition only moves forward.
+    uint32_t list = 0;
+    float qc = 0.0f;
+    bool have_qc = false;
+    for (size_t j = 0; j < m; ++j) {
+        const uint32_t i = s.ex_index[j];
+        IVF_PQ_REQUIRE(s.ex_owners[j] == s.shortlist[i], "ex-code slot " + std::to_string(s.ex_slots[j]) +
+                                                             " holds vector " + std::to_string(s.ex_owners[j]) +
+                                                             ", not " + std::to_string(s.shortlist[i]));
+        const uint32_t pos = s.ex_slots[j];
+        while (ix.lists.offsets[list + 1] <= pos) ++list, have_qc = false;
+        if (!have_qc) {
+            qc = sq_dist(query, ix.meta.centroids.data() + size_t(list) * ix.meta.aligned_dim, dim);
+            have_qc = true;
+        }
+        s.ex_est[j] = ivf_excode_estimate(reinterpret_cast<const uint8_t*>(s.ex_records.data() + j * rec), dim,
+                                          s.ex_query, qc);
+    }
+    // Shortlist entries by estimate: the exact set first, inserts after it.
+    select_smallest(s.ex_est, uint32_t(m), s.order);
+    const size_t keep = exact == 0 ? 0 : std::min<size_t>(exact, m);
+    std::vector<uint32_t> ids, slots;
+    std::vector<float> dists;
+    for (size_t r = 0; r < m; ++r) {
+        const uint32_t j = s.order[r], i = s.ex_index[j];
+        if (r < keep) {
+            ids.push_back(s.shortlist[i]), slots.push_back(s.shortlist_slot[i]), dists.push_back(s.ex_est[j]);
+        } else if (exact == 0) {
+            s.approx_ids.push_back(s.shortlist[i]), s.approx_dists.push_back(s.ex_est[j]);
+        }
+    }
+    for (uint32_t i = 0; i < s.shortlist.size(); ++i) {
+        if (s.shortlist_pos[i] != IVF_NO_POSTING_POS) continue;
+        ids.push_back(s.shortlist[i]), slots.push_back(s.shortlist_slot[i]), dists.push_back(s.exact_dist[i]);
+    }
+    s.shortlist.swap(ids);
+    s.shortlist_slot.swap(slots);
+    s.exact_dist.swap(dists);
+    lap(t, times.ex_estimate_ns);
 }
 
 // Everything after choosing the partitions in scratch.probe_order: PQ table,
@@ -209,7 +304,7 @@ void fast_candidates(const IVFPQIndex& ix, const IVFPQDelta* delta, uint32_t R, 
 template<typename T>
 IVFPQSearchResult search_probes(const IVFPQIndex& ix, const RawVectorHeap& heap, const IVFPQDelta* delta,
                                 const float* query, uint32_t k, uint32_t rerank_m, const IVFRerankSchedule& schedule,
-                                IVFPQSearchScratch& scratch, Clock::time_point t) {
+                                const IVFExRerank& ex, IVFPQSearchScratch& scratch, Clock::time_point t) {
     const IVFMetadata& meta = ix.meta;
     const PQMetadata& pq = ix.pq;
     const uint32_t dim = meta.dim;
@@ -234,18 +329,20 @@ IVFPQSearchResult search_probes(const IVFPQIndex& ix, const RawVectorHeap& heap,
     if (fast) {
         fast_candidates(ix, delta, rerank_m, scratch, delta_lock);
     } else {
-        auto add_candidate = [&](uint32_t id, const uint8_t* code) {
+        auto add_candidate = [&](uint32_t id, const uint8_t* code, uint32_t pos) {
             float d = 0.0f;
             for (uint32_t c = 0; c < pq.chunks; ++c) d += scratch.pq_table[size_t(c) * pq.k + code[c]];
             scratch.candidates.push_back(id);
+            scratch.candidate_pos.push_back(pos);
             scratch.pq_dist.push_back(d);
         };
         scratch.candidates.clear();
+        scratch.candidate_pos.clear();
         scratch.pq_dist.clear();
         if (!ix.lists.codes.empty()) {
             for (uint32_t part : scratch.probe_order) {
                 for (uint32_t i = ix.lists.offsets[part]; i < ix.lists.offsets[part + 1]; ++i) {
-                    add_candidate(ix.lists.ids[i], ix.lists.codes.data() + size_t(i) * pq.chunks);
+                    add_candidate(ix.lists.ids[i], ix.lists.codes.data() + size_t(i) * pq.chunks, i);
                 }
             }
         } else {
@@ -256,6 +353,7 @@ IVFPQSearchResult search_probes(const IVFPQIndex& ix, const RawVectorHeap& heap,
                 const uint8_t* first = ivf_list_blocks(ix.lists.blocked, part);
                 for (uint32_t i = 0; i < n; ++i) {
                     scratch.candidates.push_back(ix.lists.ids[begin + i]);
+                    scratch.candidate_pos.push_back(begin + i);
                     scratch.pq_dist.push_back(adc_block_lane(first + size_t(i / IVF_FASTSCAN_BLOCK) * block_bytes,
                                                              pq.chunks, i % IVF_FASTSCAN_BLOCK,
                                                              scratch.pq_table.data()));
@@ -278,10 +376,12 @@ IVFPQSearchResult search_probes(const IVFPQIndex& ix, const RawVectorHeap& heap,
                 for (size_t i = 0; i < scratch.candidates.size(); ++i) {
                     if (tombstones.count(scratch.candidates[i]) != 0) continue;
                     scratch.candidates[live] = scratch.candidates[i];
+                    scratch.candidate_pos[live] = scratch.candidate_pos[i];
                     scratch.pq_dist[live] = scratch.pq_dist[i];
                     ++live;
                 }
                 scratch.candidates.resize(live);
+                scratch.candidate_pos.resize(live);
                 scratch.pq_dist.resize(live);
             }
             for (uint32_t part : scratch.probe_order) {
@@ -291,7 +391,7 @@ IVFPQSearchResult search_probes(const IVFPQIndex& ix, const RawVectorHeap& heap,
                     auto code = delta->codes.codes.find(id);
                     IVF_PQ_REQUIRE(code != delta->codes.codes.end() && code->second.size() == pq.chunks,
                                    "inserted vector " + std::to_string(id) + " has no PQ code in the delta");
-                    add_candidate(id, code->second.data());
+                    add_candidate(id, code->second.data(), IVF_NO_POSTING_POS);
                 }
             }
         }
@@ -305,12 +405,14 @@ IVFPQSearchResult search_probes(const IVFPQIndex& ix, const RawVectorHeap& heap,
     if (delta != nullptr) delta_lock.lock();
     scratch.shortlist.clear();
     scratch.shortlist_slot.clear();
+    scratch.shortlist_pos.clear();
     scratch.exact_dist.clear();
     for (uint32_t i : scratch.order) {
         const RawVectorRID rid = load_rid(ix.rid_table.rid[scratch.candidates[i]]);
         if (rid_is_active(rid)) {
             scratch.shortlist.push_back(scratch.candidates[i]);
             scratch.shortlist_slot.push_back(rid_flat_slot(rid));
+            scratch.shortlist_pos.push_back(scratch.candidate_pos[i]);
             scratch.exact_dist.push_back(scratch.pq_dist[i]);
         }
     }
@@ -323,6 +425,9 @@ IVFPQSearchResult search_probes(const IVFPQIndex& ix, const RawVectorHeap& heap,
         result.dists = scratch.exact_dist;
         return result;
     }
+    scratch.approx_ids.clear();
+    scratch.approx_dists.clear();
+    if (ex.store != nullptr) excode_stage(ix, *ex.store, ex.exact, query, scratch, result.io, t);
 
     // Each fetch is one buffer-pool batch, whose misses are read
     // concurrently, as BufANN's beam search and LindormVector's batch get do.
@@ -370,7 +475,13 @@ IVFPQSearchResult search_probes(const IVFPQIndex& ix, const RawVectorHeap& heap,
         if (schedule.patience > 0 && idle == schedule.patience) break;
     }
     times.reranked += done;
+    result.io.raw_vectors = uint32_t(done);
+    result.io.raw_pages = distinct_pages(heap.layout(), scratch.shortlist_slot.data(), done, scratch.pages);
+    times.raw_pages += result.io.raw_pages;
+    scratch.shortlist.resize(done);
     scratch.exact_dist.resize(done);
+    scratch.shortlist.insert(scratch.shortlist.end(), scratch.approx_ids.begin(), scratch.approx_ids.end());
+    scratch.exact_dist.insert(scratch.exact_dist.end(), scratch.approx_dists.begin(), scratch.approx_dists.end());
     select_smallest(scratch.exact_dist, k, scratch.order);
     for (uint32_t i : scratch.order) {
         result.ids.push_back(scratch.shortlist[i]);
@@ -387,12 +498,13 @@ IVFPQSearchResult search_from_centroid_dist(const IVFPQIndex& ix, const RawVecto
                                             const IVFPQDelta* delta, const float* query,
                                             const float* centroid_dist, uint32_t k, uint32_t nprobe,
                                             uint32_t rerank_m, const IVFRerankSchedule& schedule,
-                                            IVFPQSearchScratch& scratch, Clock::time_point t) {
+                                            const IVFExRerank& ex, IVFPQSearchScratch& scratch,
+                                            Clock::time_point t) {
     size_scratch(scratch, ix);
     std::copy_n(centroid_dist, ix.meta.nlist, scratch.centroid_dist.begin());
     select_smallest(scratch.centroid_dist, std::min(nprobe, ix.meta.nlist), scratch.probe_order);
     lap(t, scratch.times.centroid_ns);
-    return search_probes<T>(ix, heap, delta, query, k, rerank_m, schedule, scratch, t);
+    return search_probes<T>(ix, heap, delta, query, k, rerank_m, schedule, ex, scratch, t);
 }
 
 }  // namespace
@@ -401,9 +513,10 @@ template<typename T>
 IVFPQSearchResult ivf_pq_search(const IVFPQIndex& ix, const RawVectorHeap& heap, const float* query,
                                 uint32_t k, uint32_t nprobe, uint32_t rerank_m,
                                 IVFPQSearchScratch& scratch, const IVFPQDelta* delta,
-                                const IVFRerankSchedule& rerank) {
+                                const IVFRerankSchedule& rerank, const IVFExRerank& ex) {
     IVF_PQ_REQUIRE(query != nullptr, "query is null");
     require_search_args(ix, k, nprobe, rerank_m, heap.layout().elem_size, sizeof(T));
+    require_ex_args(ix, ex, k);
     const Clock::time_point t = Clock::now();
     size_scratch(scratch, ix);
     std::copy_n(query, ix.meta.dim, scratch.query_padded.begin());
@@ -413,7 +526,7 @@ IVFPQSearchResult ivf_pq_search(const IVFPQIndex& ix, const RawVectorHeap& heap,
     centroid_distances(ix.meta, scratch.query_padded.data(), 1, scratch.centroid_dist.data());
     mkl_set_num_threads_local(mkl_threads);
     return search_from_centroid_dist<T>(ix, heap, delta, query, scratch.centroid_dist.data(), k, nprobe,
-                                        rerank_m, rerank, scratch, t);
+                                        rerank_m, rerank, ex, scratch, t);
 }
 
 uint32_t ivf_probe_count(const float* dist, uint32_t n, const IVFProbeCutoff& cutoff) {
@@ -428,9 +541,11 @@ template<typename T>
 IVFPQSearchResult ivf_pq_search_graph(const IVFPQIndex& ix, const IVFCentroidGraph& graph, const RawVectorHeap& heap,
                                       const float* query, uint32_t k, uint32_t nprobe, uint32_t centroid_L,
                                       uint32_t rerank_m, IVFPQSearchScratch& scratch, const IVFPQDelta* delta,
-                                      const IVFProbeCutoff& cutoff, const IVFRerankSchedule& rerank) {
+                                      const IVFProbeCutoff& cutoff, const IVFRerankSchedule& rerank,
+                                      const IVFExRerank& ex) {
     IVF_PQ_REQUIRE(query != nullptr, "query is null");
     require_search_args(ix, k, nprobe, rerank_m, heap.layout().elem_size, sizeof(T));
+    require_ex_args(ix, ex, k);
     Clock::time_point t = Clock::now();
     // tau < 1 would cut below the reference itself. NaN is tested on the
     // bits: -Ofast lets the compiler assume float comparisons see no NaN.
@@ -448,7 +563,7 @@ IVFPQSearchResult ivf_pq_search_graph(const IVFPQIndex& ix, const IVFCentroidGra
     scratch.probe_order.resize(
         ivf_probe_count(scratch.probe_dist.data(), uint32_t(scratch.probe_dist.size()), cutoff));
     lap(t, scratch.times.centroid_ns);
-    return search_probes<T>(ix, heap, delta, query, k, rerank_m, rerank, scratch, t);
+    return search_probes<T>(ix, heap, delta, query, k, rerank_m, rerank, ex, scratch, t);
 }
 
 template<typename T>
@@ -478,7 +593,8 @@ std::vector<IVFPQSearchResult> ivf_pq_search_batch(const IVFPQIndex& ix, const R
         for (int64_t r = 0; r < int64_t(rows); ++r) {
             results[start + r] = search_from_centroid_dist<T>(
                 ix, heap, delta, queries + (start + r) * meta.dim, dist.data() + size_t(r) * meta.nlist, k,
-                nprobe, rerank_m, IVFRerankSchedule{}, scratches[size_t(omp_get_thread_num())], Clock::now());
+                nprobe, rerank_m, IVFRerankSchedule{}, IVFExRerank{}, scratches[size_t(omp_get_thread_num())],
+                Clock::now());
         }
     }
     return results;
@@ -494,14 +610,15 @@ IVFPQSearchResult ivf_pq_search(const IVFPQIndex& index, const RawVectorHeap& he
 #define IVF_PQ_INSTANTIATE_SEARCH(T)                                                                        \
     template IVFPQSearchResult ivf_pq_search<T>(const IVFPQIndex&, const RawVectorHeap&, const float*,     \
                                                 uint32_t, uint32_t, uint32_t, IVFPQSearchScratch&,         \
-                                                const IVFPQDelta*, const IVFRerankSchedule&);              \
+                                                const IVFPQDelta*, const IVFRerankSchedule&,               \
+                                                const IVFExRerank&);                                       \
     template IVFPQSearchResult ivf_pq_search<T>(const IVFPQIndex&, const RawVectorHeap&, const float*,     \
                                                 uint32_t, uint32_t, uint32_t);                             \
     template IVFPQSearchResult ivf_pq_search_graph<T>(const IVFPQIndex&, const IVFCentroidGraph&,           \
                                                       const RawVectorHeap&, const float*, uint32_t, uint32_t, \
                                                       uint32_t, uint32_t, IVFPQSearchScratch&,             \
                                                       const IVFPQDelta*, const IVFProbeCutoff&,            \
-                                                      const IVFRerankSchedule&);                           \
+                                                      const IVFRerankSchedule&, const IVFExRerank&);       \
     template std::vector<IVFPQSearchResult> ivf_pq_search_batch<T>(const IVFPQIndex&, const RawVectorHeap&, \
                                                                    const float*, size_t, uint32_t, uint32_t, \
                                                                    uint32_t, uint32_t, const IVFPQDelta*);

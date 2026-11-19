@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "bufann/ivf_pq_build.h"
+#include "bufann/ivf_pq_excode.h"
 #include "bufann/ivf_pq_fastscan.h"
 #include "bufann/ivf_pq_huge_pages.h"
 #include "bufann/ivf_pq_require.h"
@@ -58,6 +59,15 @@ IVFPQIndexFileHeader make_header(const IVFPQIndex& index) {
     place(h.pq_pivots_offset, h.pq_pivots_bytes, bytes_of(index.pq.pivots));
     place(h.pq_codes_offset, h.pq_codes_bytes, uint64_t(index.lists.ids.size()) * index.pq.chunks);
     place(h.rid_table_offset, h.rid_table_bytes, bytes_of(index.rid_table.rid));
+    const IVFExCodes& ex = index.excodes;
+    if (ex.bits != 0) {
+        h.excode_bits = ex.bits;
+        h.excode_elem_size = ex.layout.elem_size;
+        h.excode_page_size = ex.layout.page_size;
+        h.excodes_bytes = uint64_t(ex.pages) * ex.layout.page_size;
+        h.excode_next_slot = ex.next_slot;
+        place(h.excode_rotation_offset, h.excode_rotation_bytes, bytes_of(ex.rotation));
+    }
     return h;
 }
 
@@ -158,6 +168,23 @@ void require_header(const IVFPQIndexFileHeader& h, const std::string& path) {
                        h.raw_vector_next_slot <= uint64_t(RAW_VECTOR_RID_SLOT_MASK) + 1,
                    "IVF-PQ index header has an invalid raw-vector heap descriptor");
     require_section_sizes(h);
+    if (h.excode_bits == 0) {
+        IVF_PQ_REQUIRE(h.excode_elem_size == 0 && h.excode_page_size == 0 && h.excode_reserved == 0 &&
+                           h.excode_rotation_offset == 0 && h.excode_rotation_bytes == 0 && h.excodes_bytes == 0 &&
+                           h.excode_next_slot == 0,
+                       "IVF-PQ index header describes an ex-code store with no bit width");
+    } else {
+        IVF_PQ_REQUIRE(h.excode_bits == IVF_EXCODE_BITS, "IVF-PQ index ex codes have " +
+                                                            std::to_string(h.excode_bits) + " bits; only " +
+                                                            std::to_string(IVF_EXCODE_BITS) + " are supported");
+        IVF_PQ_REQUIRE(h.excode_elem_size == ivf_excode_record_bytes(h.dim) && h.excode_page_size > 0 &&
+                           h.excodes_bytes % h.excode_page_size == 0 &&
+                           h.excodes_bytes / h.excode_page_size <= UINT32_MAX &&
+                           h.excode_next_slot == h.num_vectors,
+                       "IVF-PQ index header has an invalid ex-code store descriptor");
+        IVF_PQ_REQUIRE(h.excode_rotation_bytes == uint64_t(h.dim) * h.dim * sizeof(float),
+                       "ex-code rotation section size does not match dim x dim");
+    }
 }
 
 // Posting lists are the exact inverse of the cluster ids; RIDs point below
@@ -250,6 +277,7 @@ void write_ivf_pq_index(const std::string& index_prefix, const IVFPQIndex& index
         }
         static_assert(sizeof(RawVectorRID) == sizeof(uint32_t), "RID table is stored as uint32");
         out.write(index.rid_table.rid.data(), bytes_of(index.rid_table.rid));
+        if (index.excodes.bits != 0) out.write(index.excodes.rotation);
         out.sync_and_close();
     }
     IVF_PQ_REQUIRE(::rename(tmp.c_str(), path.c_str()) == 0, "Failed to move " + tmp + " into place");
@@ -319,6 +347,20 @@ IVFPQIndex load_ivf_pq_index(const std::string& index_prefix) {
     IVF_PQ_REQUIRE(file_exists(heap_path) && get_file_size(heap_path) == h.raw_vectors_bytes,
                    "raw-vector heap " + heap_path + " is missing or not the " +
                        std::to_string(h.raw_vectors_bytes) + " bytes the index records");
+    if (h.excode_bits != 0) {
+        IVFExCodes& ex = index.excodes;
+        ex.bits = h.excode_bits;
+        ex.rotation = in.read<float>(h.excode_rotation_offset, h.excode_rotation_bytes, "ex-code rotation");
+        ex.layout = compute_raw_vector_heap_layout(h.excode_page_size, h.excode_elem_size);
+        ex.pages = uint32_t(h.excodes_bytes / h.excode_page_size);
+        ex.next_slot = uint32_t(h.excode_next_slot);
+        IVF_PQ_REQUIRE(uint64_t(ex.pages) * ex.layout.slots_per_page >= ex.next_slot,
+                       "ex-code slot cursor lies past the store's pages");
+        const std::string ex_path = ivf_excodes_path(index_prefix);
+        IVF_PQ_REQUIRE(file_exists(ex_path) && get_file_size(ex_path) == h.excodes_bytes,
+                       "ex-code store " + ex_path + " is missing or not the " + std::to_string(h.excodes_bytes) +
+                           " bytes the index records");
+    }
     return index;
 }
 

@@ -21,6 +21,7 @@
 #include "ann_exception.h"
 #include "bufann/ivf_pq.h"
 #include "bufann/ivf_pq_build.h"
+#include "bufann/ivf_pq_excode.h"
 #include "bufann/ivf_pq_index_file.h"
 #include "bufann/ivf_pq_raw_vector_heap.h"
 #include "bufann/ivf_pq_search.h"
@@ -199,7 +200,7 @@ struct Built {
 inline void remove_index_files(const std::string& prefix) {
     using namespace diskann::inplace;
     for (const std::string& f : {ivf_pq_index_path(prefix), ivf_raw_vectors_path(prefix), ivf_pq_pivots_path(prefix),
-                                 ivf_pq_codes_path(prefix)}) {
+                                 ivf_pq_codes_path(prefix), ivf_excodes_path(prefix)}) {
         ::unlink(f.c_str());
     }
 }

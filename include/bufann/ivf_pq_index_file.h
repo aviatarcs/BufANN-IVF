@@ -9,10 +9,12 @@
 //   [pq pivots       f32  k x dim, chunk by chunk (PQMetadata)]
 //   [pq codes        u8   N x chunks, row i the code of posting id i]
 //   [rid table       u32  N]
+//   [ex-code rotation f32 dim x dim, only with an ex-code store]
 //
 // The raw vectors stay in the heap file next to it; the header records the
 // heap's geometry, size and allocation cursor, enough to reopen it with
-// RawVectorHeap::open_existing. The file is written to a temporary name and
+// RawVectorHeap::open_existing. The same goes for the optional 9-bit
+// ex-code store (ivf_pq_excode.h), a second heap file. The file is written to a temporary name and
 // renamed into place, so a crash leaves the previous file or none.
 
 #pragma once

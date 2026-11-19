@@ -12,18 +12,44 @@
 
 #include "bufann/ivf_pq.h"
 #include "bufann/ivf_pq_centroid_graph.h"
+#include "bufann/ivf_pq_excode.h"
 #include "bufann/ivf_pq_fastscan.h"
 #include "bufann/ivf_pq_raw_vector_heap.h"
 
 namespace diskann {
 namespace inplace {
 
+// What one query read from the two on-SSD stores: records and the distinct
+// pages holding them, i.e. the pages a reader with no cache would fetch
+// (whether the buffer pool had them is in its own hit/miss counters).
+constexpr uint32_t IVF_NO_POSTING_POS = 0xFFFFFFFFu;
+
+struct IVFPQQueryIO {
+    uint32_t ex_records = 0, ex_pages = 0;    // 9-bit ex-code store
+    uint32_t raw_vectors = 0, raw_pages = 0;  // raw-vector heap
+};
+
 // Neighbours ascending by dist; fewer than k when the probed partitions hold
 // fewer active vectors. dists are exact squared L2 after a re-rank, PQ
-// approximations without one.
+// approximations without one, and 9-bit estimates for the vectors an ex-code
+// re-rank does not re-rank exactly.
 struct IVFPQSearchResult {
     std::vector<uint32_t> ids;
     std::vector<float> dists;
+    IVFPQQueryIO io;
+};
+
+// Re-rank through the index's 9-bit ex-code store (ivf_pq_excode.h). With
+// `store` set, the rerank_m PQ candidates are first ranked by their 9-bit
+// estimates, read from the store's pages (a partition's candidates share
+// them), and only the `exact` nearest by estimate (0: none) are then fetched
+// from the raw-vector heap and re-ranked exactly; the rest keep their
+// estimates. Vectors inserted since the build have no record and are always
+// re-ranked exactly. `store` must be the heap at ivf_excodes_path opened with
+// index.excodes' layout; exact must be 0 or at least k.
+struct IVFExRerank {
+    const RawVectorHeap* store = nullptr;
+    uint32_t exact = 0;
 };
 
 // Per-query probe depth for ivf_pq_search_graph; off (tau == 0) by default.
@@ -60,14 +86,20 @@ struct IVFRerankSchedule {
 // table, scanning the codes, picking the shortlist and its RIDs, fetching its
 // raw vectors (buffer-pool pins, I/O included) and computing exact distances.
 // The phases are back to back, so their sum is the search's own time.
+// With an ex-code re-rank, ex_fetch is reading its records and ex_estimate
+// rotating the query and estimating. The I/O counts sum IVFPQQueryIO.
 struct IVFPQSearchTimes {
     uint64_t centroid_ns = 0, table_ns = 0, scan_ns = 0, select_ns = 0, fetch_ns = 0, rerank_ns = 0;
+    uint64_t ex_fetch_ns = 0, ex_estimate_ns = 0;
     uint64_t queries = 0, reranked = 0, fetch_batches = 0;
+    uint64_t ex_records = 0, ex_pages = 0, raw_pages = 0;
 
     IVFPQSearchTimes& operator+=(const IVFPQSearchTimes& o) {
         centroid_ns += o.centroid_ns, table_ns += o.table_ns, scan_ns += o.scan_ns, select_ns += o.select_ns;
         fetch_ns += o.fetch_ns, rerank_ns += o.rerank_ns;
+        ex_fetch_ns += o.ex_fetch_ns, ex_estimate_ns += o.ex_estimate_ns;
         queries += o.queries, reranked += o.reranked, fetch_batches += o.fetch_batches;
+        ex_records += o.ex_records, ex_pages += o.ex_pages, raw_pages += o.raw_pages;
         return *this;
     }
 };
@@ -83,15 +115,27 @@ struct IVFPQSearchScratch {
     std::vector<float> probe_dist;      // the graph search's squared distances, parallel to probe_order
     std::vector<float> pq_table;        // [chunks x k]
     std::vector<uint32_t> candidates;   // ids scanned from the probed partitions
+    std::vector<uint32_t> candidate_pos;  // their posting positions; IVF_NO_POSTING_POS for inserts
     std::vector<float> pq_dist;         // parallel to candidates
     std::vector<uint32_t> order;        // selection workspace over candidates
     std::vector<uint32_t> shortlist;    // ids kept for the re-rank
     std::vector<uint32_t> shortlist_slot;  // their heap slots, parallel to shortlist
+    std::vector<uint32_t> shortlist_pos;   // their posting positions, parallel to shortlist
     std::vector<float> exact_dist;      // parallel to shortlist
     std::vector<float> top_exact;       // max-heap of the k smallest exact distances so far
     std::vector<char> raw_vectors;      // [shortlist x heap elem_size]
     std::vector<uint32_t> owners;       // parallel to shortlist
     std::vector<float> vector;          // [dim]
+    std::vector<uint32_t> pages;        // page ids, for counting distinct ones
+    // The ex-code re-rank (IVFExRerank).
+    IVFExQuery ex_query;
+    std::vector<uint32_t> ex_index;     // shortlist entries with a record, by posting position
+    std::vector<uint32_t> ex_slots;     // their store slots
+    std::vector<char> ex_records;       // [ex_index x record bytes]
+    std::vector<uint32_t> ex_owners;
+    std::vector<float> ex_est;          // parallel to ex_index
+    std::vector<uint32_t> approx_ids;   // kept with their estimates, not re-ranked exactly
+    std::vector<float> approx_dists;
     IVFCentroidGraphScratch graph;      // ivf_pq_search_graph only
     // The SIMD scan (ivf_pq_fastscan.h), used when rerank_m > 0, the codes
     // are 8-bit, the index has blocked codes, the CPU has AVX-512 VBMI and
@@ -100,7 +144,8 @@ struct IVFPQSearchScratch {
     IVFPQQuantizedTable qtable;
     std::vector<float> sample;          // float PQ distances that set the table's range
     std::vector<uint16_t> block_sums;   // one list's sums, [IVF_FASTSCAN_BLOCK x its blocks]
-    std::vector<std::pair<uint16_t, uint32_t>> top;  // max-heap: quantized distance, candidate id
+    // max-heap: quantized distance, then candidate id << 32 | its posting position
+    std::vector<std::pair<uint16_t, uint64_t>> top;
 };
 
 // T is the raw vector element type the heap holds (float, uint8_t, int8_t);
@@ -114,12 +159,13 @@ struct IVFPQSearchScratch {
 // written (ivf_pq_insert), scanned in the probed partitions like the base
 // vectors, and withholds the deleted ones (ivf_pq_delete); searches may run
 // concurrently with inserts into and deletes from it. `rerank` sets how the
-// re-rank fetches its vectors (IVFRerankSchedule).
+// re-rank fetches its vectors (IVFRerankSchedule), and `ex` whether it goes
+// through the 9-bit ex-code store first (IVFExRerank).
 template<typename T>
 IVFPQSearchResult ivf_pq_search(const IVFPQIndex& index, const RawVectorHeap& heap, const float* query,
                                 uint32_t k, uint32_t nprobe, uint32_t rerank_m,
                                 IVFPQSearchScratch& scratch, const IVFPQDelta* delta = nullptr,
-                                const IVFRerankSchedule& rerank = {});
+                                const IVFRerankSchedule& rerank = {}, const IVFExRerank& ex = {});
 
 // As ivf_pq_search, but the probed partitions are the nprobe nearest
 // centroids that a search of `graph` with a beam of centroid_L >= nprobe
@@ -128,13 +174,14 @@ IVFPQSearchResult ivf_pq_search(const IVFPQIndex& index, const RawVectorHeap& he
 // all nlist, and may miss a partition the GEMV would probe. `graph` must be
 // built from index.meta; only its nlist is checked. With `cutoff` on, the
 // nprobe partitions found are cut per query (IVFProbeCutoff); `rerank` sets
-// how the re-rank fetches its vectors (IVFRerankSchedule).
+// how the re-rank fetches its vectors (IVFRerankSchedule), `ex` as for
+// ivf_pq_search.
 template<typename T>
 IVFPQSearchResult ivf_pq_search_graph(const IVFPQIndex& index, const IVFCentroidGraph& graph,
                                       const RawVectorHeap& heap, const float* query, uint32_t k, uint32_t nprobe,
                                       uint32_t centroid_L, uint32_t rerank_m, IVFPQSearchScratch& scratch,
                                       const IVFPQDelta* delta = nullptr, const IVFProbeCutoff& cutoff = {},
-                                      const IVFRerankSchedule& rerank = {});
+                                      const IVFRerankSchedule& rerank = {}, const IVFExRerank& ex = {});
 
 // Allocates a scratch per call; for one-off queries.
 template<typename T>
