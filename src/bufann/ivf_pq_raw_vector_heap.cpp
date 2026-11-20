@@ -400,24 +400,67 @@ void RawVectorHeap::read_vectors(const uint32_t* flat_slots, size_t n, char* out
         const size_t m = std::min(batch, n - first);
         for (size_t j = 0; j < m; ++j) page_ids[j] = _layout.page_of(flat_slots[first + j]);
         _pool->pin_batch(page_ids, frames, m, FrameRegion::QUERY);
-        struct UnpinAll {
-            BufferPool& pool;
-            PageFrame** frames;
-            size_t m;
-            ~UnpinAll() {
-                for (size_t j = 0; j < m; ++j) pool.unpin_frame(frames[j], false, FrameRegion::QUERY);
-            }
-        } unpin{*_pool, frames, m};
-        for (size_t j = 0; j < m; ++j) {
-            const size_t i = first + j;
-            const uint32_t index = _layout.index_in_page(flat_slots[i]);
-            std::shared_lock<std::shared_mutex> latch(frames[j]->data_lock);
-            require_page_header(frames[j]->data, _layout, page_ids[j]);
-            std::memcpy(out + i * _layout.elem_size, frames[j]->data + _layout.slot_offset_in_page(index),
-                        _layout.elem_size);
-            std::memcpy(&owners[i], frames[j]->data + _layout.owner_offset_in_page(index), RAW_VECTOR_OWNER_BYTES);
-        }
+        copy_pinned(flat_slots + first, page_ids, frames, m, out + first * _layout.elem_size, owners + first);
     }
+}
+
+// Copies the n pinned slots out and unpins their frames, even on a throw.
+void RawVectorHeap::copy_pinned(const uint32_t* flat_slots, const uint32_t* page_ids, PageFrame** frames, size_t n,
+                                char* out, uint32_t* owners) const {
+    struct UnpinAll {
+        BufferPool& pool;
+        PageFrame** frames;
+        size_t n;
+        ~UnpinAll() {
+            for (size_t j = 0; j < n; ++j) pool.unpin_frame(frames[j], false, FrameRegion::QUERY);
+        }
+    } unpin{*_pool, frames, n};
+    for (size_t i = 0; i < n; ++i) {
+        const uint32_t index = _layout.index_in_page(flat_slots[i]);
+        std::shared_lock<std::shared_mutex> latch(frames[i]->data_lock);
+        require_page_header(frames[i]->data, _layout, page_ids[i]);
+        std::memcpy(out + i * _layout.elem_size, frames[i]->data + _layout.slot_offset_in_page(index),
+                    _layout.elem_size);
+        std::memcpy(&owners[i], frames[i]->data + _layout.owner_offset_in_page(index), RAW_VECTOR_OWNER_BYTES);
+    }
+}
+
+struct RawVectorHeap::PendingRead::Ticket {
+    BufferPool::PinTicket pin;
+};
+
+RawVectorHeap::PendingRead::PendingRead() : _ticket(new Ticket) {}
+RawVectorHeap::PendingRead::~PendingRead() = default;
+
+uint32_t RawVectorHeap::buffer_pool_frames() const { return _pool ? _pool->num_frames() : 0; }
+
+size_t RawVectorHeap::async_batch_max() const {
+    return _pool ? std::clamp<size_t>(_pool->num_frames() / 64, 1, BufferPool::kPinBatchMax) : SIZE_MAX;
+}
+
+void RawVectorHeap::read_vectors_submit(const uint32_t* flat_slots, size_t n, PendingRead& pending) const {
+    IVF_PQ_REQUIRE(n <= async_batch_max(), "read_vectors_submit: more slots than async_batch_max()");
+    for (size_t i = 0; i < n; ++i) require_allocated(flat_slots[i]);
+    pending._slots.assign(flat_slots, flat_slots + n);
+    if (!_pool) return;
+    pending._page_ids.resize(n);
+    for (size_t j = 0; j < n; ++j) pending._page_ids[j] = _layout.page_of(flat_slots[j]);
+    _pool->pin_batch_submit(pending._page_ids.data(), n, pending._ticket->pin, FrameRegion::QUERY);
+}
+
+bool RawVectorHeap::read_vectors_ready(PendingRead& pending) const {
+    return !_pool || _pool->pin_batch_ready(pending._ticket->pin);
+}
+
+void RawVectorHeap::read_vectors_complete(PendingRead& pending, char* out, uint32_t* owners) const {
+    const size_t n = pending._slots.size();
+    if (!_pool) {
+        for (size_t i = 0; i < n; ++i) owners[i] = read_vector(pending._slots[i], out + i * _layout.elem_size);
+        return;
+    }
+    PageFrame* frames[BufferPool::kPinBatchMax];
+    _pool->pin_batch_wait(pending._ticket->pin, frames);
+    copy_pinned(pending._slots.data(), pending._page_ids.data(), frames, n, out, owners);
 }
 
 bool RawVectorHeap::is_slot_occupied(uint32_t flat_slot) const {

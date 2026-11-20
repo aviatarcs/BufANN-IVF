@@ -739,15 +739,8 @@ PageFrame& BufferPool::pin(uint32_t page_id, FrameRegion hint) {
 
         if (loading_idx != INVALID_PAGE) {
             // Another thread is loading or flushing this frame; wait outside all locks.
-            FrameWaitState* wait_state = _frame_waiters[loading_idx].get();
             auto wait_begin = std::chrono::high_resolution_clock::now();
-            std::unique_lock<std::mutex> wait_lk(wait_state->mtx);
-            wait_state->cv.wait(wait_lk, [&f_ref = _frames[loading_idx], hint] {
-                FrameState st = load_frame_state(f_ref);
-                return st != FrameState::LOADING &&
-                       (st != FrameState::FLUSHING ||
-                        frame_state_allows_pin(f_ref, st, hint));
-            });
+            wait_frame(loading_idx, hint);
             auto wait_end = std::chrono::high_resolution_clock::now();
             if (_stats) {
                 _stats->record_io_ns(
@@ -849,31 +842,85 @@ PageFrame& BufferPool::pin(uint32_t page_id, FrameRegion hint) {
 static_assert(BufferPool::kPinBatchMax <= 256,
               "kPinBatchMax must fit in MAX_EVENTS (256) of linux_aligned_file_reader");
 
-void BufferPool::pin_batch(const uint32_t* page_ids, PageFrame** out_frames,
-                           size_t n, FrameRegion hint,
-                           bool account_sequential_read) {
-    if (n == 0) return;
-    if (n > kPinBatchMax) {
-        throw std::invalid_argument(
-            "BufferPool::pin_batch: size exceeds kPinBatchMax (256)");
-    }
-    assert(_aio_reader && "BufferPool::pin_batch called before init()");
+namespace {
 
-    // Lazy thread registration (PipeANN pattern). Hard-fail if io_setup fails.
-    IOContext bad = (IOContext)(-1);
-    IOContext ctx = _aio_reader->get_ctx();
-    if (ctx == bad) {
-        _aio_reader->register_thread();
-        ctx = _aio_reader->get_ctx();
-    }
-    if (ctx == bad) {
-        throw std::runtime_error(
-            "BufferPool::pin_batch: io_setup failed for this thread");
-    }
+// One libaio context per thread for the split pin_batch, shared by every
+// pool: each request carries its ticket, so a completion finds its way back
+// whichever pool submitted it. Contexts count against the system-wide
+// fs.aio-max-nr (65536 by default), so 512 events, two tickets' worth; a
+// submit beyond that lands completions until the context has room.
+constexpr int kAsyncQueueDepth = 512;
 
+struct ThreadAsyncIO {
+    io_context_t ctx = 0;
+    uint32_t     in_flight = 0;  // submitted, not yet reaped
+    ~ThreadAsyncIO() {
+        if (ctx != 0) io_destroy(ctx);
+    }
+    io_context_t get() {
+        if (ctx == 0) {
+            const int ret = io_setup(kAsyncQueueDepth, &ctx);
+            if (ret != 0) {
+                ctx = 0;
+                throw std::runtime_error("BufferPool::pin_batch_submit: io_setup failed: " +
+                                         std::string(::strerror(-ret)) + " (see fs.aio-max-nr)");
+            }
+        }
+        return ctx;
+    }
+};
+thread_local ThreadAsyncIO t_async_io;
+
+}  // namespace
+
+struct BufferPool::PinTicket::Read {
+    struct iocb cb;
+    PinTicket*  ticket;
+    uint16_t    unique;  // index into the ticket's entries
+};
+
+BufferPool::PinTicket::PinTicket() : _reads(new Read[kPinBatchMax]) {}
+
+BufferPool::PinTicket::~PinTicket() {
+    // A ticket destroyed in flight would leave libaio writing into frames
+    // whose completion nobody records; there is no way to recover from that.
+    if (_pool != nullptr) std::terminate();
+}
+
+// Marks every completion as landed: the frame becomes READY at once, so
+// other threads waiting on it need not wait for its ticket's owner.
+// Returns the number reaped; min_nr > 0 blocks until that many.
+size_t BufferPool::reap_async_reads(long min_nr) {
+    ThreadAsyncIO& aio = t_async_io;
+    if (aio.in_flight == 0) return 0;
+    io_event events[256];
+    struct timespec zero{0, 0};
+    const long max_nr = std::min<long>(256, aio.in_flight);
+    min_nr = std::min(min_nr, max_nr);
+    long got;
+    do {
+        got = io_getevents(aio.ctx, min_nr, max_nr, events, min_nr > 0 ? nullptr : &zero);
+    } while (got == -EINTR);
+    if (got < 0) {
+        throw std::runtime_error("BufferPool: io_getevents failed: " + std::string(::strerror(int(-got))));
+    }
+    for (long i = 0; i < got; ++i) {
+        auto* read = static_cast<PinTicket::Read*>(events[i].data);
+        if (events[i].res != read->cb.u.c.nbytes) {
+            throw std::runtime_error("BufferPool: async page read returned " + std::to_string(long(events[i].res)) +
+                                     " of " + std::to_string(read->cb.u.c.nbytes) + " bytes");
+        }
+        PinTicket& t = *read->ticket;
+        t._pool->mark_loaded(t._unique_ids[read->unique], t._entries[read->unique], t._hint);
+        --t._pending;
+    }
+    aio.in_flight -= uint32_t(got);
+    return size_t(got);
+}
+
+size_t BufferPool::classify_batch(const uint32_t* page_ids, size_t n, FrameRegion hint, uint32_t* unique_ids,
+                                  uint16_t* slot_to_unique, BatchEntry* entries, std::vector<AlignedRead>& reqs) {
     // --- Step A: dedupe page_ids ---
-    uint32_t unique_ids[kPinBatchMax];
-    uint16_t slot_to_unique[kPinBatchMax];
     size_t n_unique = 0;
     for (size_t i = 0; i < n; ++i) {
         const uint32_t pid = page_ids[i];
@@ -886,17 +933,6 @@ void BufferPool::pin_batch(const uint32_t* page_ids, PageFrame** out_frames,
             unique_ids[n_unique++] = pid;
         }
     }
-
-    enum Kind : uint8_t { K_HIT = 0, K_WAIT_OTHER = 1, K_MISS_OURS = 2 };
-    struct Entry {
-        PageFrame* frame;
-        uint32_t   frame_idx;     // valid for WAIT_OTHER, MISS_OURS
-        Kind       kind;
-        bool       used_eviction; // MISS_OURS only
-    };
-    Entry entries[kPinBatchMax];
-    std::vector<AlignedRead> reqs;
-    reqs.reserve(n_unique);
 
     // --- Step B: per-unique classification (one pin per unique frame) ---
     for (size_t u = 0; u < n_unique; ++u) {
@@ -937,11 +973,11 @@ void BufferPool::pin_batch(const uint32_t* page_ids, PageFrame** out_frames,
                 }
             });
             if (hit_frame) {
-                entries[u] = Entry{ hit_frame, INVALID_PAGE, K_HIT, false };
+                entries[u] = BatchEntry{ hit_frame, INVALID_PAGE, BatchKind::HIT, false };
                 break;
             }
             if (loading_idx != INVALID_PAGE) {
-                entries[u] = Entry{ &_frames[loading_idx], loading_idx, K_WAIT_OTHER, false };
+                entries[u] = BatchEntry{ &_frames[loading_idx], loading_idx, BatchKind::WAIT_OTHER, false };
                 break;
             }
             if (retry) {
@@ -971,7 +1007,7 @@ void BufferPool::pin_batch(const uint32_t* page_ids, PageFrame** out_frames,
             f.dirty.store(false, std::memory_order_release);
             f.ref_bit.store(1, std::memory_order_release);
             // State is LOADING (set by evict_one's finish_evict path).
-            entries[u] = Entry{ &f, frame_idx, K_MISS_OURS, used_eviction };
+            entries[u] = BatchEntry{ &f, frame_idx, BatchKind::MISS_OURS, used_eviction };
             reqs.push_back(AlignedRead{
                 static_cast<uint64_t>(page_id) * static_cast<uint64_t>(_page_size),
                 static_cast<uint64_t>(_page_size),
@@ -980,48 +1016,62 @@ void BufferPool::pin_batch(const uint32_t* page_ids, PageFrame** out_frames,
             break;
         }
     }
+    return n_unique;
+}
 
-    // --- Step C: batched libaio read for MISS_OURS ---
-    uint64_t n_miss = 0, n_with_evict = 0, n_no_evict = 0;
-    uint64_t batch_ns = 0;
-    if (!reqs.empty()) {
-        const auto io_begin = std::chrono::high_resolution_clock::now();
-        _aio_reader->read(reqs, ctx);
-        const auto io_end = std::chrono::high_resolution_clock::now();
-        batch_ns = static_cast<uint64_t>(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(io_end - io_begin).count());
-
-        // --- Step D: transition MISS_OURS frames to READY, notify waiters ---
-        for (size_t u = 0; u < n_unique; ++u) {
-            if (entries[u].kind != K_MISS_OURS) continue;
-            auto& f = *entries[u].frame;
-            store_frame_state(f, FrameState::READY);
-            {
-                std::lock_guard<std::mutex> wait_lk(_frame_waiters[entries[u].frame_idx]->mtx);
-            }
-            _frame_waiters[entries[u].frame_idx]->cv.notify_all();
-            if (hint == FrameRegion::QUERY) {
-                publish_resident_frame(unique_ids[u], entries[u].frame_idx);
-            }
-            ++n_miss;
-            if (entries[u].used_eviction) ++n_with_evict;
-            else                          ++n_no_evict;
-        }
+void BufferPool::mark_loaded(uint32_t page_id, const BatchEntry& entry, FrameRegion hint) {
+    auto& f = *entry.frame;
+    store_frame_state(f, FrameState::READY);
+    {
+        std::lock_guard<std::mutex> wait_lk(_frame_waiters[entry.frame_idx]->mtx);
     }
+    _frame_waiters[entry.frame_idx]->cv.notify_all();
+    if (hint == FrameRegion::QUERY) {
+        publish_resident_frame(page_id, entry.frame_idx);
+    }
+}
 
-    // --- Step E: CV-wait WAIT_OTHER entries ---
+void BufferPool::wait_frame(uint32_t frame_idx, FrameRegion hint) {
+    FrameWaitState* wait_state = _frame_waiters[frame_idx].get();
+    auto& f_ref = _frames[frame_idx];
+    auto loaded = [&f_ref, hint] {
+        FrameState st = load_frame_state(f_ref);
+        return st != FrameState::LOADING &&
+               (st != FrameState::FLUSHING ||
+                frame_state_allows_pin(f_ref, st, hint));
+    };
+    std::unique_lock<std::mutex> wait_lk(wait_state->mtx);
+    if (t_async_io.in_flight == 0) {
+        wait_state->cv.wait(wait_lk, loaded);
+        return;
+    }
+    // The loader may be waiting on a page this thread submitted: keep
+    // landing this thread's reads while waiting.
+    while (!loaded()) {
+        wait_lk.unlock();
+        reap_async_reads(0);
+        wait_lk.lock();
+        if (loaded()) break;
+        wait_state->cv.wait_for(wait_lk, std::chrono::microseconds(20));
+    }
+}
+
+void BufferPool::finish_batch(size_t n, size_t n_unique, const uint16_t* slot_to_unique, const BatchEntry* entries,
+                              FrameRegion hint, PageFrame** out_frames, uint64_t io_ns,
+                              bool account_sequential_read) {
+    // --- Step E: wait for the WAIT_OTHER entries ---
     for (size_t u = 0; u < n_unique; ++u) {
-        if (entries[u].kind != K_WAIT_OTHER) continue;
-        FrameWaitState* wait_state = _frame_waiters[entries[u].frame_idx].get();
-        auto& f_ref = *entries[u].frame;
-        std::unique_lock<std::mutex> wait_lk(wait_state->mtx);
-        wait_state->cv.wait(wait_lk, [&f_ref, hint] {
-            FrameState st = load_frame_state(f_ref);
-            return st != FrameState::LOADING &&
-                   (st != FrameState::FLUSHING ||
-                    frame_state_allows_pin(f_ref, st, hint));
-        });
+        if (entries[u].kind == BatchKind::WAIT_OTHER) wait_frame(entries[u].frame_idx, hint);
     }
+
+    uint64_t n_miss = 0, n_with_evict = 0, n_no_evict = 0;
+    for (size_t u = 0; u < n_unique; ++u) {
+        if (entries[u].kind != BatchKind::MISS_OURS) continue;
+        ++n_miss;
+        if (entries[u].used_eviction) ++n_with_evict;
+        else                          ++n_no_evict;
+    }
+    const uint64_t batch_ns = io_ns;
 
     // --- Step F: extra pins for duplicate slots ---
     uint16_t pin_count_per_unique[kPinBatchMax] = {0};
@@ -1029,7 +1079,7 @@ void BufferPool::pin_batch(const uint32_t* page_ids, PageFrame** out_frames,
     uint64_t logical_hits = 0;
     uint64_t logical_misses = 0;
     for (size_t u = 0; u < n_unique; ++u) {
-        if (entries[u].kind != K_MISS_OURS) {
+        if (entries[u].kind != BatchKind::MISS_OURS) {
             logical_hits += pin_count_per_unique[u];
         } else {
             logical_misses += pin_count_per_unique[u];
@@ -1082,6 +1132,115 @@ void BufferPool::pin_batch(const uint32_t* page_ids, PageFrame** out_frames,
             }
         }
     }
+}
+
+void BufferPool::pin_batch(const uint32_t* page_ids, PageFrame** out_frames,
+                           size_t n, FrameRegion hint,
+                           bool account_sequential_read) {
+    if (n == 0) return;
+    if (n > kPinBatchMax) {
+        throw std::invalid_argument(
+            "BufferPool::pin_batch: size exceeds kPinBatchMax (256)");
+    }
+    assert(_aio_reader && "BufferPool::pin_batch called before init()");
+
+    // Lazy thread registration (PipeANN pattern). Hard-fail if io_setup fails.
+    IOContext bad = (IOContext)(-1);
+    IOContext ctx = _aio_reader->get_ctx();
+    if (ctx == bad) {
+        _aio_reader->register_thread();
+        ctx = _aio_reader->get_ctx();
+    }
+    if (ctx == bad) {
+        throw std::runtime_error(
+            "BufferPool::pin_batch: io_setup failed for this thread");
+    }
+
+    uint32_t unique_ids[kPinBatchMax];
+    uint16_t slot_to_unique[kPinBatchMax];
+    BatchEntry entries[kPinBatchMax];
+    std::vector<AlignedRead> reqs;
+    reqs.reserve(n);
+    const size_t n_unique = classify_batch(page_ids, n, hint, unique_ids, slot_to_unique, entries, reqs);
+
+    // --- Step C: batched libaio read for MISS_OURS ---
+    uint64_t batch_ns = 0;
+    if (!reqs.empty()) {
+        const auto io_begin = std::chrono::high_resolution_clock::now();
+        _aio_reader->read(reqs, ctx);
+        const auto io_end = std::chrono::high_resolution_clock::now();
+        batch_ns = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(io_end - io_begin).count());
+
+        // --- Step D: transition MISS_OURS frames to READY, notify waiters ---
+        for (size_t u = 0; u < n_unique; ++u) {
+            if (entries[u].kind == BatchKind::MISS_OURS) mark_loaded(unique_ids[u], entries[u], hint);
+        }
+    }
+    finish_batch(n, n_unique, slot_to_unique, entries, hint, out_frames, batch_ns, account_sequential_read);
+}
+
+void BufferPool::pin_batch_submit(const uint32_t* page_ids, size_t n, PinTicket& ticket, FrameRegion hint) {
+    if (ticket.in_flight()) throw std::logic_error("BufferPool::pin_batch_submit: ticket is already in flight");
+    if (n > kPinBatchMax) {
+        throw std::invalid_argument(
+            "BufferPool::pin_batch_submit: size exceeds kPinBatchMax (256)");
+    }
+    ThreadAsyncIO& aio = t_async_io;
+    const io_context_t ctx = aio.get();
+    std::vector<AlignedRead> reqs;
+    reqs.reserve(n);
+    ticket._hint = hint;
+    ticket._n = n;
+    ticket._wait_ns = 0;
+    ticket._n_unique = classify_batch(page_ids, n, hint, ticket._unique_ids, ticket._slot_to_unique,
+                                      ticket._entries, reqs);
+    ticket._pool = this;
+    // classify_batch appends reads in entry order, so the k-th read is the
+    // k-th MISS_OURS entry.
+    struct iocb* cbs[kPinBatchMax];
+    size_t r = 0;
+    for (size_t u = 0; u < ticket._n_unique; ++u) {
+        if (ticket._entries[u].kind != BatchKind::MISS_OURS) continue;
+        PinTicket::Read& read = ticket._reads[r];
+        io_prep_pread(&read.cb, _heap_fd, reqs[r].buf, reqs[r].len, int64_t(reqs[r].offset));
+        read.cb.data = &read;
+        read.ticket = &ticket;
+        read.unique = uint16_t(u);
+        cbs[r] = &read.cb;
+        ++r;
+    }
+    ticket._pending = uint32_t(r);
+    size_t done = 0;
+    while (done < r) {
+        const int ret = io_submit(ctx, long(r - done), cbs + done);
+        if (ret > 0) {
+            done += size_t(ret);
+            aio.in_flight += uint32_t(ret);
+        } else if (ret == -EAGAIN || ret == 0) {
+            // The context is full: land something and try again.
+            reap_async_reads(1);
+        } else if (ret != -EINTR) {
+            throw std::runtime_error("BufferPool::pin_batch_submit: io_submit failed: " +
+                                     std::string(::strerror(-ret)));
+        }
+    }
+}
+
+bool BufferPool::pin_batch_ready(PinTicket& ticket) {
+    if (ticket._pending > 0) reap_async_reads(0);
+    return ticket._pending == 0;
+}
+
+void BufferPool::pin_batch_wait(PinTicket& ticket, PageFrame** out_frames) {
+    if (ticket._pool != this) throw std::logic_error("BufferPool::pin_batch_wait: ticket was not submitted to this pool");
+    const auto wait_begin = std::chrono::high_resolution_clock::now();
+    while (ticket._pending > 0) reap_async_reads(1);
+    const uint64_t wait_ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::high_resolution_clock::now() - wait_begin).count());
+    ticket._pool = nullptr;
+    finish_batch(ticket._n, ticket._n_unique, ticket._slot_to_unique, ticket._entries, ticket._hint, out_frames,
+                 wait_ns, false);
 }
 
 PageFrame* BufferPool::try_pin_resident(uint32_t page_id, FrameRegion hint) {

@@ -1015,6 +1015,174 @@ bool test_buffer_pool_needs_direct_io_pages() {
 
 }  // namespace
 
+// read_vectors_submit/complete with 3 reads in flight per thread, 32
+// threads, through a pool smaller than the heap: every completed read holds
+// its own slots' vectors, though threads wait on pages another thread's
+// unreaped read is loading (a thread with reads in flight lands its own
+// completions while it waits, else two such threads would deadlock; the
+// watchdog fails the test then). Then the guards: more slots than
+// async_batch_max(), and a pending read submitted twice.
+bool test_split_reads_in_flight_under_eviction() {
+    TestCase t("32 threads with 3 split reads each in flight through 4096 frames, reading 8192 pages, get their own slots");
+    std::string path = temp_path("ivf_heap_pool_split");
+    RawVectorHeapLayout layout = compute_raw_vector_heap_layout(PAGE, 128);
+    // Every read misses more often than not, and 32 x 3 x 16 pages in
+    // flight over 8192 make one thread's read wait on another's often.
+    const uint32_t pages = 8192, n = pages * layout.slots_per_page, per_read = 16, depth = 3;
+    ::unlink(path.c_str());
+    {
+        RawVectorHeap heap;
+        heap.open(path, layout);
+        RawVectorHeapBulkWriter writer(heap, 256);
+        std::vector<char> v(128, 0);
+        for (uint32_t i = 0; i < n; ++i) {
+            std::memcpy(v.data(), &i, 4);
+            writer.append(i, v.data());
+        }
+        writer.finish();
+    }
+    InPlaceIOStats stats;
+    RawVectorHeap heap;
+    heap.open_existing(path, layout, n, pages, RawVectorHeapCache{4096, &stats});
+
+    std::atomic<bool> stop{false}, finished{false};
+    std::atomic<uint64_t> reads{0}, wrong{0}, thrown{0};
+    std::thread watchdog([&] {
+        for (int i = 0; i < 600 && !finished.load(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        if (!finished.load()) {
+            std::cout << "  FAIL: split readers still running 55 s after being stopped (deadlock)" << std::endl;
+            std::_Exit(1);
+        }
+    });
+    std::vector<std::thread> readers;
+    for (uint32_t r = 0; r < 32; ++r) {
+        readers.emplace_back([&, r] {
+            std::mt19937 rng(r);
+            std::vector<RawVectorHeap::PendingRead> pending(depth);
+            std::vector<std::vector<uint32_t>> slots(depth, std::vector<uint32_t>(per_read));
+            std::vector<uint32_t> owners(per_read);
+            std::vector<char> out(per_read * 128);
+            auto submit = [&](uint32_t i) {
+                for (uint32_t& s : slots[i]) s = rng() % n;
+                heap.read_vectors_submit(slots[i].data(), per_read, pending[i]);
+            };
+            auto complete = [&](uint32_t i) {
+                try {
+                    heap.read_vectors_complete(pending[i], out.data(), owners.data());
+                } catch (const diskann::ANNException&) {
+                    thrown.fetch_add(1);
+                    return;
+                }
+                for (uint32_t j = 0; j < per_read; ++j) {
+                    uint32_t id;
+                    std::memcpy(&id, out.data() + j * 128, 4);
+                    wrong += owners[j] != slots[i][j] || id != slots[i][j];
+                }
+                reads.fetch_add(1);
+            };
+            for (uint32_t i = 0; i < depth; ++i) submit(i);
+            for (uint32_t i = 0; !stop.load(); i = (i + 1) % depth) {
+                heap.read_vectors_ready(pending[(i + 1) % depth]);  // lands without blocking
+                complete(i);
+                submit(i);
+            }
+            for (uint32_t i = 0; i < depth; ++i) complete(i);
+        });
+    }
+    std::this_thread::sleep_for(std::chrono::seconds(5));
+    stop.store(true);
+    for (auto& th : readers) th.join();
+    finished.store(true);
+    watchdog.join();
+
+    t.check(thrown.load() == 0, std::to_string(thrown.load()) + " reads were handed another page");
+    t.check(wrong.load() == 0, std::to_string(wrong.load()) + " slots read back another vector's bytes");
+    t.check(reads.load() > 1000, "only " + std::to_string(reads.load()) + " reads ran");
+    t.check(stats.evictions.load() > 0, "nothing was evicted; the pool did not run short");
+
+    std::vector<uint32_t> too_many(heap.async_batch_max() + 1, 0);
+    RawVectorHeap::PendingRead p;
+    t.expect_throw("more slots than async_batch_max()",
+                   [&] { heap.read_vectors_submit(too_many.data(), too_many.size(), p); });
+    std::vector<uint32_t> two{1, 2};
+    heap.read_vectors_submit(two.data(), two.size(), p);
+    t.expect_throw_any("a pending read submitted again before completing",
+                       [&] { heap.read_vectors_submit(two.data(), two.size(), p); });
+    std::vector<uint32_t> owners(2);
+    std::vector<char> out(2 * 128);
+    heap.read_vectors_complete(p, out.data(), owners.data());
+    t.check(owners[0] == 1 && owners[1] == 2, "the pending read's own slots did not come back");
+    heap.close();
+    ::unlink(path.c_str());
+    return t.done();
+}
+
+// Two threads each submit a read of one page and leave it unreaped (P by A,
+// Q by B), then each submits a read of the other's page, which finds it
+// LOADING and has no read of its own to wait for. Completing the second
+// reads makes A wait on B's load and B on A's: each must land its own first
+// read while it waits, or the two wait for ever (the watchdog fails then).
+bool test_crossed_waits_on_unreaped_loads() {
+    TestCase t("two threads waiting on each other's unreaped page loads both complete");
+    std::string path = temp_path("ivf_heap_pool_crossed");
+    RawVectorHeapLayout layout = compute_raw_vector_heap_layout(PAGE, 128);
+    const uint32_t pages = 64, n = pages * layout.slots_per_page;
+    ::unlink(path.c_str());
+    {
+        RawVectorHeap heap;
+        heap.open(path, layout);
+        RawVectorHeapBulkWriter writer(heap, 64);
+        std::vector<char> v(128, 0);
+        for (uint32_t i = 0; i < n; ++i) {
+            std::memcpy(v.data(), &i, 4);
+            writer.append(i, v.data());
+        }
+        writer.finish();
+    }
+    RawVectorHeap heap;
+    heap.open_existing(path, layout, n, pages, RawVectorHeapCache{64, nullptr});
+    const uint32_t slot_p = 3 * layout.slots_per_page, slot_q = 9 * layout.slots_per_page + 1;
+
+    std::atomic<int> step{0};
+    auto wait_step = [&](int s) {
+        while (step.load() < s) std::this_thread::yield();
+    };
+    std::atomic<bool> finished{false};
+    std::thread watchdog([&] {
+        for (int i = 0; i < 300 && !finished.load(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        if (!finished.load()) {
+            std::cout << "  FAIL: crossed waits still blocked after 30 s (deadlock)" << std::endl;
+            std::_Exit(1);
+        }
+    });
+    std::atomic<uint32_t> wrong{0};
+    auto run = [&](uint32_t own, uint32_t other, int me) {
+        RawVectorHeap::PendingRead first, second;
+        heap.read_vectors_submit(&own, 1, first);  // loads, never reaped before the crossing
+        step.fetch_add(1);
+        wait_step(2);
+        heap.read_vectors_submit(&other, 1, second);  // the other thread's page, LOADING
+        step.fetch_add(1);
+        wait_step(4);
+        std::this_thread::sleep_for(std::chrono::milliseconds(me == 0 ? 50 : 0));  // both reads have landed
+        uint32_t owner = 0;
+        std::vector<char> out(128);
+        heap.read_vectors_complete(second, out.data(), &owner);
+        wrong += owner != other;
+        heap.read_vectors_complete(first, out.data(), &owner);
+        wrong += owner != own;
+    };
+    std::thread a(run, slot_p, slot_q, 0), b(run, slot_q, slot_p, 1);
+    a.join();
+    b.join();
+    finished.store(true);
+    watchdog.join();
+    t.check(wrong.load() == 0, std::to_string(wrong.load()) + " crossed reads came back with another slot");
+    heap.close();
+    ::unlink(path.c_str());
+    return t.done();
+}
+
 int main() {
     bool all_pass = true;
     for (uint32_t frames : {0u, 64u}) {
@@ -1042,6 +1210,8 @@ int main() {
     g_cache = RawVectorHeapCache{};
     all_pass &= test_buffer_pool_evicts_and_writes_back();
     all_pass &= test_buffer_pool_concurrent_batches_under_eviction();
+    all_pass &= test_split_reads_in_flight_under_eviction();
+    all_pass &= test_crossed_waits_on_unreaped_loads();
     all_pass &= test_buffer_pool_needs_direct_io_pages();
     return all_pass ? 0 : 1;
 }

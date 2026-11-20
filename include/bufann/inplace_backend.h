@@ -30,6 +30,7 @@
 #include "tsl/robin_set.h"
 
 class AlignedFileReader;
+struct AlignedRead;
 
 namespace diskann {
   template<typename T, typename TagT>
@@ -441,6 +442,27 @@ class BufferPool {
     void pin_batch(const uint32_t* page_ids, PageFrame** out_frames,
                    size_t n, FrameRegion hint = FrameRegion::QUERY,
                    bool account_sequential_read = false);
+
+    // pin_batch split in two so the caller can work while the misses are
+    // read. pin_batch_submit pins the hits, claims a frame per miss and
+    // submits the misses' reads (libaio, on a context of the calling thread)
+    // without waiting; pin_batch_wait waits for them and fills out_frames as
+    // pin_batch would, after which the caller unpins each result. Between the
+    // two, the claimed frames are LOADING and other threads pinning those
+    // pages wait for them. A ticket belongs to the thread that submitted it,
+    // which must wait on it before reusing it and may hold several at once.
+    // While a thread has reads in flight, its own waits on frames other
+    // threads are loading poll its completions, so two threads each waiting
+    // on a page the other submitted both progress.
+    class PinTicket;
+    void pin_batch_submit(const uint32_t* page_ids, size_t n, PinTicket& ticket,
+                          FrameRegion hint = FrameRegion::QUERY);
+    // Reaps the calling thread's completed reads without blocking; true once
+    // every read `ticket` submitted has landed (pin_batch_wait then blocks at
+    // most on pages other threads are loading).
+    bool pin_batch_ready(PinTicket& ticket);
+    void pin_batch_wait(PinTicket& ticket, PageFrame** out_frames);
+
     PageFrame*  try_pin_resident(uint32_t page_id,
                                  FrameRegion hint = FrameRegion::QUERY);
     void       unpin_frame(PageFrame* frame, bool dirty = false,
@@ -517,6 +539,30 @@ class BufferPool {
     void record_buffer_pool_write();
     void mark_frame_dirty(PageFrame& frame);
     void reset_residency_directory();
+    // pin_batch's steps, shared with pin_batch_submit/pin_batch_wait.
+    enum class BatchKind : uint8_t { HIT, WAIT_OTHER, MISS_OURS };
+    struct BatchEntry {
+        PageFrame* frame;
+        uint32_t   frame_idx;      // valid for WAIT_OTHER, MISS_OURS
+        BatchKind  kind;
+        bool       used_eviction;  // MISS_OURS only
+    };
+    // Dedupes page_ids and pins or claims a frame per unique page; appends a
+    // read for each MISS_OURS entry to reqs. Returns the unique count.
+    size_t classify_batch(const uint32_t* page_ids, size_t n, FrameRegion hint, uint32_t* unique_ids,
+                          uint16_t* slot_to_unique, BatchEntry* entries, std::vector<AlignedRead>& reqs);
+    // A MISS_OURS frame's read has landed: READY, waiters woken.
+    void mark_loaded(uint32_t page_id, const BatchEntry& entry, FrameRegion hint);
+    // Lands the calling thread's completed split-pin reads (blocking until
+    // min_nr have, if min_nr > 0); returns how many.
+    static size_t reap_async_reads(long min_nr);
+    // Waits until another thread's load (or flush) of the frame is over.
+    void wait_frame(uint32_t frame_idx, FrameRegion hint);
+    // Waits for the WAIT_OTHER entries, pins duplicates, fills out_frames
+    // and records the batch's statistics (io_ns: time blocked on its reads).
+    void finish_batch(size_t n, size_t n_unique, const uint16_t* slot_to_unique, const BatchEntry* entries,
+                      FrameRegion hint, PageFrame** out_frames, uint64_t io_ns, bool account_sequential_read);
+
     uint32_t evict_one(ShardState& shard, FrameRegion preferred,
                        bool* used_eviction_out = nullptr);
     std::vector<std::pair<uint32_t, std::vector<char>>> collect_dirty_frames(ShardState& shard, uint32_t max_frames, bool flush_all);
@@ -546,6 +592,30 @@ class BufferPool {
     std::thread         _flush_thread;
     std::atomic<bool>   _flush_running{false};
     InPlaceIOStats*     _stats = nullptr;
+};
+
+class BufferPool::PinTicket {
+ public:
+    PinTicket();
+    ~PinTicket();
+    PinTicket(const PinTicket&)            = delete;
+    PinTicket& operator=(const PinTicket&) = delete;
+    // Between pin_batch_submit and pin_batch_wait.
+    bool in_flight() const { return _pool != nullptr; }
+
+ private:
+    friend class BufferPool;
+    struct Read;  // one libaio request and the entry it completes
+
+    BufferPool* _pool = nullptr;
+    FrameRegion _hint = FrameRegion::QUERY;
+    size_t      _n = 0, _n_unique = 0;
+    uint32_t    _pending = 0;  // reads submitted, not yet reaped
+    uint64_t    _wait_ns = 0;  // time pin_batch_wait blocked on them
+    uint32_t    _unique_ids[kPinBatchMax];
+    uint16_t    _slot_to_unique[kPinBatchMax];
+    BatchEntry  _entries[kPinBatchMax];
+    std::unique_ptr<Read[]> _reads;  // [kPinBatchMax]
 };
 
 // ---------------------------------------------------------------------------

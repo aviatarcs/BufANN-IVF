@@ -27,6 +27,7 @@ constexpr uint32_t RAW_VECTOR_BITMAP_LOCK_STRIPES = 64;
 constexpr uint32_t RAW_VECTOR_MAX_READERS         = 1024;  // ReadGuards held at once
 
 class BufferPool;
+struct PageFrame;
 struct InPlaceIOStats;
 
 // How the heap's pages reach memory. With buffer_pool_frames == 0 they are
@@ -70,6 +71,8 @@ public:
     // written so far; a no-op without a pool, whose writes go straight to the file.
     void flush();
     bool uses_buffer_pool() const { return _pool != nullptr; }
+    uint32_t buffer_pool_frames() const;  // 0 without a buffer pool
+    size_t max_readers() const { return _readers.size(); }
 
     // Grace period for slot reuse. A reader holds a ReadGuard from before it
     // loads any RID until after its last read_vector; a slot freed while the
@@ -104,6 +107,32 @@ public:
     // missing from it are read in batches of concurrent I/Os (BufANN's batch
     // pin) rather than one read at a time.
     void read_vectors(const uint32_t* flat_slots, size_t n, char* out, uint32_t* owners) const;
+
+    // read_vectors split in two around BufferPool::pin_batch_submit/wait, so
+    // a thread can work while the misses are read: submit pins the slots'
+    // pages and starts the misses' reads, complete waits and copies out as
+    // read_vectors does. Without a buffer pool, submit only records the slots
+    // and complete reads them. n must be at most async_batch_max(); a
+    // pending read belongs to the submitting thread, which must complete it.
+    class PendingRead {
+    public:
+        PendingRead();
+        ~PendingRead();
+        PendingRead(const PendingRead&)            = delete;
+        PendingRead& operator=(const PendingRead&) = delete;
+
+    private:
+        friend class RawVectorHeap;
+        struct Ticket;  // a BufferPool::PinTicket
+        std::unique_ptr<Ticket> _ticket;
+        std::vector<uint32_t> _slots, _page_ids;
+    };
+    size_t async_batch_max() const;
+    void read_vectors_submit(const uint32_t* flat_slots, size_t n, PendingRead& pending) const;
+    // Lands completed reads without blocking; true once complete would wait
+    // on no read of this thread's.
+    bool read_vectors_ready(PendingRead& pending) const;
+    void read_vectors_complete(PendingRead& pending, char* out, uint32_t* owners) const;
     bool is_slot_occupied(uint32_t flat_slot) const;
     // The page's occupancy bitmap (bitmap_bytes) and owner ids (slots_per_page)
     // in one read; verifies the page header.
@@ -155,6 +184,8 @@ private:
     };
 
     int _fd = -1;           // page-cache mode only
+    void copy_pinned(const uint32_t* flat_slots, const uint32_t* page_ids, PageFrame** frames, size_t n, char* out,
+                     uint32_t* owners) const;
     std::unique_ptr<BufferPool> _pool;  // buffer-pool mode only; owns its own O_DIRECT descriptor
     RawVectorHeapLayout _layout;
     std::mutex _grow_mtx;
