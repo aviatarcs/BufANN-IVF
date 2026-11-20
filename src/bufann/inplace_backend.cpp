@@ -559,6 +559,7 @@ uint32_t BufferPool::evict_one(ShardState& shard, FrameRegion preferred,
             _mm_pause();
         }
         local_wait_pins_ns += elapsed_ns(wait_begin);
+        if (_after_evict_drain_hook) _after_evict_drain_hook(f);
         const bool was_dirty = f.dirty.exchange(false, std::memory_order_acq_rel);
         if (was_dirty) {
             _dirty_frame_count.fetch_sub(1, std::memory_order_relaxed);
@@ -571,8 +572,11 @@ uint32_t BufferPool::evict_one(ShardState& shard, FrameRegion preferred,
         }
         f.page_id.store(INVALID_PAGE, std::memory_order_release);
         f.generation.fetch_add(1, std::memory_order_acq_rel);
-        f.pin_count.store(0, std::memory_order_release);
-        f.update_pin_count.store(0, std::memory_order_release);
+        // pin_count is not reset: it is zero but for pinners that raced the
+        // drain above, read EVICTING and are about to unpin. Overwriting
+        // their pin would let their unpin take the next owner's pin (the
+        // frame is then evicted under its reader) or wrap the count to
+        // 2^32 - 1, pinning the frame for good.
         f.ref_bit.store(0, std::memory_order_release);
         store_frame_state(f, FrameState::LOADING);
         if (was_dirty) {
@@ -677,8 +681,20 @@ uint32_t BufferPool::evict_one(ShardState& shard, FrameRegion preferred,
 
     const ClockClaim claim = claim_clock_frame();
     if (claim.idx == INVALID_PAGE) {
-        throw ANNException("BufferPool: no reusable frame found by CLOCK scan", -1,
-                           __FUNCSIG__, __FILE__, __LINE__);
+        uint32_t pinned = 0, loading = 0, evicting = 0, referenced = 0;
+        for (uint32_t i = shard.frame_begin; i < shard.frame_end; ++i) {
+            const auto& f = _frames[i];
+            pinned += f.pin_count.load(std::memory_order_relaxed) > 0;
+            loading += load_frame_state(f) == FrameState::LOADING;
+            evicting += load_frame_state(f) == FrameState::EVICTING;
+            referenced += f.ref_bit.load(std::memory_order_relaxed) != 0;
+        }
+        throw ANNException("BufferPool: no reusable frame found by CLOCK scan of a shard of " +
+                               std::to_string(shard.frame_end - shard.frame_begin) + " frames (" +
+                               std::to_string(pinned) + " pinned, " + std::to_string(loading) + " loading, " +
+                               std::to_string(evicting) + " evicting, " + std::to_string(referenced) +
+                               " referenced)",
+                           -1, __FUNCSIG__, __FILE__, __LINE__);
     }
     if (claim.from_free_frame) {
         return finalize_evict(claim.idx, false);
@@ -800,9 +816,9 @@ PageFrame& BufferPool::pin(uint32_t page_id, FrameRegion hint) {
         const auto frame_setup_begin = std::chrono::steady_clock::now();
         auto& f = _frames[frame_idx];
         f.page_id.store(page_id, std::memory_order_release);
-        f.pin_count.store(1, std::memory_order_release);
-        f.update_pin_count.store(hint == FrameRegion::QUERY ? 0u : 1u,
-                                 std::memory_order_release);
+        // Added, not stored: see finish_evict.
+        f.pin_count.fetch_add(1, std::memory_order_acq_rel);
+        if (hint != FrameRegion::QUERY) f.update_pin_count.fetch_add(1, std::memory_order_acq_rel);
         f.dirty.store(false, std::memory_order_release);
         f.ref_bit.store(1, std::memory_order_release);
         local_frame_setup_ns += elapsed_ns(frame_setup_begin);
@@ -965,9 +981,9 @@ void BufferPool::pin_batch(const uint32_t* page_ids, PageFrame** out_frames,
             if (!we_won) continue;
             auto& f = _frames[frame_idx];
             f.page_id.store(page_id, std::memory_order_release);
-            f.pin_count.store(1, std::memory_order_release);
-            f.update_pin_count.store(hint == FrameRegion::QUERY ? 0u : 1u,
-                                     std::memory_order_release);
+            // Added, not stored: see finish_evict.
+            f.pin_count.fetch_add(1, std::memory_order_acq_rel);
+            if (hint != FrameRegion::QUERY) f.update_pin_count.fetch_add(1, std::memory_order_acq_rel);
             f.dirty.store(false, std::memory_order_release);
             f.ref_bit.store(1, std::memory_order_release);
             // State is LOADING (set by evict_one's finish_evict path).
@@ -1136,12 +1152,9 @@ void BufferPool::unpin_frame(PageFrame* frame, bool dirty, FrameRegion hint) {
         notify_flush_waiters =
             prev_updates == 1 && load_frame_state(*frame) == FrameState::FLUSHING;
     }
-#ifndef NDEBUG
-    uint32_t prev = frame->pin_count.fetch_sub(1, std::memory_order_acq_rel);
+    const uint32_t prev = frame->pin_count.fetch_sub(1, std::memory_order_acq_rel);
     assert(prev > 0);
-#else
-    frame->pin_count.fetch_sub(1, std::memory_order_acq_rel);
-#endif
+    if (prev == 0) _pin_underflows.fetch_add(1, std::memory_order_relaxed);
     if (notify_flush_waiters) {
         // Wake QUERY pins waiting for pre-flush UPDATE pins to drain.
         uint32_t frame_idx = frame->frame_index;
