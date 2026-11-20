@@ -760,8 +760,15 @@ namespace diskann {
     diskann::cout << "nnodes_per_sector: " << nnodes_per_sector << "B"
                   << std::endl;
 
-    // SECTOR_LEN buffer for each sector
-    std::unique_ptr<char[]> sector_buf = std::make_unique<char[]>(SECTOR_LEN);
+    // A node wider than a sector (960-d and wider float vectors at R 64)
+    // gets whole sectors of its own, as in current DiskANN: nnodes_per_sector
+    // is then 0 and node i starts at sector 1 + i * ceil(max_node_len /
+    // SECTOR_LEN). Each block below is one sector of nodes, or one node.
+    const _u64 nodes_per_block = nnodes_per_sector > 0 ? nnodes_per_sector : 1;
+    const _u64 sectors_per_block =
+        nnodes_per_sector > 0 ? 1 : DIV_ROUND_UP(max_node_len, SECTOR_LEN);
+    const _u64 block_len = sectors_per_block * SECTOR_LEN;
+    std::unique_ptr<char[]> sector_buf = std::make_unique<char[]>(block_len);
     std::unique_ptr<char[]> node_buf = std::make_unique<char[]>(max_node_len);
     unsigned &nnbrs = *(unsigned *) (node_buf.get() + ndims_64 * sizeof(T));
     unsigned *nhood_buf =
@@ -769,7 +776,8 @@ namespace diskann {
                       sizeof(unsigned));
 
     // number of sectors (1 for meta data)
-    _u64 n_sectors = ROUND_UP(npts_64, nnodes_per_sector) / nnodes_per_sector;
+    _u64 n_blocks = ROUND_UP(npts_64, nodes_per_block) / nodes_per_block;
+    _u64 n_sectors = n_blocks * sectors_per_block;
     _u64 disk_index_file_size = (n_sectors + 1) * SECTOR_LEN;
 
     std::vector<_u64> output_file_meta;
@@ -790,13 +798,13 @@ namespace diskann {
     std::unique_ptr<T[]> cur_node_coords = std::make_unique<T[]>(ndims_64);
     diskann::cout << "# sectors: " << n_sectors << std::endl;
     _u64 cur_node_id = 0;
-    for (_u64 sector = 0; sector < n_sectors; sector++) {
+    for (_u64 sector = 0; sector < n_blocks; sector++) {
       if (sector % 100000 == 0) {
         diskann::cout << "Sector #" << sector << "written" << std::endl;
       }
-      memset(sector_buf.get(), 0, SECTOR_LEN);
+      memset(sector_buf.get(), 0, block_len);
       for (_u64 sector_node_id = 0;
-           sector_node_id < nnodes_per_sector && cur_node_id < npts_64;
+           sector_node_id < nodes_per_block && cur_node_id < npts_64;
            sector_node_id++) {
         memset(node_buf.get(), 0, max_node_len);
         // read cur node's nnbrs
@@ -839,7 +847,7 @@ namespace diskann {
         cur_node_id++;
       }
       // flush sector to disk
-      diskann_writer.write(sector_buf.get(), SECTOR_LEN);
+      diskann_writer.write(sector_buf.get(), block_len);
     }
     diskann_writer.close();
     size_t tag_bytes_written = 0;
