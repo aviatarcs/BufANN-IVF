@@ -62,16 +62,40 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <exception>
 #include <fstream>
 #include <iostream>
 #include <memory>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace diskann::inplace;
 
 namespace {
+
+// An exception cannot leave an OpenMP region (it terminates the process
+// without printing what()), so each query runs through run() and the first
+// error is rethrown after the region, for main to report.
+class FirstError {
+public:
+    template<typename F>
+    void run(F&& f) {
+        try {
+            f();
+        } catch (...) {
+#pragma omp critical(first_error)
+            if (!_error) _error = std::current_exception();
+        }
+    }
+    void rethrow() {
+        if (_error) std::rethrow_exception(std::exchange(_error, nullptr));
+    }
+
+private:
+    std::exception_ptr _error;
+};
 
 std::string get_arg(int argc, char** argv, const char* name, const std::string& def) {
     for (int i = 1; i + 1 < argc; ++i) {
@@ -302,6 +326,7 @@ int run(int argc, char** argv) {
     for (uint32_t nprobe : nprobes) {
         std::vector<IVFPQSearchResult> res(nq);
         std::vector<double> lat(nq);
+        FirstError errors;
         // Searches `count` rows of `qs`, recording results and latencies
         // only when they are the timed queries.
         auto concurrent = [&](const float* qs, size_t count, bool timed) {
@@ -310,11 +335,14 @@ int run(int argc, char** argv) {
                 IVFPQSearchScratch scratch;
 #pragma omp for schedule(dynamic, 1)
                 for (size_t q = 0; q < count; ++q) {
-                    auto s = std::chrono::steady_clock::now();
-                    IVFPQSearchResult r = ivf_pq_search<T>(ix, heap, qs + q * dim, k, nprobe, rerank_m, scratch);
-                    if (timed) res[q] = std::move(r), lat[q] = seconds_since(s);
+                    errors.run([&] {
+                        auto s = std::chrono::steady_clock::now();
+                        IVFPQSearchResult r = ivf_pq_search<T>(ix, heap, qs + q * dim, k, nprobe, rerank_m, scratch);
+                        if (timed) res[q] = std::move(r), lat[q] = seconds_since(s);
+                    });
                 }
             }
+            errors.rethrow();
         };
         if (!skip_exact) {
             concurrent(warmup_queries.data(), warmup, false);
@@ -388,14 +416,17 @@ int run(int argc, char** argv) {
                     IVFPQSearchScratch scratch;
 #pragma omp for schedule(dynamic, 1)
                     for (size_t q = 0; q < count; ++q) {
-                        auto s = std::chrono::steady_clock::now();
-                        IVFPQSearchResult r = ivf_pq_search_graph<T>(ix, graph, heap, qs + q * dim, k, nprobe, beam,
-                                                                     rm, scratch, nullptr, cutoff, sched, ex);
-                        if (timed) res[q] = std::move(r), lat[q] = seconds_since(s);
+                        errors.run([&] {
+                            auto s = std::chrono::steady_clock::now();
+                            IVFPQSearchResult r = ivf_pq_search_graph<T>(ix, graph, heap, qs + q * dim, k, nprobe,
+                                                                         beam, rm, scratch, nullptr, cutoff, sched, ex);
+                            if (timed) res[q] = std::move(r), lat[q] = seconds_since(s);
+                        });
                     }
 #pragma omp critical
                     if (timed) times += scratch.times;
                 }
+                errors.rethrow();
             };
             concurrent_graph(warmup_queries.data(), warmup, false);
             reset_io();
