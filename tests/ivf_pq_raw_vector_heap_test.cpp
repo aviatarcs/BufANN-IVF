@@ -994,6 +994,62 @@ bool test_buffer_pool_concurrent_batches_under_eviction() {
     return t.done();
 }
 
+// A pinner that found a frame just before an evictor claimed it pins it after
+// the evictor's wait for pins to drain, reads EVICTING and lets go. A pool
+// of 4 frames has 4 shards of one frame, so pages 0, 4 and 8 share a frame.
+// The evictor once reset pin_count to 0 and the new owner stored 1, so the
+// racer's unpin took the owner's pin: the frame was then evicted under its
+// owner, which read another page's bytes, and the owner's own unpin wrapped
+// the count to 2^32 - 1.
+bool test_buffer_pool_racing_pin_keeps_the_next_owners_pin() {
+    TestCase t("a pin taken after an evictor's drain and dropped later leaves the next owner's pin in place");
+    const std::string path = temp_path("ivf_pool_racing_pin");
+    {
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        std::vector<char> page(PAGE, 0);
+        for (uint32_t p = 0; p < 12; ++p) {
+            for (uint32_t off = 0; off < PAGE; off += 4) std::memcpy(page.data() + off, &p, 4);
+            out.write(page.data(), PAGE);
+        }
+    }
+    auto holds = [](const PageFrame& f, uint32_t page) {
+        uint32_t first;
+        std::memcpy(&first, f.data, 4);
+        return first == page;
+    };
+    for (bool batched : {false, true}) {
+        const std::string via = batched ? "pin_batch: " : "pin: ";
+        BufferPool pool;
+        pool.init(PAGE, 4, path, nullptr, 32, 100, false);
+        pool.unpin_frame(&pool.pin(0));
+        PageFrame* racer = nullptr;
+        pool.set_after_evict_drain_hook_for_testing([&](PageFrame& f) {
+            if (racer == nullptr) racer = &f, f.pin_count.fetch_add(1);
+        });
+        PageFrame* owner = nullptr;
+        if (batched) {
+            const uint32_t id = 4;
+            pool.pin_batch(&id, &owner, 1);
+        } else {
+            owner = &pool.pin(4);
+        }
+        t.check(racer == owner, via + "page 4 did not take page 0's frame");
+        pool.unpin_frame(racer);  // the racer read EVICTING and lets go
+        pool.set_after_evict_drain_hook_for_testing(nullptr);
+        t.check(pool.pin_count_of(4) == 1, via + "page 4's owner holds " + std::to_string(pool.pin_count_of(4)) +
+                                               " pins, not 1");
+        // The shard's only frame is pinned by its owner: page 8 must not get it.
+        t.expect_throw(via + "pinning page 8 while page 4's owner holds the shard's only frame",
+                       [&] { pool.unpin_frame(&pool.pin(8)); });
+        t.check(holds(*owner, 4), via + "page 4's owner now reads another page's bytes");
+        pool.unpin_frame(owner);
+        t.check(pool.pin_count_of(4) == 0, via + "page 4 is still pinned after its owner left");
+        t.check(pool.pin_underflows() == 0, via + std::to_string(pool.pin_underflows()) + " unpins found no pin");
+    }
+    ::unlink(path.c_str());
+    return t.done();
+}
+
 bool test_buffer_pool_needs_direct_io_pages() {
     TestCase t("a buffer-pool heap refuses a page_size O_DIRECT cannot read, and creates no file doing so");
     std::string path = temp_path("ivf_heap_pool_page");
@@ -1210,6 +1266,7 @@ int main() {
     g_cache = RawVectorHeapCache{};
     all_pass &= test_buffer_pool_evicts_and_writes_back();
     all_pass &= test_buffer_pool_concurrent_batches_under_eviction();
+    all_pass &= test_buffer_pool_racing_pin_keeps_the_next_owners_pin();
     all_pass &= test_split_reads_in_flight_under_eviction();
     all_pass &= test_crossed_waits_on_unreaped_loads();
     all_pass &= test_buffer_pool_needs_direct_io_pages();
