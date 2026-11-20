@@ -1979,6 +1979,9 @@ static int run_workload(int argc, char **argv) {
         std::stoul(get_arg(argc, argv, "--pq_chunks", "0")));
     cfg.max_dataset_size = static_cast<uint32_t>(
         std::stoul(get_arg(argc, argv, "--max_dataset_size", "0")));
+    // Must match the heap's (fast_convert_diskann_to_inplaceann's page_size).
+    cfg.page_size = static_cast<uint32_t>(
+        std::stoul(get_arg(argc, argv, "--page_size", "4096")));
 
     // IVF-PQ: --index_type ivf_pq selects it; --search_L then sweeps nprobe.
     const std::string index_type = get_arg(argc, argv, "--index_type", "graph");

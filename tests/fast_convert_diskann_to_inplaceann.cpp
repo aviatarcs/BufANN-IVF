@@ -2,7 +2,11 @@
 // pool and writes heap pages + snapshot directly using O_DIRECT parallel IO.
 //
 // Usage: same as convert_diskann_to_inplaceann
-//   <data_type> <diskann_prefix> <output_prefix> <dim> <R> <pq_chunks> <buffer_pool_frames>
+//   <data_type> <diskann_prefix> <output_prefix> <dim> <R> <pq_chunks> <buffer_pool_frames> [page_size]
+// page_size (default 4096) must match the reader's BufANNConfig::page_size;
+// a node larger than a 4 KB page (960-d and wider float vectors at R 64)
+// needs 8192. DiskANN stores such a node over whole sectors of its own
+// (nnodes_per_sector == 0), which is read here as well.
 
 #include <algorithm>
 #include <atomic>
@@ -24,7 +28,6 @@
 #include <vector>
 
 static constexpr uint32_t SECTOR_LEN = 4096;
-static constexpr uint32_t PAGE_SIZE  = 4096;
 static constexpr uint32_t INVALID_NODE = 0xFFFFFFFFu;
 static constexpr uint32_t INVALID_PAGE = 0xFFFFFFFFu;
 
@@ -128,7 +131,7 @@ static void write_bin_u32(const std::string& path, const uint32_t* data, size_t 
 }
 
 int main(int argc, char** argv) {
-    if (argc != 8) {
+    if (argc != 8 && argc != 9) {
         std::cerr << "Usage: " << argv[0]
                   << " <data_type> <diskann_prefix> <output_prefix>"
                   << " <dim> <R> <pq_chunks> <buffer_pool_frames>" << std::endl;
@@ -142,6 +145,11 @@ int main(int argc, char** argv) {
     const uint32_t Mmax          = std::stoul(argv[5]);
     const uint32_t pq_chunks     = std::stoul(argv[6]);
     // argv[7] (buffer_pool_frames) ignored — we bypass the buffer pool
+    const uint32_t PAGE_SIZE     = argc == 9 ? std::stoul(argv[8]) : 4096;
+    if (PAGE_SIZE == 0 || PAGE_SIZE % SECTOR_LEN != 0) {
+        std::cerr << "page_size must be a positive multiple of " << SECTOR_LEN << std::endl;
+        return 1;
+    }
 
     const uint32_t elem_size = (data_type == "float") ? 4 : 1;
     const uint32_t aligned_dim = round_up8(dim);
@@ -224,7 +232,14 @@ int main(int argc, char** argv) {
 
     // Aligned buffers for O_DIRECT
     // +3: ceil(batch/nnps) can grow by 1 when batch starts mid-sector.
-    const size_t read_buf_size = static_cast<size_t>(nodes_per_batch / meta.nnodes_per_sector + 3) * SECTOR_LEN;
+    // A node either shares a sector with others (nnps > 0) or spans
+    // sectors_per_node whole sectors of its own (nnps == 0).
+    const uint64_t nnps = meta.nnodes_per_sector;
+    const uint64_t sectors_per_node = nnps > 0 ? 0 : (meta.max_node_len + SECTOR_LEN - 1) / SECTOR_LEN;
+    auto sector_of = [&](uint64_t n) { return nnps > 0 ? 1 + n / nnps : 1 + n * sectors_per_node; };
+    auto offset_in_sector = [&](uint64_t n) { return nnps > 0 ? (n % nnps) * meta.max_node_len : 0; };
+    const size_t read_buf_size = static_cast<size_t>(
+        (nnps > 0 ? nodes_per_batch / nnps : nodes_per_batch * sectors_per_node) + 3) * SECTOR_LEN;
     void* read_buf_raw = nullptr;
     posix_memalign(&read_buf_raw, 4096, read_buf_size);
     char* read_buf = static_cast<char*>(read_buf_raw);
@@ -256,10 +271,9 @@ int main(int argc, char** argv) {
         // trailing slots (turing nnps=5, nbatch=32768 → recall 0).
         // When node_id % nnps == 0 and batch % nnps == 0 (sift1b/spacev/deep
         // at default BATCH_PAGES), this matches the old sector math exactly.
-        const uint64_t nnps = meta.nnodes_per_sector;
-        src_sector = 1 + node_id / nnps;
+        src_sector = sector_of(node_id);
         const uint64_t last_node = node_id + batch_nodes - 1;
-        const uint64_t last_sector = 1 + last_node / nnps;
+        const uint64_t last_sector = sector_of(last_node) + (nnps > 0 ? 0 : sectors_per_node - 1);
         const uint64_t sectors_needed = last_sector - src_sector + 1;
         uint64_t read_bytes = sectors_needed * SECTOR_LEN;
 
@@ -286,11 +300,9 @@ int main(int argc, char** argv) {
                 uint64_t cur_node = node_id + local_node;
 
                 // Map cur_node into the read buffer (may start mid-sector).
-                const uint64_t abs_sector = 1 + cur_node / nnps;
-                const uint64_t sector_idx = abs_sector - src_sector;
-                const uint64_t slot_in_sector = cur_node % nnps;
+                const uint64_t sector_idx = sector_of(cur_node) - src_sector;
                 const char* diskann_node = read_buf + sector_idx * SECTOR_LEN +
-                                           slot_in_sector * meta.max_node_len;
+                                           offset_in_sector(cur_node);
 
                 // Parse DiskANN node: [vector (dim*elem_size)] [degree (u32)] [neighbors (degree*u32)]
                 const char* vec_data = diskann_node;
