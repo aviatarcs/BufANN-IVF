@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <cstring>
 #include <deque>
+#include <functional>
 #include <immintrin.h>
 #include <memory>
 #include <mutex>
@@ -472,6 +473,16 @@ class BufferPool {
     int heap_fd() const { return _heap_fd; }
     uint32_t total_pages() const { return _total_pages.load(std::memory_order_acquire); }
     uint32_t pin_count_of(uint32_t page_id) const;
+    // Unpins that found a frame's pin count already 0: each one is a pin
+    // that was lost (overwritten, or taken by someone else's unpin), so the
+    // frame could be evicted under its holder. Zero in a correct pool.
+    uint64_t pin_underflows() const { return _pin_underflows.load(std::memory_order_relaxed); }
+    // Tests only: runs in the evicting thread once a claimed frame's pins
+    // have drained, the point a racing pinner can still pin it (and must
+    // then find EVICTING and let go). Set before the pool is shared.
+    void set_after_evict_drain_hook_for_testing(std::function<void(PageFrame&)> hook) {
+        _after_evict_drain_hook = std::move(hook);
+    }
 
  private:
     struct ResidencySegment;
@@ -542,6 +553,8 @@ class BufferPool {
     uint32_t         _flush_budget_pages_per_cycle = 32;
     uint32_t         _flush_wakeup_ms = 100;
     std::atomic<uint32_t> _dirty_frame_count{0};
+    std::atomic<uint64_t> _pin_underflows{0};
+    std::function<void(PageFrame&)> _after_evict_drain_hook;
 
     std::thread         _flush_thread;
     std::atomic<bool>   _flush_running{false};
