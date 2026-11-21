@@ -889,10 +889,13 @@ thread_local ThreadAsyncIO t_async_io;
 
 }  // namespace
 
-struct BufferPool::PinTicket::Read {
-    struct iocb cb;
-    PinTicket*  ticket;
-    uint16_t    unique;  // index into the ticket's entries
+struct BufferPool::PinTicket::Read final : AsyncPageRead {
+    PinTicket* ticket;
+    uint16_t   unique;  // index into the ticket's entries
+    void landed() override {
+        ticket->_pool->mark_loaded(ticket->_unique_ids[unique], ticket->_entries[unique], ticket->_hint);
+        --ticket->_pending;
+    }
 };
 
 BufferPool::PinTicket::PinTicket() : _reads(new Read[kPinBatchMax]) {}
@@ -906,7 +909,7 @@ BufferPool::PinTicket::~PinTicket() {
 // Marks every completion as landed: the frame becomes READY at once, so
 // other threads waiting on it need not wait for its ticket's owner.
 // Returns the number reaped; min_nr > 0 blocks until that many.
-size_t BufferPool::reap_async_reads(long min_nr) {
+size_t reap_async_reads(long min_nr) {
     ThreadAsyncIO& aio = t_async_io;
     if (aio.in_flight == 0) return 0;
     io_event events[256];
@@ -918,20 +921,78 @@ size_t BufferPool::reap_async_reads(long min_nr) {
         got = io_getevents(aio.ctx, min_nr, max_nr, events, min_nr > 0 ? nullptr : &zero);
     } while (got == -EINTR);
     if (got < 0) {
-        throw std::runtime_error("BufferPool: io_getevents failed: " + std::string(::strerror(int(-got))));
-    }
-    for (long i = 0; i < got; ++i) {
-        auto* read = static_cast<PinTicket::Read*>(events[i].data);
-        if (events[i].res != read->cb.u.c.nbytes) {
-            throw std::runtime_error("BufferPool: async page read returned " + std::to_string(long(events[i].res)) +
-                                     " of " + std::to_string(read->cb.u.c.nbytes) + " bytes");
-        }
-        PinTicket& t = *read->ticket;
-        t._pool->mark_loaded(t._unique_ids[read->unique], t._entries[read->unique], t._hint);
-        --t._pending;
+        throw std::runtime_error("async page read: io_getevents failed: " + std::string(::strerror(int(-got))));
     }
     aio.in_flight -= uint32_t(got);
+    for (long i = 0; i < got; ++i) {
+        auto* read = static_cast<AsyncPageRead*>(events[i].data);
+        if (events[i].res != read->cb.u.c.nbytes) {
+            throw std::runtime_error("async page read returned " + std::to_string(long(events[i].res)) + " of " +
+                                     std::to_string(read->cb.u.c.nbytes) + " bytes");
+        }
+        read->landed();
+    }
     return size_t(got);
+}
+
+uint32_t async_reads_in_flight() { return t_async_io.in_flight; }
+
+void submit_async_reads(AsyncPageRead* const* reads, size_t n) {
+    ThreadAsyncIO& aio = t_async_io;
+    const io_context_t ctx = aio.get();
+    struct iocb* cbs[256];
+    size_t done = 0;
+    while (done < n) {
+        const size_t m = std::min<size_t>(256, n - done);
+        for (size_t i = 0; i < m; ++i) {
+            reads[done + i]->cb.data = reads[done + i];
+            cbs[i] = &reads[done + i]->cb;
+        }
+        const int ret = io_submit(ctx, long(m), cbs);
+        if (ret > 0) {
+            done += size_t(ret);
+            aio.in_flight += uint32_t(ret);
+        } else if (ret == -EAGAIN || ret == 0) {
+            // The context is full: land something and try again.
+            reap_async_reads(1);
+        } else if (ret != -EINTR) {
+            throw std::runtime_error("async page read: io_submit failed: " + std::string(::strerror(-ret)));
+        }
+    }
+}
+
+struct DirectPageReads::Read final : AsyncPageRead {
+    DirectPageReads* owner = nullptr;
+    void landed() override { --owner->_pending; }
+};
+
+DirectPageReads::DirectPageReads() = default;
+
+DirectPageReads::~DirectPageReads() {
+    // As for PinTicket: libaio would write into buffers nobody waits on.
+    if (_pending > 0) std::terminate();
+}
+
+void DirectPageReads::submit(int fd, const uint64_t* offsets, char* const* bufs, size_t n, uint32_t bytes) {
+    if (_pending > 0) throw std::logic_error("DirectPageReads::submit: reads already in flight");
+    if (_reads.size() < n) _reads.resize(n);
+    std::vector<AsyncPageRead*> ptrs(n);
+    for (size_t i = 0; i < n; ++i) {
+        io_prep_pread(&_reads[i].cb, fd, bufs[i], bytes, int64_t(offsets[i]));
+        _reads[i].owner = this;
+        ptrs[i] = &_reads[i];
+    }
+    _pending = uint32_t(n);
+    submit_async_reads(ptrs.data(), n);
+}
+
+bool DirectPageReads::ready() {
+    if (_pending > 0) reap_async_reads(0);
+    return _pending == 0;
+}
+
+void DirectPageReads::wait() {
+    while (_pending > 0) reap_async_reads(1);
 }
 
 size_t BufferPool::classify_batch(const uint32_t* page_ids, size_t n, FrameRegion hint, uint32_t* unique_ids,
@@ -1057,7 +1118,7 @@ void BufferPool::wait_frame(uint32_t frame_idx, FrameRegion hint) {
                 frame_state_allows_pin(f_ref, st, hint));
     };
     std::unique_lock<std::mutex> wait_lk(wait_state->mtx);
-    if (t_async_io.in_flight == 0) {
+    if (async_reads_in_flight() == 0) {
         wait_state->cv.wait(wait_lk, loaded);
         return;
     }
@@ -1202,8 +1263,6 @@ void BufferPool::pin_batch_submit(const uint32_t* page_ids, size_t n, PinTicket&
         throw std::invalid_argument(
             "BufferPool::pin_batch_submit: size exceeds kPinBatchMax (256)");
     }
-    ThreadAsyncIO& aio = t_async_io;
-    const io_context_t ctx = aio.get();
     std::vector<AlignedRead> reqs;
     reqs.reserve(n);
     ticket._hint = hint;
@@ -1214,33 +1273,18 @@ void BufferPool::pin_batch_submit(const uint32_t* page_ids, size_t n, PinTicket&
     ticket._pool = this;
     // classify_batch appends reads in entry order, so the k-th read is the
     // k-th MISS_OURS entry.
-    struct iocb* cbs[kPinBatchMax];
+    AsyncPageRead* reads[kPinBatchMax];
     size_t r = 0;
     for (size_t u = 0; u < ticket._n_unique; ++u) {
         if (ticket._entries[u].kind != BatchKind::MISS_OURS) continue;
         PinTicket::Read& read = ticket._reads[r];
         io_prep_pread(&read.cb, _heap_fd, reqs[r].buf, reqs[r].len, int64_t(reqs[r].offset));
-        read.cb.data = &read;
         read.ticket = &ticket;
         read.unique = uint16_t(u);
-        cbs[r] = &read.cb;
-        ++r;
+        reads[r++] = &read;
     }
     ticket._pending = uint32_t(r);
-    size_t done = 0;
-    while (done < r) {
-        const int ret = io_submit(ctx, long(r - done), cbs + done);
-        if (ret > 0) {
-            done += size_t(ret);
-            aio.in_flight += uint32_t(ret);
-        } else if (ret == -EAGAIN || ret == 0) {
-            // The context is full: land something and try again.
-            reap_async_reads(1);
-        } else if (ret != -EINTR) {
-            throw std::runtime_error("BufferPool::pin_batch_submit: io_submit failed: " +
-                                     std::string(::strerror(-ret)));
-        }
-    }
+    submit_async_reads(reads, r);
 }
 
 bool BufferPool::pin_batch_ready(PinTicket& ticket) {

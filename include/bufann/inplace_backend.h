@@ -4,6 +4,7 @@
 #pragma once
 
 #include <atomic>
+#include <libaio.h>
 #include <algorithm>
 #include <cassert>
 #include <condition_variable>
@@ -401,6 +402,46 @@ struct SpinLock {
 };
 
 // ---------------------------------------------------------------------------
+// Asynchronous page reads on the calling thread's libaio context
+// ---------------------------------------------------------------------------
+// One context per thread (512 events; contexts count against fs.aio-max-nr)
+// serves the split BufferPool::pin_batch and DirectPageReads alike: each
+// request is an AsyncPageRead whose landed() runs on the thread that reaps
+// it, which is always the thread that submitted it.
+struct AsyncPageRead {
+    struct iocb cb;
+    virtual void landed() = 0;
+    virtual ~AsyncPageRead() = default;
+};
+// Submits every read (prepped cb), landing completions while the context
+// is full.
+void submit_async_reads(AsyncPageRead* const* reads, size_t n);
+// Lands this thread's completed reads, blocking until min_nr have if
+// min_nr > 0; returns how many.
+size_t reap_async_reads(long min_nr);
+uint32_t async_reads_in_flight();
+
+// Uncached reads of whole pages into caller buffers, O_DIRECT through no
+// pool: every page read is a device read. bufs must be aligned for
+// O_DIRECT and stay valid until wait() (or ready() is true). Owned by the
+// submitting thread, which must wait before submitting again.
+class DirectPageReads {
+ public:
+    DirectPageReads();
+    ~DirectPageReads();
+    DirectPageReads(const DirectPageReads&)            = delete;
+    DirectPageReads& operator=(const DirectPageReads&) = delete;
+    void submit(int fd, const uint64_t* offsets, char* const* bufs, size_t n, uint32_t bytes);
+    bool ready();  // lands completions without blocking
+    void wait();
+
+ private:
+    struct Read;
+    std::vector<Read> _reads;
+    uint32_t _pending = 0;
+};
+
+// ---------------------------------------------------------------------------
 // PageFrame + FrameRegion
 // ---------------------------------------------------------------------------
 enum class FrameRegion : uint8_t { QUERY = 0, UPDATE = 1, SHARED = 2 };
@@ -564,9 +605,6 @@ class BufferPool {
                           uint16_t* slot_to_unique, BatchEntry* entries, std::vector<AlignedRead>& reqs);
     // A MISS_OURS frame's read has landed: READY, waiters woken.
     void mark_loaded(uint32_t page_id, const BatchEntry& entry, FrameRegion hint);
-    // Lands the calling thread's completed split-pin reads (blocking until
-    // min_nr have, if min_nr > 0); returns how many.
-    static size_t reap_async_reads(long min_nr);
     // Waits until another thread's load (or flush) of the frame is over.
     void wait_frame(uint32_t frame_idx, FrameRegion hint);
     // Waits for the WAIT_OTHER entries, pins duplicates, fills out_frames

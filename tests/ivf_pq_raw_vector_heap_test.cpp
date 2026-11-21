@@ -1239,6 +1239,104 @@ bool test_crossed_waits_on_unreaped_loads() {
     return t.done();
 }
 
+// A heap opened with direct reads must read back exactly what a page-cache
+// heap over the same file does: single reads, batches with repeated slots
+// and pages, and split reads in flight on 8 threads at once, each counted
+// as one device read per distinct page. A write through the heap is seen by
+// the next direct read. Direct reads with a pool, or with a page O_DIRECT
+// cannot read, are refused.
+bool test_direct_reads_match_page_cache() {
+    TestCase t("direct (O_DIRECT, uncached) reads return what page-cache reads do, one device read per page");
+    std::string path = temp_path("ivf_heap_direct");
+    RawVectorHeapLayout layout = compute_raw_vector_heap_layout(PAGE, ELEM);
+    const uint32_t n = 300 * layout.slots_per_page;
+    ::unlink(path.c_str());
+    {
+        RawVectorHeap heap;
+        heap.open(path, layout);
+        RawVectorFreeList free_list;
+        for (uint32_t i = 0; i < n; ++i) heap.write_vector(heap.allocate_slot(free_list), i, pattern(i).data());
+        heap.close();
+    }
+    const uint32_t pages = n / layout.slots_per_page;
+    RawVectorHeap plain, direct;
+    plain.open_existing(path, layout, n, pages, RawVectorHeapCache{});
+    direct.open_existing(path, layout, n, pages, RawVectorHeapCache{0, nullptr, true});
+    t.check(direct.uses_direct_reads() && !plain.uses_direct_reads(), "the modes are not what was asked for");
+
+    std::vector<char> got(ELEM), want(ELEM);
+    uint32_t bad = 0;
+    for (uint32_t i = 0; i < n; i += 13) {
+        bad += direct.read_vector(i, got.data()) != plain.read_vector(i, want.data()) || got != want;
+    }
+    t.check(bad == 0, std::to_string(bad) + " single direct reads differ");
+
+    // 200 slots over 7 pages, with repeats: 7 device reads.
+    std::vector<uint32_t> slots;
+    for (uint32_t k = 0; k < 200; ++k) slots.push_back((k * 37) % (7 * layout.slots_per_page) + 40 * layout.slots_per_page);
+    std::vector<char> out_d(slots.size() * ELEM), out_p(slots.size() * ELEM);
+    std::vector<uint32_t> own_d(slots.size()), own_p(slots.size());
+    direct.reset_direct_read_stats();
+    direct.read_vectors(slots.data(), slots.size(), out_d.data(), own_d.data());
+    plain.read_vectors(slots.data(), slots.size(), out_p.data(), own_p.data());
+    t.check(out_d == out_p && own_d == own_p, "a direct batch differs from the page-cache batch");
+    t.check(direct.direct_page_reads() == 7,
+            std::to_string(direct.direct_page_reads()) + " device reads for a batch over 7 pages");
+
+    std::atomic<uint32_t> wrong{0};
+    std::vector<std::thread> readers;
+    for (uint32_t r = 0; r < 8; ++r) {
+        readers.emplace_back([&, r] {
+            std::mt19937 rng(r);
+            const uint32_t depth = 3, m = 50;
+            std::vector<RawVectorHeap::PendingRead> pending(depth);
+            std::vector<std::vector<uint32_t>> s(depth, std::vector<uint32_t>(m));
+            std::vector<char> o(m * ELEM), w(m * ELEM);
+            std::vector<uint32_t> ow(m), ww(m);
+            for (uint32_t round = 0; round < 200; ++round) {
+                const uint32_t i = round % depth;
+                if (round >= depth) {
+                    direct.read_vectors_complete(pending[i], o.data(), ow.data());
+                    plain.read_vectors(s[i].data(), m, w.data(), ww.data());
+                    wrong += o != w || ow != ww;
+                }
+                for (uint32_t& x : s[i]) x = rng() % n;
+                direct.read_vectors_submit(s[i].data(), m, pending[i]);
+            }
+            for (uint32_t i = 0; i < depth; ++i) direct.read_vectors_complete(pending[i], o.data(), ow.data());
+        });
+    }
+    for (auto& th : readers) th.join();
+    t.check(wrong.load() == 0, std::to_string(wrong.load()) + " split direct reads differ from page-cache reads");
+
+    // A vector rewritten through the direct heap's own page-cache descriptor.
+    RawVectorFreeList free_list;
+    direct.free_slot(5, free_list);
+    direct.reclaim_freed_slots(free_list);
+    const uint32_t slot = direct.allocate_slot(free_list);
+    direct.write_vector(slot, n + 1, pattern(n + 1).data());
+    t.check(direct.read_vector(slot, got.data()) == n + 1 && got == pattern(n + 1),
+            "a direct read missed the write before it");
+    plain.close();
+    direct.close();
+
+    RawVectorHeap refused;
+    t.expect_throw("direct reads with a buffer pool", [&] {
+        refused.open_existing(path, layout, n, pages, RawVectorHeapCache{64, nullptr, true});
+    });
+    std::string small_path = temp_path("ivf_heap_direct_small");
+    ::unlink(small_path.c_str());
+    t.expect_throw("direct reads of 2048-byte pages", [&] {
+        refused.open(small_path, compute_raw_vector_heap_layout(2048, 128), RawVectorHeapCache{0, nullptr, true});
+    });
+    struct stat st;
+    t.check(::stat(small_path.c_str(), &st) != 0, "the refused direct open created its file");
+    refused.close();
+    ::unlink(small_path.c_str());
+    ::unlink(path.c_str());
+    return t.done();
+}
+
 int main() {
     bool all_pass = true;
     for (uint32_t frames : {0u, 64u}) {
@@ -1269,6 +1367,7 @@ int main() {
     all_pass &= test_buffer_pool_racing_pin_keeps_the_next_owners_pin();
     all_pass &= test_split_reads_in_flight_under_eviction();
     all_pass &= test_crossed_waits_on_unreaped_loads();
+    all_pass &= test_direct_reads_match_page_cache();
     all_pass &= test_buffer_pool_needs_direct_io_pages();
     return all_pass ? 0 : 1;
 }

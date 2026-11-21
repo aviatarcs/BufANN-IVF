@@ -5,6 +5,8 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <chrono>
+#include <cstdlib>
 #include <cerrno>
 #include <cstring>
 #include <shared_mutex>
@@ -12,6 +14,7 @@
 
 #include "bufann/inplace_backend.h"
 #include "bufann/ivf_pq_require.h"
+#include "tsl/robin_map.h"
 
 namespace diskann {
 namespace inplace {
@@ -176,6 +179,20 @@ void RawVectorHeap::open_buffer_pool(const std::string& path, RawVectorHeapCache
     _pool = std::move(pool);
 }
 
+// Checks through both descriptors that they name one file.
+void RawVectorHeap::open_direct(const std::string& path) {
+    IVF_PQ_REQUIRE(_layout.page_size % 4096 == 0,
+                   "direct reads use O_DIRECT, so the heap's page_size must be a multiple of 4096, not " +
+                       std::to_string(_layout.page_size));
+    _direct_fd = ::open(path.c_str(), O_RDONLY | O_DIRECT);
+    IVF_PQ_REQUIRE(_direct_fd >= 0, "Failed to open raw-vector heap file with O_DIRECT: " + path);
+    struct stat a, b;
+    IVF_PQ_REQUIRE(::fstat(_fd, &a) == 0 && ::fstat(_direct_fd, &b) == 0 && a.st_dev == b.st_dev &&
+                       a.st_ino == b.st_ino,
+                   "raw-vector heap file changed between its two opens: " + path);
+    reset_direct_read_stats();
+}
+
 void RawVectorHeap::open(const std::string& path, RawVectorHeapLayout layout, RawVectorHeapCache cache) {
     close();
     set_layout(layout);
@@ -186,10 +203,23 @@ void RawVectorHeap::open(const std::string& path, RawVectorHeapLayout layout, Ra
                    "(use open_existing to resume it): " + path);
 
     if (cache.buffer_pool_frames > 0) {
+        IVF_PQ_REQUIRE(!cache.direct_reads, "direct reads bypass the buffer pool; ask for one or the other");
         open_buffer_pool(path, cache, /*truncate=*/true);
     } else {
+        // Refused before the file is created.
+        IVF_PQ_REQUIRE(!cache.direct_reads || _layout.page_size % 4096 == 0,
+                       "direct reads use O_DIRECT, so the heap's page_size must be a multiple of 4096, not " +
+                           std::to_string(_layout.page_size));
         _fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
         IVF_PQ_REQUIRE(_fd >= 0, "Failed to open raw-vector heap file: " + path);
+        if (cache.direct_reads) {
+            try {
+                open_direct(path);
+            } catch (...) {
+                close();
+                throw;
+            }
+        }
     }
     _allocated_pages = 0;
     _next_flat_slot = 0;
@@ -203,6 +233,8 @@ void RawVectorHeap::open_existing(const std::string& path, RawVectorHeapLayout l
                    "slot cursor lies past the allocated pages");
 
     int fd = -1;
+    IVF_PQ_REQUIRE(cache.buffer_pool_frames == 0 || !cache.direct_reads,
+                   "direct reads bypass the buffer pool; ask for one or the other");
     if (cache.buffer_pool_frames > 0) {
         // BufferPool::init opens with O_CREAT, which would leave an empty
         // heap at a mistyped path; a path that vanishes after this check
@@ -219,6 +251,14 @@ void RawVectorHeap::open_existing(const std::string& path, RawVectorHeapLayout l
         IVF_PQ_REQUIRE(_fd >= 0,
                        (open_errno == ENOENT ? "file not found: " : "Failed to open raw-vector heap file: ") + path);
         fd = _fd;
+        if (cache.direct_reads) {
+            try {
+                open_direct(path);
+            } catch (...) {
+                close();
+                throw;
+            }
+        }
     }
 
     // Everything from here on is checked through fd, not the path: the size
@@ -257,6 +297,10 @@ void RawVectorHeap::close() {
     if (_fd >= 0) {
         ::close(_fd);
         _fd = -1;
+    }
+    if (_direct_fd >= 0) {
+        ::close(_direct_fd);
+        _direct_fd = -1;
     }
     _allocated_pages.store(0);
     _next_flat_slot.store(0);
@@ -362,6 +406,11 @@ void RawVectorHeap::write_vector(uint32_t flat_slot, uint32_t owner, const void*
 // page instead of a slot.
 uint32_t RawVectorHeap::read_vector(uint32_t flat_slot, void* out) const {
     require_allocated(flat_slot);
+    if (_direct_fd >= 0) {
+        uint32_t owner;
+        read_vectors(&flat_slot, 1, static_cast<char*>(out), &owner);
+        return owner;
+    }
     const uint32_t page_id = _layout.page_of(flat_slot);
     const uint32_t index = _layout.index_in_page(flat_slot);
     const uint32_t slot_in_page = _layout.slot_offset_in_page(index);
@@ -389,6 +438,13 @@ uint32_t RawVectorHeap::read_vector(uint32_t flat_slot, void* out) const {
 // returned; the pool was too small for the readers either way.
 void RawVectorHeap::read_vectors(const uint32_t* flat_slots, size_t n, char* out, uint32_t* owners) const {
     for (size_t i = 0; i < n; ++i) require_allocated(flat_slots[i]);
+    if (_direct_fd >= 0) {
+        // One batch of uncached reads, waited for here; the buffers are reused.
+        thread_local PendingRead pending;
+        read_vectors_submit(flat_slots, n, pending);
+        read_vectors_complete(pending, out, owners);
+        return;
+    }
     if (!_pool) {
         for (size_t i = 0; i < n; ++i) owners[i] = read_vector(flat_slots[i], out + i * _layout.elem_size);
         return;
@@ -427,6 +483,14 @@ void RawVectorHeap::copy_pinned(const uint32_t* flat_slots, const uint32_t* page
 
 struct RawVectorHeap::PendingRead::Ticket {
     BufferPool::PinTicket pin;
+    // Direct mode: each unique page once, into its own aligned buffer.
+    DirectPageReads direct;
+    std::vector<uint32_t> unique_pages, slot_unique;
+    std::vector<uint64_t> offsets;
+    std::vector<char*> bufs;
+    char* buffer = nullptr;
+    size_t buffer_pages = 0;
+    ~Ticket() { std::free(buffer); }
 };
 
 RawVectorHeap::PendingRead::PendingRead() : _ticket(new Ticket) {}
@@ -438,10 +502,60 @@ size_t RawVectorHeap::async_batch_max() const {
     return _pool ? std::clamp<size_t>(_pool->num_frames() / 64, 1, BufferPool::kPinBatchMax) : SIZE_MAX;
 }
 
+void RawVectorHeap::direct_submit(PendingRead& pending) const {
+    PendingRead::Ticket& t = *pending._ticket;
+    const size_t n = pending._slots.size();
+    t.unique_pages.clear();
+    t.slot_unique.resize(n);
+    tsl::robin_map<uint32_t, uint32_t> index;
+    for (size_t i = 0; i < n; ++i) {
+        const uint32_t page = _layout.page_of(pending._slots[i]);
+        auto [it, fresh] = index.try_emplace(page, uint32_t(t.unique_pages.size()));
+        if (fresh) t.unique_pages.push_back(page);
+        t.slot_unique[i] = it->second;
+    }
+    const size_t m = t.unique_pages.size();
+    const size_t page = _layout.page_size;
+    if (t.buffer_pages < m) {
+        std::free(t.buffer);
+        t.buffer = nullptr;
+        t.buffer_pages = 0;
+        void* p = nullptr;
+        IVF_PQ_REQUIRE(::posix_memalign(&p, 4096, m * page) == 0, "out of memory for direct-read buffers");
+        t.buffer = static_cast<char*>(p);
+        t.buffer_pages = m;
+    }
+    t.offsets.resize(m);
+    t.bufs.resize(m);
+    for (size_t u = 0; u < m; ++u) {
+        t.offsets[u] = _layout.page_offset(t.unique_pages[u]);
+        t.bufs[u] = t.buffer + u * page;
+    }
+    t.direct.submit(_direct_fd, t.offsets.data(), t.bufs.data(), m, uint32_t(page));
+    _direct_page_reads.fetch_add(m, std::memory_order_relaxed);
+}
+
+void RawVectorHeap::direct_complete(PendingRead& pending, char* out, uint32_t* owners) const {
+    PendingRead::Ticket& t = *pending._ticket;
+    const auto begin = std::chrono::steady_clock::now();
+    t.direct.wait();
+    _direct_read_wait_ns.fetch_add(uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                std::chrono::steady_clock::now() - begin).count()),
+                                   std::memory_order_relaxed);
+    for (size_t u = 0; u < t.unique_pages.size(); ++u) require_page_header(t.bufs[u], _layout, t.unique_pages[u]);
+    for (size_t i = 0; i < pending._slots.size(); ++i) {
+        const char* p = t.bufs[t.slot_unique[i]];
+        const uint32_t index = _layout.index_in_page(pending._slots[i]);
+        std::memcpy(out + i * _layout.elem_size, p + _layout.slot_offset_in_page(index), _layout.elem_size);
+        std::memcpy(&owners[i], p + _layout.owner_offset_in_page(index), RAW_VECTOR_OWNER_BYTES);
+    }
+}
+
 void RawVectorHeap::read_vectors_submit(const uint32_t* flat_slots, size_t n, PendingRead& pending) const {
     IVF_PQ_REQUIRE(n <= async_batch_max(), "read_vectors_submit: more slots than async_batch_max()");
     for (size_t i = 0; i < n; ++i) require_allocated(flat_slots[i]);
     pending._slots.assign(flat_slots, flat_slots + n);
+    if (_direct_fd >= 0) return direct_submit(pending);
     if (!_pool) return;
     pending._page_ids.resize(n);
     for (size_t j = 0; j < n; ++j) pending._page_ids[j] = _layout.page_of(flat_slots[j]);
@@ -449,11 +563,13 @@ void RawVectorHeap::read_vectors_submit(const uint32_t* flat_slots, size_t n, Pe
 }
 
 bool RawVectorHeap::read_vectors_ready(PendingRead& pending) const {
+    if (_direct_fd >= 0) return pending._ticket->direct.ready();
     return !_pool || _pool->pin_batch_ready(pending._ticket->pin);
 }
 
 void RawVectorHeap::read_vectors_complete(PendingRead& pending, char* out, uint32_t* owners) const {
     const size_t n = pending._slots.size();
+    if (_direct_fd >= 0) return direct_complete(pending, out, owners);
     if (!_pool) {
         for (size_t i = 0; i < n; ++i) owners[i] = read_vector(pending._slots[i], out + i * _layout.elem_size);
         return;

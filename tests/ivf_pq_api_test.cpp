@@ -530,6 +530,36 @@ bool test_config_validation(const std::string& prefix) {
 
 }  // namespace
 
+// ivf_io_mode DIRECT reads the re-rank's pages from the device (no pool,
+// no page cache) and must return what the default POOL load returns.
+template<typename T>
+bool test_direct_io_mode(const std::string& tag, const std::string& prefix) {
+    TestCase t(tag + ": ivf_io_mode DIRECT returns the POOL load's results, reading every re-rank page uncached");
+    const std::string base_bin = prefix + "_base.bin";
+    std::vector<T> base = synthetic<T>(N, 1, 1.0f), queries = synthetic<T>(NQ, 2, 1.0f);
+    diskann::save_bin<T>(base_bin, base.data(), N, DIM);
+    BufANNConfig cfg = ivf_config<T>();
+    BufANNIndex<T>* pooled = bufann_build<T>(base_bin, prefix, cfg);
+    BufANNConfig direct_cfg = cfg;
+    direct_cfg.ivf_io_mode = IVFIOMode::DIRECT;
+    BufANNIndex<T>* direct = bufann_load<T>(prefix, direct_cfg);
+    t.check(direct->ivf->heap.uses_direct_reads() && !direct->ivf->heap.uses_buffer_pool(),
+            "a DIRECT load is not reading directly");
+    t.check(!pooled->ivf->heap.uses_direct_reads(), "the default load reads directly");
+    size_t mismatches = 0;
+    for (uint32_t q = 0; q < NQ; ++q) {
+        const T* query = queries.data() + size_t(q) * DIM;
+        mismatches += bufann_query<T>(*direct, query, K) != bufann_query<T>(*pooled, query, K);
+    }
+    t.check(mismatches == 0, std::to_string(mismatches) + " of " + std::to_string(NQ) + " queries differ");
+    t.check(direct->ivf->heap.direct_page_reads() > 0, "the DIRECT load read nothing from the device");
+    bufann_free<T>(direct);
+    bufann_free<T>(pooled);
+    ::unlink(base_bin.c_str());
+    remove_index_files(prefix);
+    return t.done();
+}
+
 int main() {
     const std::string prefix = temp_path("ivf_pq_api");
     bool all_pass = true;
@@ -540,6 +570,8 @@ int main() {
         all_pass &= test_tag_churn_under_queries<float>("float", prefix + "_churn");
         all_pass &= test_centroid_graph<float>("float", prefix + "_graph_f32");
         all_pass &= test_centroid_graph<uint8_t>("uint8", prefix + "_graph_u8");
+        all_pass &= test_direct_io_mode<float>("float", prefix + "_direct_f32");
+        all_pass &= test_direct_io_mode<uint8_t>("uint8", prefix + "_direct_u8");
         all_pass &= test_config_validation(prefix + "_cfg");
     } catch (const std::exception& e) {
         std::cout << "  FAIL: " << e.what() << std::endl;

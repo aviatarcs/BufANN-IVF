@@ -34,6 +34,12 @@ enum class IndexType : uint8_t {
     IvfPq = 1,
 };
 
+// IVF-PQ: how the exact re-rank reads the raw-vector heap. POOL goes
+// through a buffer pool of buffer_pool_frames (0 frames = the OS page
+// cache); DIRECT reads each page from the device, O_DIRECT into the query's
+// own buffers, with no pool and no page cache (buffer_pool_frames unused).
+enum class IVFIOMode : uint8_t { POOL = 0, DIRECT = 1 };
+
 struct BufANNConfig {
     // --- required ---
     uint32_t dim = 0;           // vector dimensionality
@@ -64,6 +70,7 @@ struct BufANNConfig {
     // do not change the top k.
     uint32_t ivf_rerank_batch    = 0;
     uint32_t ivf_rerank_patience = 0;
+    IVFIOMode ivf_io_mode = IVFIOMode::POOL;
 
     // --- graph parameters ---
     uint32_t R           = 64;  // max graph degree (used for build and insert pruning)

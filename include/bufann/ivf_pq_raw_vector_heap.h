@@ -43,6 +43,13 @@ struct InPlaceIOStats;
 struct RawVectorHeapCache {
     uint32_t buffer_pool_frames = 0;
     InPlaceIOStats* stats = nullptr;
+    // With no buffer pool only: vector reads (read_vector, read_vectors and
+    // the split form) go through a second, O_DIRECT descriptor into the
+    // reader's own buffers, so each page they touch is a device read, cached
+    // neither by a pool nor by the OS. Writes, bitmaps and page directories
+    // still use the page-cache descriptor (the kernel writes a range back
+    // before a direct read of it).
+    bool direct_reads = false;
 };
 
 // allocate_slot/write_vector/free_slot may be called concurrently: allocation
@@ -72,6 +79,12 @@ public:
     void flush();
     bool uses_buffer_pool() const { return _pool != nullptr; }
     uint32_t buffer_pool_frames() const;  // 0 without a buffer pool
+    bool uses_direct_reads() const { return _direct_fd >= 0; }
+    // Direct mode: pages read from the device, and time spent waiting on
+    // them, since open or reset_direct_read_stats.
+    uint64_t direct_page_reads() const { return _direct_page_reads.load(); }
+    uint64_t direct_read_wait_ns() const { return _direct_read_wait_ns.load(); }
+    void reset_direct_read_stats() const { _direct_page_reads.store(0), _direct_read_wait_ns.store(0); }
     size_t max_readers() const { return _readers.size(); }
 
     // Grace period for slot reuse. A reader holds a ReadGuard from before it
@@ -123,7 +136,7 @@ public:
 
     private:
         friend class RawVectorHeap;
-        struct Ticket;  // a BufferPool::PinTicket
+        struct Ticket;  // a BufferPool::PinTicket, or direct reads and their buffers
         std::unique_ptr<Ticket> _ticket;
         std::vector<uint32_t> _slots, _page_ids;
     };
@@ -158,6 +171,7 @@ public:
 private:
     void set_layout(RawVectorHeapLayout layout);
     void open_buffer_pool(const std::string& path, RawVectorHeapCache cache, bool truncate);
+    void open_direct(const std::string& path);
     // Buffer-pool page access: `fn` gets the page under the frame's shared
     // (read) or exclusive (write) latch; a read verifies the page header first.
     template<typename F>
@@ -183,7 +197,11 @@ private:
         std::atomic<uint64_t> epoch{0};
     };
 
-    int _fd = -1;           // page-cache mode only
+    int _fd = -1;           // page-cache and direct modes
+    int _direct_fd = -1;    // direct mode: the O_DIRECT descriptor vector reads use
+    mutable std::atomic<uint64_t> _direct_page_reads{0}, _direct_read_wait_ns{0};
+    void direct_submit(PendingRead& pending) const;
+    void direct_complete(PendingRead& pending, char* out, uint32_t* owners) const;
     void copy_pinned(const uint32_t* flat_slots, const uint32_t* page_ids, PageFrame** frames, size_t n, char* out,
                      uint32_t* owners) const;
     std::unique_ptr<BufferPool> _pool;  // buffer-pool mode only; owns its own O_DIRECT descriptor
