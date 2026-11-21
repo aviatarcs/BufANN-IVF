@@ -195,6 +195,91 @@ bool test_buffer_pool_matches_reference(const std::string& tag, const Built& b, 
     return t.done();
 }
 
+// ivf_pq_search_graph_pipelined must return, for every query, exactly what
+// ivf_pq_search_graph returns one query at a time through the page cache
+// (no buffer pool, no async reads): through the same heap, through a
+// 384-frame pool smaller than the f32 heap, so pages are evicted and re-read
+// while other queries' reads are in flight, and through direct (uncached
+// O_DIRECT) reads, at several depths on 4 threads. One-at-a-time searches
+// through the direct heap must match too.
+template<typename T>
+bool test_pipelined_matches_blocking(const std::string& tag, const Built& b, const std::string& prefix,
+                                     const std::vector<float>& queries) {
+    TestCase t(tag + ": the pipelined graph search equals one-at-a-time graph searches, pooled, direct or not");
+    const IVFCentroidGraph graph = build_ivf_centroid_graph(b.index.meta);
+    const uint32_t rerank_m = 20, nprobe = 8, beam = 10;
+    std::vector<IVFPQSearchResult> want(NQ);
+    IVFPQSearchScratch scratch;
+    for (uint32_t q = 0; q < NQ; ++q) {
+        want[q] = ivf_pq_search_graph<T>(b.index, graph, b.heap, queries.data() + size_t(q) * DIM, K, nprobe, beam,
+                                         rerank_m, scratch);
+    }
+    InPlaceIOStats stats;
+    RawVectorHeap pooled;
+    const uint32_t frames = 384;
+    pooled.open_existing(ivf_raw_vectors_path(prefix), b.index.heap_layout, b.index.heap_next_slot,
+                         b.index.heap_pages, RawVectorHeapCache{frames, &stats});
+    RawVectorHeap direct;
+    direct.open_existing(ivf_raw_vectors_path(prefix), b.index.heap_layout, b.index.heap_next_slot,
+                         b.index.heap_pages, RawVectorHeapCache{0, nullptr, true});
+    for (uint32_t q = 0; q < NQ; ++q) {
+        IVFPQSearchResult got = ivf_pq_search_graph<T>(b.index, graph, direct, queries.data() + size_t(q) * DIM, K,
+                                                       nprobe, beam, rerank_m, scratch);
+        if (!t.check(got.ids == want[q].ids && got.dists == want[q].dists,
+                     "direct one-at-a-time: query " + std::to_string(q) + " differs")) {
+            break;
+        }
+    }
+    t.check(direct.direct_page_reads() > 0, "the direct heap read nothing from the device");
+    const int threads = omp_get_max_threads();
+    omp_set_num_threads(4);
+    for (const RawVectorHeap* heap : std::initializer_list<const RawVectorHeap*>{&b.heap, &pooled, &direct}) {
+        for (uint32_t depth : {1u, 2u}) {
+            for (uint32_t rm : {0u, rerank_m}) {
+                std::vector<IVFPQSearchResult> got(NQ);
+                std::vector<double> latency(NQ, -1.0);
+                const IVFPQSearchTimes times = ivf_pq_search_graph_pipelined<T>(
+                    b.index, graph, *heap, queries.data(), NQ, K, nprobe, beam, rm, depth, got.data(), latency.data());
+                const std::string where = std::string(heap == &pooled   ? "pooled"
+                                                      : heap == &direct ? "direct"
+                                                                        : "page cache") +
+                                          " depth " +
+                                          std::to_string(depth) + " rerank_m " + std::to_string(rm);
+                t.check(times.queries == NQ, where + ": " + std::to_string(times.queries) + " queries timed");
+                for (uint32_t q = 0; q < NQ; ++q) {
+                    IVFPQSearchResult w = rm == rerank_m ? want[q]
+                                                         : ivf_pq_search_graph<T>(b.index, graph, b.heap,
+                                                                                  queries.data() + size_t(q) * DIM, K,
+                                                                                  nprobe, beam, rm, scratch);
+                    if (!t.check(got[q].ids == w.ids && got[q].dists == w.dists,
+                                 where + ": query " + std::to_string(q) + " differs") ||
+                        !t.check(latency[q] >= 0.0, where + ": query " + std::to_string(q) + " has no latency")) {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    omp_set_num_threads(threads);
+    t.check(b.index.heap_pages <= frames || stats.evictions.load() > 0,
+            "the heap outgrew the pool but nothing was evicted");
+    // The pins of 4 x 2 queries in flight fit easily; 4 x 64 x 20 do not.
+    omp_set_num_threads(4);
+    std::vector<IVFPQSearchResult> got(NQ);
+    t.expect_throw("depth 0", [&] {
+        ivf_pq_search_graph_pipelined<T>(b.index, graph, pooled, queries.data(), NQ, K, nprobe, beam, rerank_m, 0,
+                                         got.data());
+    });
+    t.expect_throw("pins beyond half the pool", [&] {
+        ivf_pq_search_graph_pipelined<T>(b.index, graph, pooled, queries.data(), NQ, K, nprobe, beam, rerank_m, 64,
+                                         got.data());
+    });
+    omp_set_num_threads(threads);
+    pooled.close();
+    direct.close();
+    return t.done();
+}
+
 // The batch path must agree with single-query searches on every query, in
 // query order, for a batch that spans several GEMM blocks, with and without
 // the re-rank; an empty batch is empty.
@@ -650,6 +735,8 @@ int main() {
         all_pass &= test_rerank_schedule<uint8_t>("u8", *u, queries);
         all_pass &= test_buffer_pool_matches_reference<float>("f32", *f, prefix_f, queries);
         all_pass &= test_buffer_pool_matches_reference<uint8_t>("u8", *u, prefix_u, queries);
+        all_pass &= test_pipelined_matches_blocking<float>("f32", *f, prefix_f, queries);
+        all_pass &= test_pipelined_matches_blocking<uint8_t>("u8", *u, prefix_u, queries);
         all_pass &= test_fastscan_end_to_end<float>("f32", *f, base_f, queries);
         all_pass &= test_fastscan_end_to_end<uint8_t>("u8", *u, base_u, queries);
         all_pass &= test_fastscan_end_to_end<float>("f32 uneven chunks", *e, base_f, queries);

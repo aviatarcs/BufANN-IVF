@@ -136,6 +136,25 @@ IVFPQSearchResult ivf_pq_search_graph(const IVFPQIndex& index, const IVFCentroid
                                       const IVFPQDelta* delta = nullptr, const IVFProbeCutoff& cutoff = {},
                                       const IVFRerankSchedule& rerank = {});
 
+// ivf_pq_search_graph over nq queries (row-major [nq x dim]) on the
+// current OpenMP threads, each keeping up to `depth` queries in flight: it
+// starts the next query (centroid search, scan, shortlist) while earlier
+// queries' re-rank pages are read, and finishes whichever has landed, so the
+// thread works instead of blocking on the fetch. Results (in query order)
+// are those of ivf_pq_search_graph with the default IVFRerankSchedule, each
+// query's re-rank being one fetch. latency_s, if given, gets each query's
+// time from its start to its result, waits behind other queries included.
+// threads x depth must stay within half the heap's reader entries and, with
+// a buffer pool, threads x depth x rerank_m within half its frames. Returns
+// the threads' summed phase times.
+template<typename T>
+IVFPQSearchTimes ivf_pq_search_graph_pipelined(const IVFPQIndex& index, const IVFCentroidGraph& graph,
+                                               const RawVectorHeap& heap, const float* queries, size_t nq,
+                                               uint32_t k, uint32_t nprobe, uint32_t centroid_L, uint32_t rerank_m,
+                                               uint32_t depth, IVFPQSearchResult* results,
+                                               double* latency_s = nullptr, const IVFPQDelta* delta = nullptr,
+                                               const IVFProbeCutoff& cutoff = {});
+
 // Allocates a scratch per call; for one-off queries.
 template<typename T>
 IVFPQSearchResult ivf_pq_search(const IVFPQIndex& index, const RawVectorHeap& heap, const float* query,

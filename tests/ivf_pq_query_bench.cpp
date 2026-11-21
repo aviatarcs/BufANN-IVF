@@ -28,14 +28,16 @@
 //
 // --scan float turns off the SIMD (Quicker ADC) PQ scan; with simd, the
 // default, it runs when the CPU has AVX-512 VBMI and rerank_m > 0.
-//                      [--buffer_pool_frames 262144]
+//                      [--io_mode direct|pool|pagecache] [--buffer_pool_frames 262144]
 //
-// The heap is read through a BufANN buffer pool of --buffer_pool_frames
-// page frames (default 262144, 1 GB of 4 KB pages: BufANN's benchmark
-// default), O_DIRECT underneath, so the numbers are taken under the memory
-// budget BufANN's are, and each line reports the pool's hits, misses and I/O
-// time for its timed queries under BufANN's driver's field names. 0 frames
-// reads the heap through the unbounded OS page cache instead, as before.
+// --io_mode direct (the default) reads every re-rank page from the device:
+// O_DIRECT into the query's own buffers, no pool, no OS page cache, as
+// RaBitQ-SSD reads its records; misses_per_query is then the device reads
+// per query and cache_hits 0. --io_mode pool reads the heap through a BufANN
+// buffer pool of --buffer_pool_frames page frames (default 262144, 1 GB of
+// 4 KB pages: BufANN's benchmark default), O_DIRECT underneath, and each
+// line reports the pool's hits, misses and I/O time under BufANN's driver's
+// field names. --io_mode pagecache reads through the unbounded OS page cache.
 
 #include "bufann/inplace_backend.h"
 #include "bufann/ivf_pq_build.h"
@@ -140,6 +142,10 @@ int run(int argc, char** argv) {
         }
     }
     const int threads = std::stoi(get_arg(argc, argv, "--threads", std::to_string(omp_get_max_threads())));
+    // 0: each thread runs one query at a time and blocks on its re-rank
+    // fetch; d > 0: ivf_pq_search_graph_pipelined, d queries in flight per
+    // thread (graph centroid search only, default re-rank schedule).
+    const std::vector<uint32_t> pipeline_depths = parse_list(get_arg(argc, argv, "--pipeline_depths", "0"));
     const std::vector<uint32_t> nprobes = parse_list(get_arg(argc, argv, "--nprobes", "8,16,32,64,128"));
     const std::string scan = get_arg(argc, argv, "--scan", "simd");
     if (scan != "simd" && scan != "float") throw diskann::ANNException("--scan must be simd or float", -1);
@@ -159,7 +165,13 @@ int run(int argc, char** argv) {
             if (!(f >= 1.0)) throw diskann::ANNException("--graph_beams factors must be at least 1", -1);
         }
     }
-    const uint32_t pool_frames = uint32_t(std::stoul(get_arg(argc, argv, "--buffer_pool_frames", "262144")));
+    const std::string io_mode = get_arg(argc, argv, "--io_mode", "direct");
+    if (io_mode != "direct" && io_mode != "pool" && io_mode != "pagecache") {
+        throw diskann::ANNException("--io_mode must be direct, pool or pagecache", -1);
+    }
+    const uint32_t pool_frames =
+        io_mode == "pool" ? uint32_t(std::stoul(get_arg(argc, argv, "--buffer_pool_frames", "262144"))) : 0;
+    if (io_mode == "pool" && pool_frames == 0) throw diskann::ANNException("--io_mode pool needs frames", -1);
     for (const std::string& f : {ivf_pq_index_path(prefix), query_file, gt_file}) {
         if (!file_exists(f)) throw diskann::ANNException("missing file: " + f, -1);
     }
@@ -208,7 +220,7 @@ int run(int argc, char** argv) {
     InPlaceIOStats io;
     RawVectorHeap heap;
     heap.open_existing(ivf_raw_vectors_path(prefix), ix.heap_layout, ix.heap_next_slot, ix.heap_pages,
-                       RawVectorHeapCache{pool_frames, &io});
+                       RawVectorHeapCache{pool_frames, &io, io_mode == "direct"});
     const size_t n = ix.assignments.cluster_id.size();
     if (dim != ix.meta.dim) {
         throw diskann::ANNException("query dim " + std::to_string(dim) + " != index dim " +
@@ -262,21 +274,33 @@ int run(int argc, char** argv) {
     auto reset_io = [&] {
         drain_query_cache_hits(io);
         io.reset();
+        heap.reset_direct_read_stats();
     };
     auto io_json = [&](size_t queries, double avg_latency_s) {
         drain_query_cache_hits(io);
-        const uint64_t hits = io.cache_hits.load(), misses = io.cache_misses.load();
-        const double io_us = double(io.query_io_ns.load() + io.batch_io_ns_total.load()) / 1e3 / double(queries);
-        char buf[512];
+        // Direct mode: every page read is a miss and a device read.
+        const bool direct = heap.uses_direct_reads();
+        const uint64_t hits = direct ? 0 : io.cache_hits.load();
+        const uint64_t misses = direct ? heap.direct_page_reads() : io.cache_misses.load();
+        const uint64_t reads = direct ? misses : io.page_fault_total.load() + io.batch_misses_total.load();
+        const double io_us = double(direct ? heap.direct_read_wait_ns()
+                                           : io.query_io_ns.load() + io.batch_io_ns_total.load()) /
+                             1e3 / double(queries);
+        // Eviction time is spent claiming frames before a batch's reads are
+        // submitted, so it is part of t_fetch but not of the I/O wait.
+        const auto per_query_us = [&](const std::atomic<uint64_t>& ns) { return double(ns.load()) / 1e3 / double(queries); };
+        char buf[768];
         std::snprintf(buf, sizeof(buf),
-                      "\"buffer_pool_frames\":%u,\"cache_hits\":%llu,\"cache_misses\":%llu,"
+                      "\"io_mode\":\"%s\",\"buffer_pool_frames\":%u,\"cache_hits\":%llu,\"cache_misses\":%llu,"
                       "\"cache_miss_rate\":%.6f,\"misses_per_query\":%.2f,\"io_read_random_ios\":%llu,"
-                      "\"query_io_avg_us_per_query\":%.1f,\"query_io_fraction_of_latency\":%.4f",
-                      pool_frames, (unsigned long long)hits, (unsigned long long)misses,
+                      "\"query_io_avg_us_per_query\":%.1f,\"query_io_fraction_of_latency\":%.4f,"
+                      "\"evict_us_per_query\":%.1f,\"evict_scan_us_per_query\":%.1f,\"evict_wait_pins_us_per_query\":%.1f",
+                      io_mode.c_str(), pool_frames, (unsigned long long)hits, (unsigned long long)misses,
                       hits + misses == 0 ? 0.0 : double(misses) / double(hits + misses),
                       double(misses) / double(queries),
-                      (unsigned long long)(io.page_fault_total.load() + io.batch_misses_total.load()), io_us,
-                      avg_latency_s > 0 ? io_us / (avg_latency_s * 1e6) : 0.0);
+                      (unsigned long long)reads, io_us,
+                      avg_latency_s > 0 ? io_us / (avg_latency_s * 1e6) : 0.0, per_query_us(io.eviction_total_ns),
+                      per_query_us(io.eviction_scan_ns), per_query_us(io.eviction_wait_pins_ns));
         return std::string(buf);
     };
 
@@ -372,8 +396,20 @@ int run(int argc, char** argv) {
             }
             for (uint32_t rm : rerank_ms) {
             for (const IVFRerankSchedule& sched : schedules) {
+            for (uint32_t depth : pipeline_depths) {
+            if (depth > 0 && (sched.batch != 0 || sched.patience != 0)) {
+                throw diskann::ANNException("--pipeline_depths > 0 runs the default re-rank schedule only (0:0)", -1);
+            }
             IVFPQSearchTimes times;
             auto concurrent_graph = [&](const float* qs, size_t count, bool timed) {
+                if (depth > 0) {
+                    std::vector<IVFPQSearchResult> scratch_res(timed ? 0 : count);
+                    const IVFPQSearchTimes t = ivf_pq_search_graph_pipelined<T>(
+                        ix, graph, heap, qs, count, k, nprobe, beam, rm, depth,
+                        timed ? res.data() : scratch_res.data(), timed ? lat.data() : nullptr, nullptr, cutoff);
+                    if (timed) times += t;
+                    return;
+                }
 #pragma omp parallel
                 {
                     IVFPQSearchScratch scratch;
@@ -408,16 +444,18 @@ int run(int argc, char** argv) {
                         "\"query_count\":%zu,\"query_qps\":%.1f,\"query_lat_avg_us\":%.1f,"
                         "\"query_lat_p50_us\":%.1f,\"query_lat_p99_us\":%.1f,\"recall\":%.3f,"
                         "\"probe_recall\":%.4f,\"t_centroid_us\":%.1f,\"t_table_us\":%.1f,\"t_scan_us\":%.1f,"
-                        "\"t_select_us\":%.1f,\"t_fetch_us\":%.1f,\"t_rerank_us\":%.1f,\"rss_mb\":%.0f,%s}\n",
+                        "\"t_select_us\":%.1f,\"t_fetch_us\":%.1f,\"t_rerank_us\":%.1f,\"rss_mb\":%.0f,"
+                        "\"pipeline_depth\":%u,%s}\n",
                         scan_used, beam, n, ix.meta.nlist, ix.pq.chunks, nprobe, tau, double(probed_total) / double(nq),
                         double(codes_total) / double(nq), rm, sched.batch, sched.patience,
                         double(times.reranked) / double(nq), double(times.fetch_batches) / double(nq), threads, nq,
                         double(nq) / graph_wall, graph_avg * 1e6, percentile_us(lat, 0.50),
                         percentile_us(lat, 0.99), recall_of(res), double(probe_hits) / double(probed_total),
                         times.centroid_ns / per_q, times.table_ns / per_q, times.scan_ns / per_q,
-                        times.select_ns / per_q, times.fetch_ns / per_q, times.rerank_ns / per_q, rss_mb(),
+                        times.select_ns / per_q, times.fetch_ns / per_q, times.rerank_ns / per_q, rss_mb(), depth,
                         graph_io_fields.c_str());
             std::fflush(stdout);
+            }
             }
             }
         }
@@ -438,9 +476,9 @@ int main(int argc, char** argv) {
         get_arg(argc, argv, "--gt_file", "").empty()) {
         std::cerr << "Usage: ivf_pq_query_bench --data_type float|int8|uint8 --index_prefix <prefix> "
                      "--query_file <query.bin> --gt_file <truthset.bin> [--nprobes 8,16,32,64,128] "
-                     "[--rerank_m 100] [--k 10] [--threads N] [--warmup N] [--graph_beams 2,4] [--probe_taus 0,1.4] "
+                     "[--rerank_m 100] [--k 10] [--threads N] [--warmup N] [--graph_beams 2,4] [--probe_taus 0,1.4] [--pipeline_depths 0,4] "
                      "[--warmup_query_file <warmup.bin>] [--skip_exact 1] [--rerank_schedules 0:0,10:2] "
-                     "[--buffer_pool_frames 262144]"
+                     "[--io_mode direct|pool|pagecache] [--buffer_pool_frames 262144]"
                   << std::endl;
         return 2;
     }
