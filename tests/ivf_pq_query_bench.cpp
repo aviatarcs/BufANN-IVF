@@ -232,7 +232,8 @@ int run(int argc, char** argv) {
                 file_mb(ivf_pq_index_path(prefix)), file_mb(ivf_raw_vectors_path(prefix)),
                 file_mb(ivf_pq_codes_path(prefix)));
     if (pool_frames == 0) {
-        std::printf("heap: %u pages of %u B through the OS page cache\n", ix.heap_pages, ix.heap_layout.page_size);
+        std::printf("heap: %u pages of %u B %s\n", ix.heap_pages, ix.heap_layout.page_size,
+                    heap.uses_direct_reads() ? "read uncached (O_DIRECT, no pool)" : "through the OS page cache");
     } else {
         std::printf("heap: %u pages of %u B through a buffer pool of %u frames (%.0f MB, %.1f%% of the heap)\n",
                     ix.heap_pages, ix.heap_layout.page_size, pool_frames,
